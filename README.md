@@ -42,7 +42,8 @@ cd veil-forum-v*
 
 ### From source
 
-Requirements: Rust stable and SQLite.
+Requirements: Rust 1.88 or newer and SQLite. The repository pins the CI and
+local development toolchain through `rust-toolchain.toml`.
 
 ```bash
 cargo build --release

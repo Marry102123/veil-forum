@@ -28,6 +28,11 @@ I2P Destination keys, passwords, or service environment files in a backup.
 Migrations are applied during startup. Do not interrupt a migration and do not
 run tests against the production database.
 
+If startup fails, the error identifies the database path, administrator
+initialization, or listener address. Check that the data directory is writable,
+that the first-run `VEIL_ADMIN_PASSWORD` is 12-128 characters, and that the
+configured loopback port is not already in use.
+
 ## systemd
 
 Create a dedicated user and data directory, install `deploy/veil-forum.service`

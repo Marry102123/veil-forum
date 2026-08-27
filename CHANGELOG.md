@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-alpha.2
+
+- Clarify browser Proof-of-Work (PoW) anti-abuse checks in English, Chinese,
+  and Russian user interfaces.
+- Bound PoW form inputs and challenge issuance to reduce resource abuse.
+- Make `/healthz` verify SQLite readiness and prevent stale static assets after
+  upgrades.
+- Pin the development toolchain to stable Rust and document the Rust 1.88 MSRV.
+- Add PoW and Origin validation tests and improve startup error diagnostics.
+
 ## 0.1.0-alpha.1
 
 Initial public Alpha release.

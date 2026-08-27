@@ -188,3 +188,25 @@ fn has_leading_zeros(hash: &[u8], bits: u32) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn difficulty_is_bounded_and_monotonic() {
+        assert_eq!(minutes_to_difficulty(0.0), 4);
+        assert_eq!(minutes_to_difficulty(-1.0), 4);
+        assert!(minutes_to_difficulty(0.02) < minutes_to_difficulty(1.0));
+        assert_eq!(minutes_to_difficulty(10.0), 13);
+        assert!(minutes_to_difficulty(1000.0) <= 24);
+    }
+
+    #[test]
+    fn leading_zero_check_handles_bit_boundaries() {
+        assert!(has_leading_zeros(&[0, 0, 0, 1], 24));
+        assert!(!has_leading_zeros(&[0, 0, 1, 0], 24));
+        assert!(has_leading_zeros(&[0b0000_1111], 4));
+        assert!(!has_leading_zeros(&[0b0001_0000], 4));
+    }
+}

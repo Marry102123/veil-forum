@@ -49,12 +49,12 @@ async function solvePowMainThread(challenge, salt, difficulty){
     }
     if (hasLeadingZeros(hash, difficulty)) {
       if (progressEl) progressEl.style.width = '100%';
-      if (statusEl) statusEl.textContent = `done nonce=${nonce} in ${((Date.now()-start)/1000).toFixed(1)}s`;
+      if (statusEl) statusEl.textContent = statusEl.dataset.done || 'PoW anti-abuse check completed';
       return {nonce: String(nonce), timeMs: Date.now()-start};
     }
     nonce++;
     const pctDisplay = Math.min(99.9, (nonce / expected) * 100);
-    if (statusEl) statusEl.textContent = `computing... nonce=${nonce}/${expected} (${pctDisplay.toFixed(1)}% est.) elapsed=${((Date.now()-start)/1000).toFixed(1)}s`;
+    if (statusEl) statusEl.textContent = `${statusEl.dataset.computing || 'Performing PoW anti-abuse computation...'} ${pctDisplay.toFixed(1)}%`;
     if (progressEl) {
       const pct = Math.min(99, (nonce / expected) * 100);
       progressEl.style.width = pct.toFixed(1) + '%';
@@ -100,7 +100,7 @@ function solvePowWorker(challenge, salt, difficulty){
       if(d.type==='progress'){
         const nonce = d.nonce;
         const pctDisplay = Math.min(99.9, (nonce / expected) * 100);
-        if (statusEl) statusEl.textContent = `computing… nonce=${nonce}/${expected} (${pctDisplay.toFixed(1)}% est.) elapsed=${((Date.now()-start)/1000).toFixed(1)}s`;
+        if (statusEl) statusEl.textContent = `${statusEl.dataset.computing || 'Performing PoW anti-abuse computation...'} ${pctDisplay.toFixed(1)}%`;
         if (progressEl) {
           const pct = Math.min(99, (nonce / expected) * 100);
           progressEl.style.width = pct.toFixed(1) + '%';
@@ -108,7 +108,7 @@ function solvePowWorker(challenge, salt, difficulty){
       } else if(d.type==='done'){
         if(settled) return; settled=true;
         if (progressEl) progressEl.style.width = '100%';
-        if (statusEl) statusEl.textContent = `done nonce=${d.nonce} in ${((Date.now()-start)/1000).toFixed(1)}s`;
+        if (statusEl) statusEl.textContent = statusEl.dataset.done || 'PoW anti-abuse check completed';
         cleanup();
         resolve({nonce: String(d.nonce), timeMs: Date.now()-start});
       } else if(d.type==='error'){
@@ -173,12 +173,12 @@ async function attachPow(form, scope){
       inp.value=v;
     }
     const status = document.getElementById('pow-status');
-    if(status) status.textContent='PoW solved, submitting…';
+    if(status) status.textContent=status.dataset.submitting || 'PoW check completed, submitting...';
     if(pbar) pbar.style.width='100%';
     return true;
   }catch(e){
     // use non-blocking UI instead of alert where possible
-    const msg = 'PoW failed: '+e.message;
+    const msg = (document.getElementById('pow-status')?.dataset.failed || 'The PoW anti-abuse check failed. Please try again.') + ' (' + e.message + ')';
     try{ alert(msg); }catch{}
     const st = document.getElementById('pow-status');
     if(st) st.textContent=msg;

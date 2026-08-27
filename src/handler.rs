@@ -9,8 +9,10 @@ use hmac::Mac;
 use rand::RngCore;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 #[derive(Clone)]
@@ -18,6 +20,8 @@ pub struct AppState {
     pub store: crate::store::Store,
     pub pow: crate::pow::Manager,
     pub password_gate: Arc<Semaphore>,
+    pub pow_challenge_gate: Arc<Semaphore>,
+    pub pow_challenge_times: Arc<std::sync::Mutex<VecDeque<Instant>>>,
 }
 
 const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'self'";
@@ -114,6 +118,58 @@ fn valid_origin(headers: &HeaderMap) -> bool {
 }
 fn require_form_security(headers: &HeaderMap, form: &HashMap<String, String>) -> bool {
     valid_csrf(headers, form) && valid_origin(headers)
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    fn valid_pow_form() -> HashMap<String, String> {
+        HashMap::from([
+            ("pow_challenge".into(), "a".repeat(32)),
+            ("pow_salt".into(), "b".repeat(16)),
+            ("pow_difficulty".into(), "4".into()),
+            (
+                "pow_expires_at".into(),
+                (chrono::Utc::now().timestamp() + 60).to_string(),
+            ),
+            ("pow_hmac".into(), "c".repeat(64)),
+            ("pow_nonce".into(), "0".into()),
+        ])
+    }
+
+    #[test]
+    fn pow_form_rejects_oversized_or_invalid_values() {
+        let mut form = valid_pow_form();
+        assert!(verify_pow_form(&form, crate::pow::Scope::Post).is_ok());
+        form.insert("pow_nonce".into(), "n".repeat(65));
+        assert!(verify_pow_form(&form, crate::pow::Scope::Post).is_err());
+
+        let mut form = valid_pow_form();
+        form.insert("pow_difficulty".into(), "25".into());
+        assert!(verify_pow_form(&form, crate::pow::Scope::Post).is_err());
+
+        let mut form = valid_pow_form();
+        form.insert(
+            "pow_expires_at".into(),
+            (chrono::Utc::now().timestamp() + 301).to_string(),
+        );
+        assert!(verify_pow_form(&form, crate::pow::Scope::Post).is_err());
+    }
+
+    #[test]
+    fn origin_must_match_host_except_null_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "forum.test".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://forum.test".parse().unwrap());
+        assert!(valid_origin(&headers));
+
+        headers.insert(header::ORIGIN, "https://attacker.test".parse().unwrap());
+        assert!(!valid_origin(&headers));
+
+        headers.insert(header::ORIGIN, "null".parse().unwrap());
+        assert!(valid_origin(&headers));
+    }
 }
 
 fn sec_headers() -> HeaderMap {
@@ -521,7 +577,7 @@ fn layout_html(
 
 fn verify_pow_form(
     form: &HashMap<String, String>,
-    scope: crate::pow::Scope,
+    _scope: crate::pow::Scope,
 ) -> Result<(String, String, u32, i64, String, String), String> {
     let chal = form.get("pow_challenge").cloned().unwrap_or_default();
     let salt = form.get("pow_salt").cloned().unwrap_or_default();
@@ -538,8 +594,18 @@ fn verify_pow_form(
     {
         return Err("missing pow fields".to_string());
     }
+    if chal.len() > 128 || salt.len() > 64 || hmac.len() > 128 || nonce.len() > 64 {
+        return Err("pow field too long".to_string());
+    }
     let diff: u32 = diff_s.parse().map_err(|_| "bad difficulty")?;
+    if !(4..=24).contains(&diff) {
+        return Err("difficulty out of range".to_string());
+    }
     let exp: i64 = exp_s.parse().map_err(|_| "bad expires")?;
+    let now = chrono::Utc::now().timestamp();
+    if exp < now || exp > now + 300 {
+        return Err("expires out of range".to_string());
+    }
     Ok((chal, salt, diff, exp, hmac, nonce))
 }
 fn pow_fallback_html(ch: &crate::pow::Challenge, locale: &str) -> String {
@@ -645,8 +711,15 @@ pub fn routes(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> impl IntoResponse {
-    let resp = (StatusCode::OK, "ok").into_response();
+async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
+    let status = match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&s.store.pool)
+        .await
+    {
+        Ok(1) => (StatusCode::OK, "ok"),
+        Ok(_) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "database unavailable"),
+    };
+    let resp = status.into_response();
     apply_sec(resp)
 }
 
@@ -667,6 +740,34 @@ async fn pow_challenge(
     State(s): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let _permit = match s.pow_challenge_gate.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return apply_sec(
+                (StatusCode::TOO_MANY_REQUESTS, "too many PoW challenges").into_response(),
+            )
+        }
+    };
+    {
+        let now = Instant::now();
+        let mut times = s.pow_challenge_times.lock().unwrap();
+        while times
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            times.pop_front();
+        }
+        if times.len() >= 60 {
+            return apply_sec(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "PoW challenge rate limit exceeded",
+                )
+                    .into_response(),
+            );
+        }
+        times.push_back(now);
+    }
     let scope_str = q.get("scope").map(|x| x.as_str()).unwrap_or("post");
     let scope = crate::pow::Scope::from_str(scope_str);
     let ch = s.pow.generate(scope).await;
@@ -737,10 +838,8 @@ async fn handle_static(Path(path): Path<String>, _headers: HeaderMap) -> impl In
         for (k, v) in sec_headers().iter() {
             resp.headers_mut().insert(k.clone(), v.clone());
         }
-        resp.headers_mut().insert(
-            header::CACHE_CONTROL,
-            "public, max-age=3600".parse().unwrap(),
-        );
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
         if let Some(e) = etag {
             resp.headers_mut().insert(header::ETAG, e.parse().unwrap());
         }
@@ -910,17 +1009,24 @@ async fn board(
         ui("posts", "帖", "сообщений")
     ));
     if let Some(u) = &user {
+        let pow_title = crate::i18n::translate(&locale, "pow.post_title");
+        let pow_description = crate::i18n::translate(&locale, "pow.description");
+        let pow_computing = crate::i18n::translate(&locale, "pow.computing");
+        let pow_done = crate::i18n::translate(&locale, "pow.done");
+        let pow_failed = crate::i18n::translate(&locale, "pow.failed");
+        let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
         content.push_str(&format!(r#"<div class="card">
-<h3>{} <span class="muted" style="font-weight:400">· PoW {} min</span></h3>
-<div id="pow-status"></div>
+<h3>{} <span class="muted" style="font-weight:400">· {}</span></h3>
+<p class="muted pow-explanation">{}</p>
+<div id="pow-status" data-computing="{}" data-done="{}" data-failed="{}" data-submitting="{}"></div>
 <div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
 <form method="POST" action="/b/{}/new" data-pow-scope="post">
 <input name="title" placeholder="{}" required maxlength="120" style="width:100%;margin:5px 0">
 <textarea name="content" placeholder="{}" required rows="4" style="width:100%"></textarea>
 {}
-{}<button class="btn-primary">{} (PoW)</button>
+ {}<button class="btn-primary">{}</button>
 </form>
-</div>"#, ui("New thread", "发新帖", "Новая тема"), html_escape(&pow_min), html_escape(&board.slug), ui("Title, 5-120 characters", "标题 5-120字", "Заголовок, 5-120 символов"), ui("Markdown supported. Images are disabled.", "正文 Markdown 支持 基础+代码块+表格 · 禁图", "Поддерживается Markdown. Изображения отключены."), pow_fallback, if board.allow_anonymous { format!(r#"<label style="font-size:12px"><input type="checkbox" name="anonymous"> {}</label> "#, ui("Anonymous", "匿名", "Анонимно")) } else { String::new() }, ui("Post", "发帖", "Опубликовать")));
+</div>"#, ui("New thread", "发新帖", "Новая тема"), pow_title, pow_description, pow_computing, pow_done, pow_failed, pow_submitting, html_escape(&board.slug), ui("Title, 5-120 characters", "标题 5-120字", "Заголовок, 5-120 символов"), ui("Markdown supported. Images are disabled.", "正文 Markdown 支持 基础+代码块+表格 · 禁图", "Поддерживается Markdown. Изображения отключены."), pow_fallback, if board.allow_anonymous { format!(r#"<label style="font-size:12px"><input type="checkbox" name="anonymous"> {}</label> "#, ui("Anonymous", "匿名", "Анонимно")) } else { String::new() }, ui("Post", "发帖", "Опубликовать")));
     } else {
         content.push_str(&format!(r#"<div class="card" style="padding:6px 8px;font-size:12.5px"><a href="/login">{}</a> <span class="muted">· {}</span></div>"#, ui("Log in to post", "登录后发帖", "Войдите, чтобы создать тему"), ui("Proof of work protects posting", "PoW 解放过滤", "Proof of work защищает публикации")));
     }
@@ -1135,18 +1241,25 @@ async fn thread(
                 .as_ref()
                 .map(|post| post.id.to_string())
                 .unwrap_or_default();
+            let pow_title = crate::i18n::translate(&locale, "pow.reply_title");
+            let pow_description = crate::i18n::translate(&locale, "pow.description");
+            let pow_computing = crate::i18n::translate(&locale, "pow.computing");
+            let pow_done = crate::i18n::translate(&locale, "pow.done");
+            let pow_failed = crate::i18n::translate(&locale, "pow.failed");
+            let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
             content.push_str(&format!(r#"<div class="card" id="reply-card">
-<h3>{reply_label} <span class="muted" style="font-weight:400">· PoW {pow_minutes} min</span></h3>
-<div id="pow-status"></div>
+<h3>{reply_label} <span class="muted" style="font-weight:400">· {pow_title}</span></h3>
+<p class="muted pow-explanation">{pow_description}</p>
+<div id="pow-status" data-computing="{pow_computing}" data-done="{pow_done}" data-failed="{pow_failed}" data-submitting="{pow_submitting}"></div>
 <div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
 <form method="POST" action="/t/{thread_id}/reply" data-pow-scope="post" id="reply-form">
 {reply_hint}
 <input type="hidden" name="parent_post_id" value="{reply_to}">
 <textarea name="content" required rows="4" style="width:100%" placeholder="{markdown_hint}"></textarea>
 {pow_fallback}
- {anonymous_field}<button class="btn-primary">{reply_label} (PoW)</button>
+ {anonymous_field}<button class="btn-primary">{reply_label}</button>
 </form>
-</div>"#, reply_label = ui("Reply", "回帖", "Ответить"), pow_minutes = html_escape(&pow_min), thread_id = th.id, reply_hint = reply_hint, reply_to = reply_to_value, markdown_hint = ui("Markdown supported.", "Markdown 支持 基础+代码块+表格", "Поддерживается Markdown."), pow_fallback = pow_fallback, anonymous_field = if board.as_ref().map(|b| b.allow_anonymous).unwrap_or(false) { format!(r#"<label style="font-size:12px"><input type="checkbox" name="anonymous"> {}</label> "#, ui("Anonymous", "匿名", "Анонимно")) } else { String::new() }));
+</div>"#, reply_label = ui("Reply", "回帖", "Ответить"), pow_title = pow_title, pow_description = pow_description, pow_computing = pow_computing, pow_done = pow_done, pow_failed = pow_failed, pow_submitting = pow_submitting, thread_id = th.id, reply_hint = reply_hint, reply_to = reply_to_value, markdown_hint = ui("Markdown supported.", "Markdown 支持 基础+代码块+表格", "Поддерживается Markdown."), pow_fallback = pow_fallback, anonymous_field = if board.as_ref().map(|b| b.allow_anonymous).unwrap_or(false) { format!(r#"<label style="font-size:12px"><input type="checkbox" name="anonymous"> {}</label> "#, ui("Anonymous", "匿名", "Анонимно")) } else { String::new() }));
         }
     } else {
         content.push_str(&format!(r#"<div class="card" style="padding:6px 8px;font-size:12.5px"><a href="/login">{}</a></div>"#, ui("Log in to reply", "登录后回帖", "Войдите, чтобы ответить")));
@@ -1326,6 +1439,12 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
         "minutes",
         &pow_min,
     );
+    let pow_title = crate::i18n::translate(&locale, "pow.register_title");
+    let pow_description = crate::i18n::translate(&locale, "pow.description");
+    let pow_computing = crate::i18n::translate(&locale, "pow.computing");
+    let pow_done = crate::i18n::translate(&locale, "pow.done");
+    let pow_failed = crate::i18n::translate(&locale, "pow.failed");
+    let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
     let invite_field = if need_invite {
         &format!(
             r#"<input name="invite_code" placeholder="{}" required style="width:100%;margin:5px 0">"#,
@@ -1337,22 +1456,29 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
     let pow_ch = s.pow.generate(crate::pow::Scope::Register).await;
     let pow_fallback = pow_fallback_html(&pow_ch, &locale);
     let content = format!(
-        r#"<h2>{register} <span class="muted" style="font-weight:400">· PoW {pow_min} min</span></h2>
-<div id="pow-status"></div>
+        r#"<h2>{register} <span class="muted" style="font-weight:400">· {pow_title}</span></h2>
+<p class="muted pow-explanation">{pow_description}</p>
+<div id="pow-status" data-computing="{pow_computing}" data-done="{pow_done}" data-failed="{pow_failed}" data-submitting="{pow_submitting}"></div>
 <div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
 <form method="POST" action="/register" data-pow-scope="register" style="max-width:420px">
 <input name="username" placeholder="{username}" aria-label="{username}" required pattern="[a-zA-Z0-9_]{{3,20}}" style="width:100%;margin:5px 0">
 <input name="password" type="password" placeholder="{password}" aria-label="{password}" required minlength="6" maxlength="72" style="width:100%;margin:5px 0">
-{}
-{}<button class="btn-primary" style="width:100%;margin-top:6px">{register_button}</button>
+{invite_field}
+{pow_fallback}<button class="btn-primary" style="width:100%;margin-top:6px">{register_button}</button>
 </form>
 <p style="font-size:12.5px">{login}? <a href="/login">{login}</a></p>
-<p class="muted" style="font-size:11.5px">{}: {} · {}</p>"#,
-        invite_field,
-        pow_fallback,
-        ui("Registration mode", "注册模式", "Режим регистрации"),
-        html_escape(&reg_mode),
-        ui(
+<p class="muted" style="font-size:11.5px">{registration_mode}: {reg_mode} · {recovery_hint}</p>"#,
+        invite_field = invite_field,
+        pow_fallback = pow_fallback,
+        pow_title = pow_title,
+        pow_description = pow_description,
+        pow_computing = pow_computing,
+        pow_done = pow_done,
+        pow_failed = pow_failed,
+        pow_submitting = pow_submitting,
+        registration_mode = ui("Registration mode", "注册模式", "Режим регистрации"),
+        reg_mode = html_escape(&reg_mode),
+        recovery_hint = ui(
             "No email recovery. Keep your password safe.",
             "无邮箱找回，丢密即丢号",
             "Восстановления по email нет. Сохраните пароль."
@@ -1535,20 +1661,33 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         "minutes",
         &pow_min,
     );
+    let pow_title = crate::i18n::translate(&locale, "pow.login_title");
+    let pow_description = crate::i18n::translate(&locale, "pow.description");
+    let pow_computing = crate::i18n::translate(&locale, "pow.computing");
+    let pow_done = crate::i18n::translate(&locale, "pow.done");
+    let pow_failed = crate::i18n::translate(&locale, "pow.failed");
+    let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
     let pow_ch = s.pow.generate(crate::pow::Scope::Login).await;
     let pow_fallback = pow_fallback_html(&pow_ch, &locale);
     let content = format!(
-        r#"<h2>{login_button} <span class="muted" style="font-weight:400">· PoW {pow_min} min</span></h2>
-<div id="pow-status"></div>
+        r#"<h2>{login_button} <span class="muted" style="font-weight:400">· {pow_title}</span></h2>
+<p class="muted pow-explanation">{pow_description}</p>
+<div id="pow-status" data-computing="{pow_computing}" data-done="{pow_done}" data-failed="{pow_failed}" data-submitting="{pow_submitting}"></div>
 <div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
 <form method="POST" action="/login" data-pow-scope="login" style="max-width:420px">
 <input name="username" placeholder="{username}" aria-label="{username}" required style="width:100%;margin:5px 0">
 <input name="password" type="password" placeholder="{password}" aria-label="{password}" required style="width:100%;margin:5px 0">
-{}<button class="btn-primary" style="width:100%;margin-top:6px">{login_button}</button>
+{pow_fallback}<button class="btn-primary" style="width:100%;margin-top:6px">{login_button}</button>
 </form>
-<p style="font-size:12.5px"><a href="/register">{register}</a> <span class="muted">· {}</span></p>"#,
-        pow_fallback,
-        crate::i18n::ui(
+<p style="font-size:12.5px"><a href="/register">{register}</a> <span class="muted">· {email_hint}</span></p>"#,
+        pow_fallback = pow_fallback,
+        pow_title = pow_title,
+        pow_description = pow_description,
+        pow_computing = pow_computing,
+        pow_done = pow_done,
+        pow_failed = pow_failed,
+        pow_submitting = pow_submitting,
+        email_hint = crate::i18n::ui(
             &locale,
             "no email required",
             "无需邮箱",

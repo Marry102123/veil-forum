@@ -39,17 +39,27 @@ async fn main() -> anyhow::Result<()> {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    let store = store::Store::open(&data).await?;
-    auth::ensure_admin(&store.pool).await?;
+    let store = store::Store::open(&data)
+        .await
+        .map_err(|e| anyhow::anyhow!("open database {}: {}", data, e))?;
+    auth::ensure_admin(&store.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("initialize administrator: {}", e))?;
     println!("veil-forum security mode enabled");
     let pow = pow::Manager::new(store.clone());
     let state = handler::AppState {
         store: store.clone(),
         pow,
         password_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+        pow_challenge_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
+        pow_challenge_times: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::new(),
+        )),
     };
     let app = handler::routes(state).layer(ConcurrencyLimitLayer::new(64));
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind listener {}: {}", addr, e))?;
     println!("Rust listening on {} (Go on 8000)", addr);
     axum::serve(listener, app).await?;
     Ok(())
