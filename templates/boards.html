@@ -1,0 +1,10 @@
+{{define "content"}}
+<h2>版块</h2>
+{{range .Boards}}
+<div class="card">
+<b><a href="/b/{{.Slug}}">{{.Name}}</a></b> <span style="color:#888">/{{.Slug}}</span>
+<p style="color:#aaa">{{.Description}}</p>
+<small>匿名:{{if .AllowAnonymous}}允许{{else}}禁止{{end}} | 游客可读:{{if .GuestReadable}}是{{else}}否{{end}}</small>
+</div>
+{{else}}<p>暂无版块</p>{{end}}
+{{end}}

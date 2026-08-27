@@ -1,0 +1,80 @@
+{{define "content"}}
+<h2>管理后台</h2>
+
+<div class="admin-grid">
+<div class="card">
+<h3>站点配置</h3>
+<form method="POST" action="/admin/config/site">
+<label>站点名 <input name="site_name" value="{{.Configs.site_name}}" style="width:100%"></label>
+<button>保存</button>
+</form>
+<hr>
+<form method="POST" action="/admin/config/pow">
+<label>注册 PoW 分钟 <input name="pow_register_minutes" value="{{.Configs.pow_register_minutes}}" style="width:100%"></label>
+<label>登录 PoW 分钟 <input name="pow_login_minutes" value="{{.Configs.pow_login_minutes}}" style="width:100%"></label>
+<label>发帖 PoW 分钟 <input name="pow_post_minutes" value="{{.Configs.pow_post_minutes}}" style="width:100%"></label>
+<small style="color:#888">Argon2id 小数分钟 0.005~10 默认0.02 上限10</small><br>
+<button>保存PoW</button>
+</form>
+<hr>
+<form method="POST" action="/admin/config/registration">
+<label>注册模式
+<select name="registration_mode">
+<option value="open" {{if eq .Configs.registration_mode "open"}}selected{{end}}>开放</option>
+<option value="invite" {{if eq .Configs.registration_mode "invite"}}selected{{end}}>需邀请码</option>
+<option value="closed" {{if eq .Configs.registration_mode "closed"}}selected{{end}}>关闭</option>
+</select></label><button>切换</button>
+</form>
+</div>
+
+<div class="card">
+<h3>改密 (当前 {{.User.Username}})</h3>
+<form method="POST" action="/admin/change-password">
+<input name="old_password" type="password" placeholder="旧密码" style="width:100%">
+<input name="new_password" type="password" placeholder="新密码" style="width:100%">
+<button>改密</button>
+</form>
+<hr>
+<h3>生成邀请码</h3>
+<form method="POST" action="/admin/invite/create"><button>生成1枚</button></form>
+<ul>{{range .Invites}}<li><code>{{.Code}}</code> {{if .UsedBy}}已用 by {{.UsedBy}}{{else}}未用<form method="POST" action="/admin/invite/{{.Code}}/delete" style="display:inline"><button>作废</button></form>{{end}}</li>{{else}}<li>无邀请码</li>{{end}}</ul>
+</div>
+</div>
+
+<div class="card">
+<h3>版块管理</h3>
+<form method="POST" action="/admin/board/create" style="border:1px solid #333;padding:6px">
+<input name="slug" placeholder="slug 字母_-" required pattern="[a-z0-9_-]{2,20}"> <input name="name" placeholder="名称" required> <input name="description" placeholder="描述" style="width:40%">
+<label><input type="checkbox" name="allow_anonymous" checked>允许匿名</label>
+<label><input type="checkbox" name="guest_readable" checked>游客可读</label>
+<button>创建版块</button>
+</form>
+<table>
+<tr><th>slug</th><th>名称</th><th>匿名</th><th>游客可读</th><th>操作</th></tr>
+{{range .Boards}}<tr>
+<td>{{.Slug}}</td><td>{{.Name}}</td><td>{{if .AllowAnonymous}}是{{else}}否{{end}}</td><td>{{if .GuestReadable}}是{{else}}否{{end}}</td>
+<td>
+<form method="POST" action="/admin/board/{{.ID}}/update" style="display:inline">
+<input type="hidden" name="name" value="{{.Name}}"><input type="hidden" name="description" value="{{.Description}}">
+<label><input type="checkbox" name="allow_anonymous" {{if .AllowAnonymous}}checked{{end}}>匿名</label>
+<label><input type="checkbox" name="guest_readable" {{if .GuestReadable}}checked{{end}}>可读</label>
+<button>更新</button>
+</form>
+<form method="POST" action="/admin/board/{{.ID}}/delete" style="display:inline" onsubmit="return confirm('删版及帖?')"><button>删</button></form>
+</td></tr>{{end}}
+</table>
+</div>
+
+<div class="card">
+<h3>用户管理 (近100)</h3>
+<table>
+<tr><th>ID</th><th>用户</th><th>admin</th><th>banned</th><th>操作</th></tr>
+{{range .Users}}<tr>
+<td>{{.ID}}</td><td>{{.Username}}</td><td>{{.IsAdmin}}</td><td>{{.IsBanned}}</td>
+<td>
+{{if .IsBanned}}<form method="POST" action="/admin/user/{{.ID}}/unban" style="display:inline"><button>解封</button></form>
+{{else}}<form method="POST" action="/admin/user/{{.ID}}/ban" style="display:inline"><button>封禁</button></form>{{end}}
+</td></tr>{{end}}
+</table>
+</div>
+{{end}}

@@ -1,0 +1,34 @@
+[package]
+name = "veil-forum"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Experimental privacy-oriented forum for Tor and I2P deployments"
+repository = "https://github.com/Marry102123/veil-forum"
+readme = "README.md"
+
+[features]
+external-go-interop = []
+
+[dependencies]
+axum = { version = "0.7", features = ["macros","form"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8.1", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+comrak = { version = "0.22", features = [] }
+ammonia = "4"
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+askama = "0.12"
+tower = { version = "0.4", features = ["limit"] }
+tower-http = { version = "0.5", features = ["trace", "fs", "limit"] }
+serde_json = "1"
+regex = "1"
+hex = "0.4"
+base64 = "0.22"
+
+rust-i18n = "4"
+anyhow = "1"
