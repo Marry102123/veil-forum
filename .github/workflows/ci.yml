@@ -50,6 +50,8 @@ jobs:
           version: 0.14.0
       - uses: taiki-e/install-action@cargo-zigbuild
       - name: Build target binary
+        env:
+          RUSTFLAGS: ${{ matrix.target == 'powerpc64le-unknown-linux-gnu' && '-C link-arg=-lgcc' || '' }}
         run: cargo zigbuild --release --target ${{ matrix.target }}
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}

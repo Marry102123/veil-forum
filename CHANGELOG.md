@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0-alpha.11
+
+- Link the GCC runtime explicitly for the PowerPC64LE GNU release target.
+
 ## 0.1.0-alpha.10
 
 - Use Zig and cargo-zigbuild for reproducible cross-compilation of all listed
