@@ -46,13 +46,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: goto-bus-stop/setup-zig@v2
+        if: matrix.target != 'powerpc64le-unknown-linux-gnu'
         with:
           version: 0.14.0
       - uses: taiki-e/install-action@cargo-zigbuild
+        if: matrix.target != 'powerpc64le-unknown-linux-gnu'
+      - name: Install PowerPC64LE GNU toolchain
+        if: matrix.target == 'powerpc64le-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc64le-linux-gnu
       - name: Build target binary
-        env:
-          RUSTFLAGS: ${{ matrix.target == 'powerpc64le-unknown-linux-gnu' && '-C link-arg=-lgcc' || '' }}
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.target }}" = "powerpc64le-unknown-linux-gnu" ]; then
+            CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
+              cargo build --release --target ${{ matrix.target }}
+          else
+            cargo zigbuild --release --target ${{ matrix.target }}
+          fi
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
           cp target/${{ matrix.target }}/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0-alpha.12
+
+- Build the PowerPC64LE GNU release target with Ubuntu's GCC cross-toolchain.
+
 ## 0.1.0-alpha.11
 
 - Link the GCC runtime explicitly for the PowerPC64LE GNU release target.
