@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.10
+
+- Use Zig and cargo-zigbuild for reproducible cross-compilation of all listed
+  Linux release targets.
+
 ## 0.1.0-alpha.9
 
 - Fix cross-target release builds by using the complete `cross` toolchain for

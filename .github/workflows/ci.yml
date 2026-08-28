@@ -43,9 +43,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cross
+        with:
+          targets: ${{ matrix.target }}
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
+      - uses: taiki-e/install-action@cargo-zigbuild
       - name: Build target binary
-        run: cross build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
           cp target/${{ matrix.target }}/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
