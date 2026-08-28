@@ -22,7 +22,7 @@ jobs:
       - run: cargo audit --ignore RUSTSEC-2023-0071
 
   release-build:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -34,7 +34,7 @@ jobs:
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
           cp target/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
-          cp -r static templates locales migrations deploy docs LICENSE README.md CHANGELOG.md SECURITY.md package/veil-forum-${GITHUB_REF_NAME}/
+          cp -r static locales migrations deploy docs LICENSE README.md CHANGELOG.md SECURITY.md package/veil-forum-${GITHUB_REF_NAME}/
           tar -czf veil-forum-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz -C package veil-forum-${GITHUB_REF_NAME}
       - run: sha256sum veil-forum-*.tar.gz > veil-forum-${GITHUB_REF_NAME}-checksums.txt
       - name: Publish GitHub Release assets

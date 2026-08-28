@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.4
+
+- Fix tagged CI release builds for the current inline-template layout and
+  publish downloadable Linux x86_64 GNU release assets.
+
 ## 0.1.0-alpha.3
 
 - Remove login Proof-of-Work and its configuration, state, and stale locale
