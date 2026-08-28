@@ -29,36 +29,23 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            image: messense/rust-musl-cross:x86_64-musl
           - target: aarch64-unknown-linux-musl
-            image: messense/rust-musl-cross:aarch64-musl
           - target: armv7-unknown-linux-musleabihf
-            image: messense/rust-musl-cross:armv7-musleabihf
           - target: riscv64gc-unknown-linux-musl
-            image: messense/rust-musl-cross:riscv64-musl
           - target: x86_64-unknown-linux-gnu
-            image: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main
           - target: aarch64-unknown-linux-gnu
-            image: ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
           - target: i686-unknown-linux-musl
-            image: messense/rust-musl-cross:i686-musl
           - target: powerpc64le-unknown-linux-gnu
-            image: ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu:main
           - target: s390x-unknown-linux-gnu
-            image: ghcr.io/cross-rs/s390x-unknown-linux-gnu:main
     permissions:
       contents: write
       actions: write
     steps:
       - uses: actions/checkout@v4
-      - name: Build static musl binary
-        uses: addnab/docker-run-action@v3
-        with:
-          image: ${{ matrix.image }}
-          options: -v ${{ github.workspace }}:/volume
-          run: |
-            cd /volume
-            cargo build --release --target ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cross
+      - name: Build target binary
+        run: cross build --release --target ${{ matrix.target }}
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
           cp target/${{ matrix.target }}/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/

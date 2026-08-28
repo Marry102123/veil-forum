@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.9
+
+- Fix cross-target release builds by using the complete `cross` toolchain for
+  every Linux target.
+
 ## 0.1.0-alpha.8
 
 - Expand the single-release Linux matrix to x86_64, aarch64, armv7, riscv64,
