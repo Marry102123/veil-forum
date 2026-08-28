@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.7
+
+- Fix the multi-architecture release aggregation job and publish both static
+  musl archives in one GitHub Release.
+
 ## 0.1.0-alpha.6
 
 - Publish x86_64 and aarch64 static musl archives in one GitHub Release.
