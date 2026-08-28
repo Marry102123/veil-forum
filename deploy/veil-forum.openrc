@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+name="veil-forum"
+description="veil-forum experimental Tor/I2P forum"
+command="/usr/local/bin/veil-forum"
+command_args="--addr 127.0.0.1:8001 --data /var/lib/veil-forum/forum.db"
+command_user="veil-forum:veil-forum"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after tor
+}
+
+start_pre() {
+    checkpath --directory --owner veil-forum:veil-forum --mode 0700 /var/lib/veil-forum
+}

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.6
+
+- Publish x86_64 and aarch64 static musl archives in one GitHub Release.
+- Add an OpenRC service template for non-systemd Linux distributions.
+- Document architecture-specific release archives and static asset installation.
+
 ## 0.1.0-alpha.5
 
 - Publish a statically linked Linux x86_64 musl release for compatibility with

@@ -31,14 +31,17 @@ traffic analysis.
 
 ### From a release archive
 
-Download the Linux x86_64 archive and its checksum from the
+Download the archive for your CPU architecture and its checksum from the
 [releases page](https://github.com/Marry102123/veil-forum/releases), then:
 
 ```bash
-sha256sum -c veil-forum-v*-checksums.txt
-tar -xzf veil-forum-v*-x86_64-unknown-linux-gnu.tar.gz
-cd veil-forum-v*
+sha256sum -c veil-forum-*-checksums.txt
+tar -xzf veil-forum-*-x86_64-unknown-linux-musl.tar.gz
+cd veil-forum-*
 ```
+
+The archive includes the `static/` directory. Keep it next to the binary, or
+install it at `/usr/local/static` when using the service templates.
 
 ### From source
 
