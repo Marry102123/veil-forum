@@ -6,13 +6,6 @@ use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use sqlx::Row;
 use veil_forum::store::{parse_time, Store};
 
-// ---------- helper ----------
-fn parse_must(s: &str) -> DateTime<Utc> {
-    // parse_time 在失败时会 fallback 到 Utc::now()，需用已知时间差检测是否真的解析成功
-    // 对确定性输入，我们断言解析结果与预期时间误差 <1s，且字符串往返包含预期前缀
-    parse_time(s)
-}
-
 fn assert_within_1ms(a: DateTime<Utc>, b: DateTime<Utc>) {
     let diff_nanos = (a.timestamp_nanos_opt().unwrap() - b.timestamp_nanos_opt().unwrap()).abs();
     assert!(
@@ -22,12 +15,6 @@ fn assert_within_1ms(a: DateTime<Utc>, b: DateTime<Utc>) {
         a.to_rfc3339_opts(SecondsFormat::Nanos, true),
         b.to_rfc3339_opts(SecondsFormat::Nanos, true)
     );
-}
-
-// Go 标准库 time.RFC3339Nano = "2006-01-02T15:04:05.999999999Z07:00"
-// Go 会裁剪尾随 0，例如 2026-08-26T08:19:02.123Z，而 Rust SecondsFormat::Nanos 总是 9 位
-fn go_rfc3339nano_now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 // ---------- 1. 带纳秒全精度 9 位 ----------

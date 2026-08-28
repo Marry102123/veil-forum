@@ -87,8 +87,8 @@ async fn main() -> anyhow::Result<()> {
     let carol = *uid_map.get("carol").unwrap();
     let anon42 = *uid_map.get("anon42").unwrap();
     let researcher = *uid_map.get("researcher").unwrap();
-    let vendor = *uid_map.get("vendorX").unwrap();
-    let admin = *uid_map.get("dread_admin").unwrap();
+    let _vendor = *uid_map.get("vendorX").unwrap();
+    let _admin = *uid_map.get("dread_admin").unwrap();
 
     let board_threads: Vec<(&str, Vec<(&str, &str, &str)>)> = vec![
         ("general", vec![

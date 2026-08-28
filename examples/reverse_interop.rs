@@ -1,7 +1,6 @@
 //! Reverse interop writer: Rust Store::open("/tmp/shared2.db") creates rows via Rust APIs
 //! Mirrors Go forward_interop but in opposite direction.
 
-use sqlx::Row;
 use veil_forum::store::Store;
 
 #[tokio::main]

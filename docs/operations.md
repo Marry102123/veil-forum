@@ -2,17 +2,19 @@
 
 ## Backup
 
-Stop the service before a simple file backup, or use SQLite backup tooling
-while the service is running. Protect the database, `-wal`, and `-shm` files
-as sensitive data because they can contain sessions and deleted content.
+Use the included online backup script while the service is running:
 
 ```bash
-sudo systemctl stop veil-forum
-sudo install -d -m 700 /srv/veil-forum-backups
-sudo cp --preserve=mode /var/lib/veil-forum/forum.db /srv/veil-forum-backups/forum.db
-sudo chmod 600 /srv/veil-forum-backups/forum.db
-sudo systemctl start veil-forum
+sudo scripts/backup.sh /var/lib/veil-forum /srv/veil-forum-backups
 ```
+
+The script uses SQLite `VACUUM INTO` for a consistent online backup, keeps the
+30 most recent backups, and sets mode 600 on all backup files. Without
+`sqlite3` or `sqlite3-rsync` it falls back to a plain file copy, which is only
+consistent while the service is stopped or idle.
+
+Protect the database, `-wal`, and `-shm` files as sensitive data because they
+can contain sessions and deleted content.
 
 Encrypt backups before moving them off-host. Never include Onion private keys,
 I2P Destination keys, passwords, or service environment files in a backup.
@@ -27,6 +29,9 @@ I2P Destination keys, passwords, or service environment files in a backup.
 
 Migrations are applied during startup. Do not interrupt a migration and do not
 run tests against the production database.
+
+`scripts/release.sh` builds the release binary and produces a tar archive and
+sha256 checksums in `dist/`, matching the files published for each release.
 
 If startup fails, the error identifies the database path, administrator
 initialization, or listener address. Check that the data directory is writable,

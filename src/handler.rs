@@ -9,10 +9,8 @@ use hmac::Mac;
 use rand::RngCore;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 #[derive(Clone)]
@@ -20,8 +18,6 @@ pub struct AppState {
     pub store: crate::store::Store,
     pub pow: crate::pow::Manager,
     pub password_gate: Arc<Semaphore>,
-    pub pow_challenge_gate: Arc<Semaphore>,
-    pub pow_challenge_times: Arc<std::sync::Mutex<VecDeque<Instant>>>,
 }
 
 const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'self'";
@@ -285,11 +281,10 @@ fn get_theme(headers: &HeaderMap) -> &'static str {
         for part in cookie.split(';') {
             let kv: Vec<&str> = part.trim().splitn(2, '=').collect();
             if kv.len() == 2 && kv[0].trim() == "theme" {
-                let v = kv[1].trim();
-                if v == "light" {
+                if kv[1].trim() == "light" {
                     return "light";
                 }
-                if v == "dark" {
+                if kv[1].trim() == "dark" {
                     return "dark";
                 }
             }
@@ -567,7 +562,6 @@ fn layout_html(
         stats_users = stats_users,
         recent_html = recent_html,
         announcement_body = announcement_body,
-        theme_attr = theme_attr,
         locale = html_escape(locale),
         search_label = html_escape(&search_label),
         account_label = html_escape(&account_label),
@@ -678,9 +672,8 @@ pub fn routes(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/healthz", get(healthz))
-        .route("/api/pow/challenge", get(pow_challenge))
-        .route("/static/*path", get(handle_static))
         .route("/theme", get(theme_toggle))
+        .route("/static/*path", get(handle_static))
         .route("/b/:slug", get(board))
         .route("/t/:id", get(thread))
         .route("/search", get(search))
@@ -734,57 +727,6 @@ async fn site_locale(store: &crate::store::Store) -> String {
     } else {
         "en".to_string()
     }
-}
-
-async fn pow_challenge(
-    State(s): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let _permit = match s.pow_challenge_gate.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return apply_sec(
-                (StatusCode::TOO_MANY_REQUESTS, "too many PoW challenges").into_response(),
-            )
-        }
-    };
-    {
-        let now = Instant::now();
-        let mut times = s.pow_challenge_times.lock().unwrap();
-        while times
-            .front()
-            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
-        {
-            times.pop_front();
-        }
-        if times.len() >= 60 {
-            return apply_sec(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "PoW challenge rate limit exceeded",
-                )
-                    .into_response(),
-            );
-        }
-        times.push_back(now);
-    }
-    let scope_str = q.get("scope").map(|x| x.as_str()).unwrap_or("post");
-    let scope = crate::pow::Scope::from_str(scope_str);
-    let ch = s.pow.generate(scope).await;
-    let body = format!(
-        r#"{{"challenge":"{}","salt":"{}","difficulty":{},"expires_at":{},"hmac":"{}","scope":"{}"}}"#,
-        ch.challenge, ch.salt, ch.difficulty, ch.expires_at, ch.hmac, ch.scope
-    );
-    let mut resp = (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response();
-    for (k, v) in sec_headers().iter() {
-        resp.headers_mut().insert(k.clone(), v.clone());
-    }
-    resp
 }
 
 async fn handle_static(Path(path): Path<String>, _headers: HeaderMap) -> impl IntoResponse {
@@ -854,32 +796,25 @@ async fn theme_toggle(
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let to = q.get("to").map(|s| s.as_str()).unwrap_or("dark");
-    let val = if to == "light" { "light" } else { "dark" };
-    let referer = headers
-        .get(header::REFERER)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
-    let loc = if referer.starts_with("/") {
-        referer.to_string()
-    } else if referer.contains("://") {
-        referer
-            .parse::<axum::http::Uri>()
-            .ok()
-            .map(|u| u.path().to_string())
-            .unwrap_or_else(|| "/".to_string())
-    } else {
-        "/".to_string()
+    let theme = match q.get("to").map(String::as_str) {
+        Some("light") => "light",
+        _ => "dark",
     };
-    let loc = if loc.is_empty() { "/".to_string() } else { loc };
-    let mut resp = Redirect::to(&loc).into_response();
-    resp.headers_mut().insert(
+    let location = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|referer| referer.strip_prefix('/'))
+        .map(|path| format!("/{}", path))
+        .filter(|path| !path.starts_with("//"))
+        .unwrap_or_else(|| "/".to_string());
+    let mut response = Redirect::to(&location).into_response();
+    response.headers_mut().insert(
         header::SET_COOKIE,
-        format!("theme={}; Path=/; Max-Age=31536000; SameSite=Lax", val)
+        format!("theme={theme}; Path=/; Max-Age=31536000; SameSite=Lax")
             .parse()
-            .unwrap(),
+            .expect("valid theme cookie"),
     );
-    apply_sec(resp)
+    apply_sec(response)
 }
 
 async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1008,7 +943,7 @@ async fn board(
         total,
         ui("posts", "帖", "сообщений")
     ));
-    if let Some(u) = &user {
+    if user.is_some() {
         let pow_title = crate::i18n::translate(&locale, "pow.post_title");
         let pow_description = crate::i18n::translate(&locale, "pow.description");
         let pow_computing = crate::i18n::translate(&locale, "pow.computing");
@@ -1221,7 +1156,7 @@ async fn thread(
             "".to_string()
         }
     ));
-    if let Some(u) = &user {
+    if user.is_some() {
         if th.is_locked {
             content.push_str(&format!(
                 r#"<p class="notice-locked">{}</p>"#,
@@ -1570,11 +1505,9 @@ async fn register_post(
         let resp = (StatusCode::BAD_REQUEST, "password length").into_response();
         return apply_sec(resp);
     }
-    if reg_mode == "invite" {
-        if invite.is_empty() {
-            let resp = (StatusCode::BAD_REQUEST, "invite required").into_response();
-            return apply_sec(resp);
-        }
+    if reg_mode == "invite" && invite.is_empty() {
+        let resp = (StatusCode::BAD_REQUEST, "invite required").into_response();
+        return apply_sec(resp);
     }
     let _permit = match s.password_gate.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -1632,10 +1565,6 @@ async fn register_post(
     );
     apply_sec(resp)
 }
-fn is_admin_user(u: &Option<crate::store::User>) -> bool {
-    u.as_ref().map(|x| x.is_admin).unwrap_or(false)
-}
-
 // ---------- Login ----------
 async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user = current_user(&s, &headers).await;
@@ -1643,50 +1572,21 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         let resp = Redirect::to("/").into_response();
         return apply_sec(resp);
     }
-    let pow_min = s
-        .store
-        .get_config("pow_login_minutes")
-        .await
-        .unwrap_or(None)
-        .unwrap_or_else(|| "0.02".to_string());
     let site = get_site_name(&s.store).await;
-    let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let username = crate::i18n::translate(&locale, "auth.username");
     let password = crate::i18n::translate(&locale, "auth.password");
     let register = crate::i18n::translate(&locale, "nav.register");
     let login = crate::i18n::translate(&locale, "nav.login");
-    let login_button = crate::i18n::format(
-        crate::i18n::translate(&locale, "auth.login_pow"),
-        "minutes",
-        &pow_min,
-    );
-    let pow_title = crate::i18n::translate(&locale, "pow.login_title");
-    let pow_description = crate::i18n::translate(&locale, "pow.description");
-    let pow_computing = crate::i18n::translate(&locale, "pow.computing");
-    let pow_done = crate::i18n::translate(&locale, "pow.done");
-    let pow_failed = crate::i18n::translate(&locale, "pow.failed");
-    let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
-    let pow_ch = s.pow.generate(crate::pow::Scope::Login).await;
-    let pow_fallback = pow_fallback_html(&pow_ch, &locale);
     let content = format!(
-        r#"<h2>{login_button} <span class="muted" style="font-weight:400">· {pow_title}</span></h2>
-<p class="muted pow-explanation">{pow_description}</p>
-<div id="pow-status" data-computing="{pow_computing}" data-done="{pow_done}" data-failed="{pow_failed}" data-submitting="{pow_submitting}"></div>
-<div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
-<form method="POST" action="/login" data-pow-scope="login" style="max-width:420px">
+        r#"<h2>{login}</h2>
+<form method="POST" action="/login" style="max-width:420px">
 <input name="username" placeholder="{username}" aria-label="{username}" required style="width:100%;margin:5px 0">
 <input name="password" type="password" placeholder="{password}" aria-label="{password}" required style="width:100%;margin:5px 0">
-{pow_fallback}<button class="btn-primary" style="width:100%;margin-top:6px">{login_button}</button>
+<button class="btn-primary" style="width:100%;margin-top:6px">{login}</button>
 </form>
 <p style="font-size:12.5px"><a href="/register">{register}</a> <span class="muted">· {email_hint}</span></p>"#,
-        pow_fallback = pow_fallback,
-        pow_title = pow_title,
-        pow_description = pow_description,
-        pow_computing = pow_computing,
-        pow_done = pow_done,
-        pow_failed = pow_failed,
-        pow_submitting = pow_submitting,
         email_hint = crate::i18n::ui(
             &locale,
             "no email required",
@@ -1706,7 +1606,7 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         &recent,
         &announcement,
         &content,
-        true,
+        false,
         None,
         get_theme(&headers),
         &locale,
@@ -1722,29 +1622,6 @@ async fn login_post(
 ) -> impl IntoResponse {
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
-    }
-    let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Login) {
-        Ok(v) => v,
-        Err(e) => {
-            let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
-            return apply_sec(resp);
-        }
-    };
-    if let Err(e) = s
-        .pow
-        .verify(
-            crate::pow::Scope::Login,
-            &pow_fields.0,
-            &pow_fields.1,
-            pow_fields.2,
-            pow_fields.3,
-            &pow_fields.4,
-            &pow_fields.5,
-        )
-        .await
-    {
-        let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
-        return apply_sec(resp);
     }
     let username = form
         .get("username")
@@ -2007,14 +1884,7 @@ async fn reply(
             }
             s.parse::<i64>().ok()
         })
-        .and_then(|pid| {
-            // 同步校验：先简单检查 pid >0，实际线程一致性在下方异步校验时再做
-            if pid > 0 {
-                Some(pid)
-            } else {
-                None
-            }
-        });
+        .filter(|&pid| pid > 0);
     // 若提供了 parent，校验其存在且属于同一 thread
     let parent_validated: Option<i64> = if let Some(pid) = parent_post_id {
         match s.store.get_post(pid).await.unwrap_or(None) {
@@ -2112,7 +1982,6 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
 <hr>
 <form method="POST" action="/admin/config/pow">
 <label>{register_pow} <input name="pow_register_minutes" value="{}" style="width:100%"></label>
-<label>{login_pow} <input name="pow_login_minutes" value="{}" style="width:100%"></label>
 <label>{post_pow} <input name="pow_post_minutes" value="{}" style="width:100%"></label>
 <small style="color:#888">{pow_help}</small><br>
 <button>{save_pow}</button>
@@ -2132,7 +2001,6 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
         if configs.get("default_locale").map(|x| x=="ru").unwrap_or(false) {"selected"} else {""},
         html_escape(configs.get("announcement").map(|x| x.as_str()).unwrap_or("")),
         html_escape(configs.get("pow_register_minutes").map(|x| x.as_str()).unwrap_or("0.02")),
-        html_escape(configs.get("pow_login_minutes").map(|x| x.as_str()).unwrap_or("0.02")),
         html_escape(configs.get("pow_post_minutes").map(|x| x.as_str()).unwrap_or("0.02")),
         if configs.get("registration_mode").map(|x| x=="open").unwrap_or(false) {"selected"} else {""},
         if configs.get("registration_mode").map(|x| x=="invite").unwrap_or(false) {"selected"} else {""},
@@ -2140,7 +2008,7 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
         site_name_label = ui("Site name", "站点名", "Название сайта"), save = crate::i18n::translate(&locale, "admin.save"),
         locale_label = crate::i18n::translate(&locale, "admin.default_locale"),
         announcement_label = ui("Announcement", "公告", "Объявление"), announcement_hint = ui("Leave blank to hide", "留空则不显示", "Оставьте пустым, чтобы скрыть"), announcement_help = ui("Shown on every page.", "显示在所有页面右侧。", "Показывается на каждой странице."), save_announcement = ui("Save announcement", "保存公告", "Сохранить объявление"),
-        register_pow = ui("Registration PoW minutes", "注册 PoW 分钟", "Минуты PoW регистрации"), login_pow = ui("Login PoW minutes", "登录 PoW 分钟", "Минуты PoW входа"), post_pow = ui("Posting PoW minutes", "发帖 PoW 分钟", "Минуты PoW публикации"), pow_help = ui("Argon2id minutes, from 0.005 to 10.", "Argon2id 小数分钟 0.005~10", "Минуты Argon2id, от 0.005 до 10."), save_pow = ui("Save PoW", "保存PoW", "Сохранить PoW"), registration_mode = ui("Registration mode", "注册模式", "Режим регистрации"), open = ui("Open", "开放", "Открытая"), invite = ui("Invite only", "需邀请码", "Только по приглашению"), closed = ui("Closed", "关闭", "Закрыта"),
+        register_pow = ui("Registration PoW minutes", "注册 PoW 分钟", "Минуты PoW регистрации"), post_pow = ui("Posting PoW minutes", "发帖 PoW 分钟", "Минуты PoW публикации"), pow_help = ui("Argon2id minutes, from 0.005 to 10.", "Argon2id 小数分钟 0.005~10", "Минуты Argon2id, от 0.005 до 10."), save_pow = ui("Save PoW", "保存PoW", "Сохранить PoW"), registration_mode = ui("Registration mode", "注册模式", "Режим регистрации"), open = ui("Open", "开放", "Открытая"), invite = ui("Invite only", "需邀请码", "Только по приглашению"), closed = ui("Closed", "关闭", "Закрыта"),
     ));
     content.push_str(&format!(
         r#"<div class="card">
@@ -2169,12 +2037,12 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
         ));
     } else {
         for inv in &invites {
-            if inv.used_by.is_some() {
+            if let Some(used_by) = inv.used_by {
                 content.push_str(&format!(
                     r#"<li><code>{}</code> {} {}</li>"#,
                     html_escape(&inv.code),
                     ui("used by", "已用 by", "использован"),
-                    inv.used_by.unwrap()
+                    used_by
                 ));
             } else {
                 content.push_str(&format!(r#"<li><code>{}</code> {}<form method="POST" action="/admin/invite/{}/delete" style="display:inline"><button>{}</button></form></li>"#, html_escape(&inv.code), ui("unused", "未用", "не использован"), html_escape(&inv.code), ui("Revoke", "作废", "Отозвать")));
@@ -2327,11 +2195,7 @@ async fn admin_pow(
         return apply_sec(resp);
     }
     let mut ok = true;
-    for k in [
-        "pow_register_minutes",
-        "pow_login_minutes",
-        "pow_post_minutes",
-    ] {
+    for k in ["pow_register_minutes", "pow_post_minutes"] {
         let v = form
             .get(k)
             .map(|x| x.trim().to_string())

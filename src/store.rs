@@ -1,5 +1,6 @@
 use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
+use std::str::FromStr;
 
 #[derive(Clone)]
 pub struct Store {
@@ -122,21 +123,32 @@ pub struct InviteCode {
 
 impl Store {
     pub async fn open(path: &str) -> anyhow::Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", path);
-        let pool = SqlitePool::connect(&url).await?;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path))?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA foreign_keys=ON")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout=5000")
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await?;
         #[cfg(unix)]
         if !path.starts_with(":memory:") {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         let s = Self { pool };
-        let _ = sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&s.pool)
-            .await;
-        let _ = sqlx::query("PRAGMA foreign_keys=ON").execute(&s.pool).await;
-        let _ = sqlx::query("PRAGMA busy_timeout=5000")
-            .execute(&s.pool)
-            .await;
         s.migrate().await?;
         s.seed_defaults().await?;
         Ok(s)
@@ -212,12 +224,15 @@ impl Store {
                 sqlx::query(sql).execute(&self.pool).await?;
             }
         }
+        // 清除已下线功能（登录 PoW）遗留的配置键，幂等
+        sqlx::query("DELETE FROM configs WHERE key='pow_login_minutes'")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
     async fn seed_defaults(&self) -> anyhow::Result<()> {
         let defaults = [
             ("pow_register_minutes", "0.02"),
-            ("pow_login_minutes", "0.02"),
             ("pow_post_minutes", "0.02"),
             ("registration_mode", "invite"),
             ("site_name", "secure-forum"),
@@ -247,7 +262,9 @@ impl Store {
     /// GetConfig — 对齐 Go `(string,error)` 语义：
     /// - not-found: Go 返回 sql.ErrNoRows; Rust 返回 Ok(None)（调用方可 fallback 到默认值）
     /// - DB 错误: Go 返回 error; Rust 返回 Err(anyhow)
-    /// 旧签名 `Option<String>` 会吞掉 DB 错误（`.ok().flatten()`），现改为 `Result<Option>` 以与 Go 一致可区分错误与缺失。
+    ///
+    /// 旧签名 `Option<String>` 会吞掉 DB 错误（`.ok().flatten()`），现改为 `Result<Option>`
+    /// 以与 Go 一致可区分错误与缺失。
     pub async fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as("SELECT value FROM configs WHERE key=?")
             .bind(key)
@@ -355,14 +372,6 @@ impl Store {
             .await?;
         Ok(())
     }
-    pub async fn set_user_admin(&self, id: i64, admin: bool) -> anyhow::Result<()> {
-        sqlx::query("UPDATE users SET is_admin=? WHERE id=?")
-            .bind(if admin { 1 } else { 0 })
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
     pub async fn update_password(&self, id: i64, hash: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE users SET password_hash=? WHERE id=?")
             .bind(hash)
@@ -371,13 +380,6 @@ impl Store {
             .await?;
         Ok(())
     }
-    pub async fn count_users(&self) -> anyhow::Result<i64> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.0)
-    }
-
     pub async fn audit(
         &self,
         actor_user_id: Option<i64>,
@@ -506,33 +508,19 @@ impl Store {
         parent_post_id: Option<i64>,
     ) -> anyhow::Result<i64> {
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,parent_post_id,content_md,content_html,created_at) VALUES(?,?,?,?,?,?,?,?)")
             .bind(thread_id).bind(board_id).bind(author_id).bind(if is_anonymous {1} else {0}).bind(parent_post_id).bind(md).bind(html).bind(&now)
-            .execute(&self.pool).await?;
+            .execute(&mut *tx).await?;
         let id = res.last_insert_rowid();
-        // 含回帖计数触发：bump thread
-        let _ =
-            sqlx::query("UPDATE threads SET reply_count=reply_count+1, last_reply_at=? WHERE id=?")
-                .bind(&now)
-                .bind(thread_id)
-                .execute(&self.pool)
-                .await?;
+        sqlx::query("UPDATE threads SET reply_count=reply_count+1, last_reply_at=? WHERE id=?")
+            .bind(&now)
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(id)
     }
-    /// 兼容旧调用：无父贴
-    pub async fn create_post_simple(
-        &self,
-        thread_id: i64,
-        board_id: i64,
-        author_id: i64,
-        is_anonymous: bool,
-        md: &str,
-        html: &str,
-    ) -> anyhow::Result<i64> {
-        self.create_post_with_parent(thread_id, board_id, author_id, is_anonymous, md, html, None)
-            .await
-    }
-
     /// ListPosts: thread 分页 + author join，未匿名显示 username，匿名仍存 author_id 但显示上游可忽略
     pub async fn list_posts(
         &self,
@@ -598,10 +586,34 @@ impl Store {
     }
 
     pub async fn delete_post(&self, id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let post = sqlx::query("SELECT thread_id FROM posts WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(post) = post else {
+            return Ok(());
+        };
+        let thread_id: i64 = post.get("thread_id");
+        let first_post: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM posts WHERE thread_id=? ORDER BY id ASC LIMIT 1")
+                .bind(thread_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         sqlx::query("DELETE FROM posts WHERE id=?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        if first_post.map(|row| row.0 != id).unwrap_or(false) {
+            sqlx::query(
+                "UPDATE threads SET reply_count=MAX(reply_count-1, 0), last_reply_at=COALESCE((SELECT MAX(created_at) FROM posts WHERE thread_id=?), created_at) WHERE id=?",
+            )
+            .bind(thread_id)
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -664,16 +676,6 @@ impl Store {
         }
         let threads: Vec<ThreadBrief> = map.into_values().collect();
         Ok((posts, threads, total.0))
-    }
-
-    /// helpers aligned with Go's IncrementReplyCount (kept for parity)
-    pub async fn increment_reply_count(&self, thread_id: i64, now: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE threads SET reply_count=reply_count+1, last_reply_at=? WHERE id=?")
-            .bind(now)
-            .bind(thread_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     // ---- threads — ported from Go internal/store/threads.go ----
@@ -1014,6 +1016,17 @@ mod tests {
         let (p2, _) = s.list_posts(tid, 2, 1).await?;
         assert_eq!(p2.len(), 1);
         assert_eq!(p2[0].id, pid2);
+        s.delete_post(pid2).await?;
+        let rc_after_delete: (i64,) = sqlx::query_as("SELECT reply_count FROM threads WHERE id=?")
+            .bind(tid)
+            .fetch_one(&s.pool)
+            .await?;
+        assert_eq!(rc_after_delete.0, 1);
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=?")
+            .bind(tid)
+            .fetch_one(&s.pool)
+            .await?;
+        assert_eq!(remaining.0, 1);
         let gp = s.get_post(pid1).await?.unwrap();
         assert_eq!(gp.id, pid1);
         let pid3 = s
@@ -1026,7 +1039,7 @@ mod tests {
                 "<p>banana</p>",
             )
             .await?;
-        let (hits, threads, total) = s.search_posts("banana", 1, 10).await?;
+        let (hits, threads, _total) = s.search_posts("banana", 1, 10).await?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, pid3);
         assert_eq!(threads.len(), 1);

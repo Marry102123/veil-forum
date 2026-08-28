@@ -1,5 +1,4 @@
 use chrono::Utc;
-use hex;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
@@ -24,28 +23,18 @@ pub struct Manager {
 #[derive(Clone, Debug)]
 pub enum Scope {
     Register,
-    Login,
     Post,
 }
 impl Scope {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Register => "register",
-            Self::Login => "login",
             Self::Post => "post",
-        }
-    }
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "login" => Self::Login,
-            "post" => Self::Post,
-            _ => Self::Register,
         }
     }
     fn config_key(&self) -> &'static str {
         match self {
             Self::Register => "pow_register_minutes",
-            Self::Login => "pow_login_minutes",
             Self::Post => "pow_post_minutes",
         }
     }
@@ -66,8 +55,8 @@ pub fn minutes_to_difficulty(m: f64) -> u32 {
     let secs = m * 60.0;
     let rate = 10.0;
     let hashes = secs * rate;
-    let d = (hashes.max(1.0).log2().round() as i32).clamp(4, 24) as u32;
-    d
+
+    (hashes.max(1.0).log2().round() as i32).clamp(4, 24) as u32
 }
 
 impl Manager {
@@ -176,15 +165,13 @@ impl Manager {
 fn has_leading_zeros(hash: &[u8], bits: u32) -> bool {
     let full = (bits / 8) as usize;
     let rem = bits % 8;
-    for i in 0..full {
-        if hash[i] != 0 {
+    for &byte in hash.iter().take(full) {
+        if byte != 0 {
             return false;
         }
     }
-    if rem > 0 {
-        if hash[full] >> (8 - rem) != 0 {
-            return false;
-        }
+    if rem > 0 && hash[full] >> (8 - rem) != 0 {
+        return false;
     }
     true
 }

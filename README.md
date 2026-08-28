@@ -21,7 +21,7 @@ traffic analysis.
 - Open, invite-only, and closed registration modes
 - Invite-only registration by default on new installations
 - Argon2id passwords, expiring sessions, CSRF and Origin checks
-- Proof of work for registration, login, and posting
+- Proof of work for registration and posting
 - Administrator controls for boards, invites, users, moderation, and notices
 - Administrator audit log
 - SQLite persistence with migrations and restrictive data-directory permissions

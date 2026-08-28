@@ -52,7 +52,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
-    ,last_seen_at TEXT NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(title, content_md, content='posts', content_rowid='id', tokenize='porter unicode61');
 CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN INSERT INTO posts_fts(rowid, title, content_md) VALUES (new.id, (SELECT title FROM threads WHERE id=new.thread_id), new.content_md); END;

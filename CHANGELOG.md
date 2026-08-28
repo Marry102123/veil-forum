@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-alpha.3
+
+- Remove login Proof-of-Work and its configuration, state, and stale locale
+  keys; registration and posting PoW are unchanged.
+- Serialize SQLite through a single connection with WAL, foreign keys, and a
+  busy timeout, and move reply-count updates into the same transactions as
+  post creation and deletion.
+- Remove the unused PoW challenge API rate-limit state and dead search, theme,
+  and challenge handlers from the previous cleanup.
+- Remove the unused Go-era `templates/` directory; the Rust binary renders all
+  pages server-side.
+- Add `scripts/backup.sh` for consistent online SQLite backups and
+  `scripts/release.sh` for reproducible release archives with sha256 checksums.
+
 ## 0.1.0-alpha.2
 
 - Clarify browser Proof-of-Work (PoW) anti-abuse checks in English, Chinese,

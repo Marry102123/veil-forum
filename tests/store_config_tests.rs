@@ -69,7 +69,6 @@ async fn get_all_configs_contains_defaults_and_inserted() -> anyhow::Result<()> 
     // seedDefaults 插入的 5+1 条
     for k in [
         "pow_register_minutes",
-        "pow_login_minutes",
         "pow_post_minutes",
         "registration_mode",
         "site_name",

@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use veil_forum::store::Store;
 
 #[tokio::main]
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     // We call Store::open again on same memory won't share, so test file DB
     let path = "/tmp/secure_forum_test_migrate.db";
     let _ = std::fs::remove_file(path);
-    let s1 = Store::open(path).await?;
+    let _s1 = Store::open(path).await?;
     println!("first file open ok");
     // second open on same file should be idempotent (calls migrate again)
     let s2 = Store::open(path).await?;
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     assert_eq!(cnt.0, 1);
 
     // Verify that 001 IF NOT EXISTS still works on second run
-    let s3 = Store::open(path).await?;
+    let _s3 = Store::open(path).await?;
     println!("third open ok");
     let _ = std::fs::remove_file(path);
     println!("ALL MIGRATE IDEMPOTENCY CHECKS PASSED");

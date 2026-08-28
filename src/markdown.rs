@@ -1,4 +1,3 @@
-use ammonia;
 use comrak::{markdown_to_html, ComrakOptions};
 use regex::Regex;
 

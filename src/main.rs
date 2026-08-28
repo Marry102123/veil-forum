@@ -51,10 +51,6 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         pow,
         password_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
-        pow_challenge_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
-        pow_challenge_times: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::new(),
-        )),
     };
     let app = handler::routes(state).layer(ConcurrencyLimitLayer::new(64));
     let listener = tokio::net::TcpListener::bind(&addr)

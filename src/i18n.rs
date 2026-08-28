@@ -5,6 +5,12 @@ pub struct I18n {
     locales: HashMap<String, HashMap<String, String>>,
 }
 
+impl Default for I18n {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl I18n {
     pub fn new() -> Self {
         let mut locales = HashMap::new();
@@ -32,46 +38,6 @@ impl I18n {
         }
         key.to_string()
     }
-    pub fn detect(
-        &self,
-        cookie_locale: Option<&str>,
-        accept_lang: Option<&str>,
-        default_locale: &str,
-    ) -> String {
-        if let Some(c) = cookie_locale {
-            if self.locales.contains_key(c) {
-                return c.to_string();
-            }
-        }
-        if let Some(al) = accept_lang {
-            for part in al.split(',') {
-                let lang = part
-                    .split(';')
-                    .next()
-                    .unwrap()
-                    .trim()
-                    .split('-')
-                    .next()
-                    .unwrap()
-                    .trim();
-                if self.locales.contains_key(lang) {
-                    return lang.to_string();
-                }
-                if lang.len() >= 2 {
-                    let short = &lang[0..2];
-                    if self.locales.contains_key(short) {
-                        return short.to_string();
-                    }
-                }
-            }
-        }
-        if self.locales.contains_key(default_locale) {
-            default_locale.to_string()
-        } else {
-            "en".to_string()
-        }
-    }
-
     pub fn supported() -> &'static [&'static str] {
         &["en", "zh", "ru"]
     }
