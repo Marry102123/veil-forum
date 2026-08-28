@@ -40,8 +40,10 @@ tar -xzf veil-forum-*-x86_64-unknown-linux-musl.tar.gz
 cd veil-forum-*
 ```
 
-The archive includes the `static/` directory. Keep it next to the binary, or
-install it at `/usr/local/static` when using the service templates.
+The release provides Linux archives for x86_64, aarch64, armv7, riscv64, i686,
+powerpc64le, and s390x targets. Choose the exact target matching your CPU and
+libc. The archive includes the `static/` directory. Keep it next to the binary,
+or install it at `/usr/local/static` when using the service templates.
 
 ### From source
 

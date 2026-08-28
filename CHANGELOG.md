@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.8
+
+- Expand the single-release Linux matrix to x86_64, aarch64, armv7, riscv64,
+  i686, powerpc64le, and s390x musl/GNU targets.
+
 ## 0.1.0-alpha.7
 
 - Fix the multi-architecture release aggregation job and publish both static

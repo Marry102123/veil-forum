@@ -32,6 +32,20 @@ jobs:
             image: messense/rust-musl-cross:x86_64-musl
           - target: aarch64-unknown-linux-musl
             image: messense/rust-musl-cross:aarch64-musl
+          - target: armv7-unknown-linux-musleabihf
+            image: messense/rust-musl-cross:armv7-musleabihf
+          - target: riscv64gc-unknown-linux-musl
+            image: messense/rust-musl-cross:riscv64-musl
+          - target: x86_64-unknown-linux-gnu
+            image: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main
+          - target: aarch64-unknown-linux-gnu
+            image: ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
+          - target: i686-unknown-linux-musl
+            image: messense/rust-musl-cross:i686-musl
+          - target: powerpc64le-unknown-linux-gnu
+            image: ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu:main
+          - target: s390x-unknown-linux-gnu
+            image: ghcr.io/cross-rs/s390x-unknown-linux-gnu:main
     permissions:
       contents: write
       actions: write
