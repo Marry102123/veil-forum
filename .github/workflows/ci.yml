@@ -29,13 +29,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - name: Build static musl binary
+        uses: addnab/docker-run-action@v3
+        with:
+          image: messense/rust-musl-cross:x86_64-musl
+          options: -v ${{ github.workspace }}:/volume
+          run: |
+            cd /volume
+            cargo build --release --target x86_64-unknown-linux-musl
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
-          cp target/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
+          cp target/x86_64-unknown-linux-musl/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
           cp -r static locales migrations deploy docs LICENSE README.md CHANGELOG.md SECURITY.md package/veil-forum-${GITHUB_REF_NAME}/
-          tar -czf veil-forum-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz -C package veil-forum-${GITHUB_REF_NAME}
+          tar -czf veil-forum-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz -C package veil-forum-${GITHUB_REF_NAME}
       - run: sha256sum veil-forum-*.tar.gz > veil-forum-${GITHUB_REF_NAME}-checksums.txt
       - name: Publish GitHub Release assets
         env:

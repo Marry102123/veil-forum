@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.5
+
+- Publish a statically linked Linux x86_64 musl release for compatibility with
+  older Debian systems.
+
 ## 0.1.0-alpha.4
 
 - Fix tagged CI release builds for the current inline-template layout and
