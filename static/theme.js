@@ -16,8 +16,19 @@
     return null;
   })();
   apply(saved || (window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
-  const button = document.getElementById('theme-toggle');
-  button?.addEventListener('click', () => {
-    apply(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
-  });
+  const bind = () => {
+    const button = document.getElementById('theme-toggle');
+    const fallback = document.querySelector('.noscript-themes');
+    if (!button) return;
+    button.style.display = '';
+    if (fallback) fallback.style.display = 'none';
+    button.addEventListener('click', () => {
+      apply(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bind, { once: true });
+  } else {
+    bind();
+  }
 })();

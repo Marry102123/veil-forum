@@ -1,7 +1,8 @@
+use axum::middleware;
 use axum::{
     extract::{Form, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
@@ -18,6 +19,11 @@ pub struct AppState {
     pub store: crate::store::Store,
     pub pow: crate::pow::Manager,
     pub password_gate: Arc<Semaphore>,
+}
+
+#[derive(Deserialize)]
+struct PowQuery {
+    scope: String,
 }
 
 const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'self'";
@@ -473,14 +479,16 @@ fn layout_html(
         s
     };
     let pow_scripts = if need_pow {
-        r#"<script src="/static/argon2-bundled.min.js"></script><script src="/static/pow.js"></script>"#
+        r#"<script src="/static/pow.js?v=2"></script>"#
     } else {
         ""
     };
+    // Always emit an explicit theme. Without data-theme="dark", the CSS
+    // prefers-color-scheme fallback can override a NoScript dark selection.
     let theme_attr = if theme == "light" {
         r#" data-theme="light""#
     } else {
-        ""
+        r#" data-theme="dark""#
     };
     let content = inject_csrf_fields(content.to_string(), headers);
     let search_label = crate::i18n::translate(locale, "nav.search");
@@ -518,7 +526,7 @@ fn layout_html(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>{title} - {site_name2}</title>
-<script src="/static/theme.js"></script>
+<script src="/static/theme.js?v=2"></script>
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/app.js"></script>
 {pow_scripts}
@@ -538,7 +546,7 @@ fn layout_html(
 <main>{content}</main>
 <aside class="side">
 <div class="card announcement-card"><b>{announcement_label}</b><div class="announcement-body">{announcement_body}</div></div>
-<div class="card display-card"><b>{display_label}</b><button id="theme-toggle" type="button" aria-label="{display_label}">☼</button><noscript><style>#theme-toggle{{display:none}}</style><span class="noscript-themes"><a href="/theme?to=light" aria-label="{light_label}">☼ {light_label}</a><a href="/theme?to=dark" aria-label="{dark_label}">☾ {dark_label}</a></span></noscript></div>
+<div class="card display-card"><b>{display_label}</b><button id="theme-toggle" type="button" aria-label="{display_label}" style="display:none">☼</button><span class="noscript-themes"><a class="theme-choice" href="/theme?to=light" aria-label="{light_label}">☼ {light_label}</a><a class="theme-choice" href="/theme?to=dark" aria-label="{dark_label}">☾ {dark_label}</a></span></div>
 <div class="card"><b>{stats_label}</b><div class="muted" style="margin-top:6px;font-size:11.5px;line-height:1.6">PoW {pow_minutes} min<br>{threads_label} {stats_threads} · {replies_label} {stats_posts}<br>{users_label} {stats_users}</div></div>
 <div class="card"><b>{recent_label}</b><div style="margin-top:4px">{recent_html}</div></div>
 </aside>
@@ -605,8 +613,8 @@ fn verify_pow_form(
 fn pow_fallback_html(ch: &crate::pow::Challenge, locale: &str) -> String {
     let ui = |en, zh, ru| crate::i18n::ui(locale, en, zh, ru);
     let py = format!(
-        r#"# pip install argon2-cffi
-import argon2.low_level
+        r#"# Python standard library only
+import hashlib
 def has_leading_zeros(h, bits):
     full = bits//8
     rem = bits%8
@@ -620,8 +628,8 @@ challenge = "{ch}"
 salt = "{salt}"
 difficulty = {diff}
 for nonce in range(20000000):
-    secret = f"{{salt}}{{challenge}}{{nonce}}".encode()
-    out = argon2.low_level.hash_secret_raw(secret, b"secure-forum-argon2-salt", 1, 16384, 1, 32, argon2.low_level.Type.ID)
+    secret = f"veil-forum-pow-v2{{salt}}{{challenge}}{{nonce}}".encode()
+    out = hashlib.sha256(secret).digest()
     if has_leading_zeros(out, difficulty):
         print(f"found nonce={{nonce}}")
         break
@@ -648,7 +656,7 @@ for nonce in range(20000000):
 <b>{manual_title}</b><br>
 {manual_help}<br>
 <pre style="white-space:pre-wrap">{py_esc}</pre>
-<small class="muted">pip install argon2-cffi | {difficulty_label} {diff} | {expires_label} {exp} | curl /api/pow/challenge?scope={scope}</small>
+        <small class="muted">Python 3 standard library | {difficulty_label} {diff} | {expires_label} {exp} | curl /api/pow/challenge?scope={scope}</small>
 </div>
 </div>
 </noscript>"#,
@@ -662,7 +670,7 @@ for nonce in range(20000000):
         nonce_label = ui("PoW nonce (manual when JavaScript is disabled)", "PoW Nonce（Tor 无JS请手算）", "PoW nonce (вручную без JavaScript)"),
         nonce_hint = ui("Paste nonce", "粘贴 nonce", "Вставьте nonce"),
         manual_title = ui("JavaScript disabled: manual PoW", "JS 已禁用 - 手动 PoW", "JavaScript отключён: ручной PoW"),
-        manual_help = ui("This form requires Argon2id 16 MB proof of work. Run this locally when JavaScript is unavailable.", "本表单需 Argon2id 16MB PoW，JS 自动完成；Tor 最高安全级请本地运行：", "Для формы требуется Argon2id proof of work на 16 МБ. Выполните локально без JavaScript."),
+        manual_help = ui("This form requires a SHA-256 proof of work. Run this locally when JavaScript is unavailable.", "本表单需 SHA-256 PoW，JS 自动完成；Tor 最高安全级请本地运行：", "Для формы требуется SHA-256 proof of work. Выполните локально без JavaScript."),
         difficulty_label = ui("difficulty", "难度", "сложность"),
         expires_label = ui("expires", "过期", "истекает")
     )
@@ -672,6 +680,7 @@ pub fn routes(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/healthz", get(healthz))
+        .route("/api/pow/challenge", get(pow_challenge))
         .route("/theme", get(theme_toggle))
         .route("/static/*path", get(handle_static))
         .route("/b/:slug", get(board))
@@ -701,7 +710,17 @@ pub fn routes(state: AppState) -> Router {
         .route("/admin/post/:id/delete", post(post_delete))
         .route("/admin/change-password", post(change_password))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
+        .layer(middleware::from_fn(theme_query_cookie))
         .with_state(state)
+}
+
+async fn pow_challenge(State(s): State<AppState>, Query(q): Query<PowQuery>) -> impl IntoResponse {
+    let scope = match q.scope.as_str() {
+        "register" => crate::pow::Scope::Register,
+        "post" => crate::pow::Scope::Post,
+        _ => return (StatusCode::BAD_REQUEST, "invalid PoW scope").into_response(),
+    };
+    apply_sec(axum::Json(s.pow.generate(scope).await).into_response())
 }
 
 async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
@@ -803,10 +822,38 @@ async fn theme_toggle(
     let location = headers
         .get(header::REFERER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|referer| referer.strip_prefix('/'))
-        .map(|path| format!("/{}", path))
-        .filter(|path| !path.starts_with("//"))
+        .and_then(|referer| {
+            let path = if referer.starts_with('/') {
+                referer.to_string()
+            } else {
+                referer
+                    .find("://")
+                    .and_then(|scheme| {
+                        referer[scheme + 3..]
+                            .find('/')
+                            .map(|p| &referer[scheme + 3 + p..])
+                    })
+                    .unwrap_or("/")
+                    .to_string()
+            };
+            let clean = path.split('#').next().unwrap_or("/");
+            (!clean.starts_with("//") && clean.starts_with('/')).then(|| clean.to_string())
+        })
         .unwrap_or_else(|| "/".to_string());
+    let mut parts = location.splitn(2, '?');
+    let path = parts.next().unwrap_or("/");
+    let query = parts.next().unwrap_or("");
+    let query = query
+        .split('&')
+        .filter(|part| !part.starts_with("theme=") && !part.is_empty())
+        .chain(std::iter::once(if theme == "light" {
+            "theme=light"
+        } else {
+            "theme=dark"
+        }))
+        .collect::<Vec<_>>()
+        .join("&");
+    let location = format!("{}?{}", path, query);
     let mut response = Redirect::to(&location).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -815,6 +862,46 @@ async fn theme_toggle(
             .expect("valid theme cookie"),
     );
     apply_sec(response)
+}
+
+// URL theme state is the no-cookie fallback used by NoScript and hardened
+// browsers. Inject it as a synthetic request cookie so all existing handlers
+// use the same rendering path without changing every handler signature.
+async fn theme_query_cookie(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let theme = request.uri().query().and_then(|query| {
+        query.split('&').find_map(|part| {
+            let mut kv = part.splitn(2, '=');
+            match (kv.next(), kv.next()) {
+                (Some("theme"), Some("light")) => Some("light"),
+                (Some("theme"), Some("dark")) => Some("dark"),
+                _ => None,
+            }
+        })
+    });
+    if let Some(theme) = theme {
+        let mut cookies = request
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .filter(|part| !part.trim_start().starts_with("theme="))
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        cookies.push(if theme == "light" {
+            "theme=light"
+        } else {
+            "theme=dark"
+        });
+        if let Ok(value) = cookies.join("; ").parse() {
+            request.headers_mut().insert(header::COOKIE, value);
+        }
+    }
+    next.run(request).await
 }
 
 async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

@@ -1,4 +1,4 @@
-importScripts('/static/argon2-bundled.min.js');
+// SHA-256 PoW keeps verification cheap for the server and portable in browsers.
 function hasLeadingZeros(hash, bits){
   const full = Math.floor(bits/8);
   const rem = bits%8;
@@ -18,23 +18,9 @@ self.onmessage = async (e) => {
     const expected = Math.pow(2, difficulty);
     try{
       while(true){
-        const pass = salt + challenge + nonce;
-        let res;
-        try{
-          res = await argon2.hash({
-            pass: pass,
-            salt: 'secure-forum-argon2-salt',
-            time: 1,
-            mem: 16384,
-            hashLen: 32,
-            parallelism: 1,
-            type: argon2.ArgonType.Argon2id
-          });
-        }catch(err){
-          self.postMessage({type:'error', message: err.message || String(err)});
-          return;
-        }
-        if(hasLeadingZeros(res.hash, difficulty)){
+        const data = new TextEncoder().encode('veil-forum-pow-v2' + salt + challenge + nonce);
+        const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+        if(hasLeadingZeros(hash, difficulty)){
           self.postMessage({type:'done', nonce: String(nonce)});
           return;
         }

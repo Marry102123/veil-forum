@@ -60,8 +60,9 @@ nav form{display:inline}
 #theme-toggle:hover{border-color:var(--border-strong)}
 .top-nav{gap:8px}
 .top-nav #theme-toggle{width:28px;height:26px;padding:0;font-size:18px;line-height:1}
-.noscript-themes{display:flex;gap:3px}
-.noscript-themes a{font-size:18px;line-height:1;padding:2px 5px}
+.noscript-themes{display:flex;gap:4px;margin-top:2px}
+.noscript-themes .theme-choice{flex:1;padding:5px 4px;text-align:center;font-size:12px;line-height:1.2;border:1px solid var(--border);background:var(--card);color:var(--fg)}
+.noscript-themes .theme-choice:hover{border-color:var(--border-strong);text-decoration:none}
 
 /* layout */
 .layout{

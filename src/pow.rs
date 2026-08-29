@@ -1,17 +1,15 @@
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 type HmacSha256 = Hmac<Sha256>;
 const DEFAULT_MINUTES: f64 = 0.02;
 const MAX_MINUTES: f64 = 10.0;
-const ARGON_TIME: u32 = 1;
-const ARGON_MEM: u32 = 16 * 1024;
-const ARGON_PAR: u32 = 1;
-const ARGON_SALT: &[u8] = b"secure-forum-argon2-salt";
+const POW_DOMAIN: &[u8] = b"veil-forum-pow-v2";
+const MAX_USED_CHALLENGES: usize = 10_000;
 
 #[derive(Clone)]
 pub struct Manager {
@@ -106,6 +104,7 @@ impl Manager {
             scope: scope.as_str().to_string(),
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn verify(
         &self,
         scope: Scope,
@@ -122,8 +121,8 @@ impl Manager {
         let payload = format!("{}:{}:{}:{}:{}", ch, salt, diff, exp, scope.as_str());
         let mut mac = HmacSha256::new_from_slice(&self.hmac_key).unwrap();
         mac.update(payload.as_bytes());
-        let expected = hex::encode(mac.finalize().into_bytes());
-        if expected != hmac_hex {
+        let provided = hex::decode(hmac_hex).map_err(|_| anyhow::anyhow!("invalid hmac"))?;
+        if mac.verify_slice(&provided).is_err() {
             anyhow::bail!("hmac mismatch");
         }
         // 预占用防重放，短临界区，不跨 await
@@ -134,6 +133,15 @@ impl Manager {
             }
             let now = Utc::now().timestamp();
             used.retain(|_, e| *e >= now);
+            if used.len() >= MAX_USED_CHALLENGES {
+                if let Some(oldest) = used
+                    .iter()
+                    .min_by_key(|(_, expires_at)| **expires_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    used.remove(&oldest);
+                }
+            }
             used.insert(hmac_hex.to_string(), exp);
         }
         let cur = self.get_difficulty(&scope).await;
@@ -142,19 +150,12 @@ impl Manager {
             self.used.lock().unwrap().remove(hmac_hex);
             anyhow::bail!("difficulty too low: got {} want {}", diff, cur);
         }
-        let mut out = [0u8; 32];
-        let params = argon2::Params::new(ARGON_MEM, ARGON_TIME, ARGON_PAR, Some(32)).unwrap();
-        let a2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-        let hash_res = a2.hash_password_into(
-            format!("{}{}{}", salt, ch, nonce).as_bytes(),
-            ARGON_SALT,
-            &mut out,
-        );
-        if let Err(e) = hash_res {
-            self.used.lock().unwrap().remove(hmac_hex);
-            anyhow::bail!("{}", e);
-        }
-        let hash = out;
+        let mut hasher = Sha256::new();
+        hasher.update(POW_DOMAIN);
+        hasher.update(salt.as_bytes());
+        hasher.update(ch.as_bytes());
+        hasher.update(nonce.as_bytes());
+        let hash = hasher.finalize();
         if !has_leading_zeros(&hash, diff) {
             self.used.lock().unwrap().remove(hmac_hex);
             anyhow::bail!("pow failed");

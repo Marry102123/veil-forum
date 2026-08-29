@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.13
+
+- Fix the PoW challenge API and switch proof of work verification to SHA-256.
+- Make theme switching work with JavaScript disabled, including URL fallback.
+- Improve Chinese search with an idempotent FTS5 trigram index and safe queries.
+- Remove the obsolete Go listener message and harden PoW replay handling.
+
 ## 0.1.0-alpha.12
 
 - Build the PowerPC64LE GNU release target with Ubuntu's GCC cross-toolchain.

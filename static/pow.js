@@ -29,24 +29,9 @@ async function solvePowMainThread(challenge, salt, difficulty){
   }
   if (containerEl) containerEl.style.display = 'block';
   if (progressEl) progressEl.style.width = '0%';
-  if (typeof argon2 === 'undefined') throw new Error('argon2 not loaded');
   while (true) {
-    const pass = salt + challenge + nonce;
-    let hash;
-    try {
-      const res = await argon2.hash({
-        pass: pass,
-        salt: 'secure-forum-argon2-salt',
-        time: 1,
-        mem: 16384,
-        hashLen: 32,
-        parallelism: 1,
-        type: argon2.ArgonType.Argon2id
-      });
-      hash = res.hash;
-    } catch (e) {
-      throw new Error('argon2 error: ' + e.message);
-    }
+    const data = new TextEncoder().encode('veil-forum-pow-v2' + salt + challenge + nonce);
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
     if (hasLeadingZeros(hash, difficulty)) {
       if (progressEl) progressEl.style.width = '100%';
       if (statusEl) statusEl.textContent = statusEl.dataset.done || 'PoW anti-abuse check completed';

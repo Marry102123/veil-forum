@@ -224,6 +224,22 @@ impl Store {
                 sqlx::query(sql).execute(&self.pool).await?;
             }
         }
+        // 007_search_trigram.sql contains trigger bodies with semicolons. Run
+        // it once, rather than rebuilding the complete index on every startup.
+        let search_version: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM configs WHERE key='search_index_version'")
+                .fetch_optional(&self.pool)
+                .await?;
+        if search_version.as_ref().map(|v| v.0.as_str()) != Some("trigram-v1") {
+            sqlx::raw_sql(include_str!("../migrations/007_search_trigram.sql"))
+                .execute(&self.pool)
+                .await?;
+            sqlx::query(
+                "INSERT INTO configs(key,value) VALUES('search_index_version','trigram-v1') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
         // 清除已下线功能（登录 PoW）遗留的配置键，幂等
         sqlx::query("DELETE FROM configs WHERE key='pow_login_minutes'")
             .execute(&self.pool)
@@ -497,6 +513,7 @@ impl Store {
             .await
     }
     /// CreatePostWithParent: 楼中楼，parent_post_id None 表示回楼主，Some(pid) 表示回复某条评论
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_post_with_parent(
         &self,
         thread_id: i64,
@@ -632,23 +649,44 @@ impl Store {
         if q.is_empty() {
             return Ok((Vec::new(), Vec::new(), 0));
         }
-        let total: (i64,) =
+        let short_query = q.chars().count() < 3;
+        // MATCH has its own query language. Quote the whole user input so
+        // punctuation cannot turn into operators or malformed FTS syntax.
+        let fts_query = format!("\"{}\"", q.replace('"', "\"\""));
+        let total: (i64,) = if short_query {
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM posts p JOIN threads th ON th.id=p.thread_id WHERE th.title LIKE ? OR p.content_md LIKE ?",
+            )
+            .bind(format!("%{}%", q))
+            .bind(format!("%{}%", q))
+            .fetch_one(&self.pool)
+            .await?
+        } else {
             sqlx::query_as("SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH ?")
-                .bind(q)
+                .bind(&fts_query)
                 .fetch_one(&self.pool)
-                .await?;
-        let rows = sqlx::query(
-            "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, \
-                    COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id \
-             FROM posts_fts \
-             JOIN posts p ON p.id=posts_fts.rowid \
-             JOIN threads th ON th.id=p.thread_id \
-             LEFT JOIN users u ON u.id=p.author_id \
-             WHERE posts_fts MATCH ? \
-             ORDER BY rank LIMIT ? OFFSET ?"
-        )
-        .bind(q).bind(page_size).bind(offset)
-        .fetch_all(&self.pool).await?;
+                .await?
+        };
+        let rows = if short_query {
+            sqlx::query(
+                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts p JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE th.title LIKE ? OR p.content_md LIKE ? ORDER BY p.id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(format!("%{}%", q))
+            .bind(format!("%{}%", q))
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE posts_fts MATCH ? ORDER BY rank LIMIT ? OFFSET ?",
+            )
+            .bind(&fts_query)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        };
         let mut posts = Vec::with_capacity(rows.len());
         let mut map: std::collections::HashMap<i64, ThreadBrief> = std::collections::HashMap::new();
         for r in rows {

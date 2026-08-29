@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| anyhow::anyhow!("bind listener {}: {}", addr, e))?;
-    println!("Rust listening on {} (Go on 8000)", addr);
+    println!("Rust listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
 }
