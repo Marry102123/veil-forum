@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0-alpha.15
+
+- Add process-local privacy-preserving rate limits using `governor`: global
+  limits for authentication and PoW issuance, plus keyed posting limits derived
+  from a one-way, per-process HMAC of a session ID. The application neither
+  records IP addresses nor persists client identifiers for this feature.
+- Consolidate session cookie parsing through `axum-extra`, keep the CSRF/Origin
+  gate on every mutating form route, and retain the 64 KiB form-body limit.
+- Further harden the systemd unit and document `systemd-analyze verify` and
+  `systemd-analyze security` compatibility checks.
+- Pin GitHub Actions to immutable commits, add weekly Dependabot updates and
+  `cargo-deny` supply-chain policy checks.
+- Move layout sidebar fragments into embedded Tera partials, reducing manual
+  HTML construction while preserving automatic escaping.
+- Add a safe SQLite integrity and online-backup maintenance script with
+  validated backups and bounded retention.
+
 ## 0.1.0-alpha.14
 
 - Replace hand-built server HTML with embedded Tera templates. Templates are

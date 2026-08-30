@@ -1,6 +1,6 @@
 [package]
 name = "veil-forum"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
@@ -23,6 +23,8 @@ sha2 = "0.10"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+axum-extra = { version = "0.9", features = ["cookie"] }
+governor = "0.6"
 tera = "1.19"
 tower = { version = "0.4", features = ["limit", "util"] }
 tower-http = { version = "0.5", features = ["trace", "fs", "limit"] }

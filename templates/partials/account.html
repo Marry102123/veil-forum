@@ -1,0 +1,5 @@
+{% if account_user %}
+<div class="account-name">{{ account_user.username }}</div><div class="account-links">{% if account_user.is_admin %}<a href="/admin">{{ admin_label }}</a>{% endif %}<form method="POST" action="/logout">{{ csrf_field | safe }}<button class="btn-sm" aria-label="{{ logout_label }}">{{ logout_label }}</button></form></div>
+{% else %}
+<div class="account-links"><a class="btn-link" href="/login">{{ login_label }}</a><a class="btn-link" href="/register">{{ register_label }}</a></div><div class="muted account-note">{{ login_hint }}</div>
+{% endif %}

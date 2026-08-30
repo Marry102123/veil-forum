@@ -23,12 +23,20 @@ ProtectControlGroups=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
+# ProtectProc/ProcSubset require systemd 247+. Omit these two lines only on
+# older systemd versions; the remaining restrictions are intentionally kept.
+ProtectProc=invisible
+ProcSubset=pid
 ReadWritePaths=/var/lib/veil-forum
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 MemoryDenyWriteExecute=true
 LockPersonality=true
 RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 UMask=0077
 
 [Install]

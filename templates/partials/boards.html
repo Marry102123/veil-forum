@@ -1,0 +1,1 @@
+{% if boards | length == 0 %}<div class="muted">{{ no_boards_label }}</div>{% else %}{% for board in boards %}<div class="board-list-item"><a href="/b/{{ board.slug | urlencode }}" title="{{ board.description }}">{{ board.name }}</a> <span class="muted">/{{ board.slug }}</span></div>{% endfor %}{% endif %}

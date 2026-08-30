@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use axum_extra::extract::cookie::Cookie;
 use hmac::Mac;
 use rand::RngCore;
 use serde::Deserialize;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub store: crate::store::Store,
     pub pow: crate::pow::Manager,
     pub password_gate: Arc<Semaphore>,
+    pub limits: crate::rate_limit::Limits,
 }
 
 #[derive(Deserialize)]
@@ -38,17 +40,21 @@ fn csrf_key() -> &'static [u8; 32] {
         k
     })
 }
-fn csrf_token(headers: &HeaderMap) -> String {
-    let session = headers
+fn session_id(headers: &HeaderMap) -> Option<String> {
+    headers
         .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookie| {
-            cookie.split(';').find_map(|part| {
-                let mut kv = part.trim().splitn(2, '=');
-                (kv.next()? == "session_id").then(|| kv.next().unwrap_or("").to_string())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|part| {
+                Cookie::parse(part.trim())
+                    .ok()
+                    .filter(|cookie| cookie.name() == "session_id")
+                    .map(|cookie| cookie.value().to_owned())
             })
         })
-        .unwrap_or_else(|| "anonymous".to_string());
+}
+fn csrf_token(headers: &HeaderMap) -> String {
+    let session = session_id(headers).unwrap_or_else(|| "anonymous".to_string());
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
     let nonce_hex = hex::encode(nonce);
@@ -69,16 +75,7 @@ fn valid_csrf(headers: &HeaderMap, form: &HashMap<String, String>) -> bool {
     if supplied.len() != 128 || !supplied.chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
-    let session = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookie| {
-            cookie.split(';').find_map(|part| {
-                let mut kv = part.trim().splitn(2, '=');
-                (kv.next()? == "session_id").then(|| kv.next().unwrap_or("").to_string())
-            })
-        })
-        .unwrap_or_else(|| "anonymous".to_string());
+    let session = session_id(headers).unwrap_or_else(|| "anonymous".to_string());
     let nonce = &supplied[..64];
     let mut mac =
         hmac::Hmac::<sha2::Sha256>::new_from_slice(csrf_key()).expect("fixed-size HMAC key");
@@ -259,17 +256,8 @@ async fn get_site_name(store: &crate::store::Store) -> String {
         .unwrap_or_else(|| "secure-forum".to_string())
 }
 async fn current_user(state: &AppState, headers: &HeaderMap) -> Option<crate::store::User> {
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in cookie.split(';') {
-        let kv: Vec<&str> = part.trim().splitn(2, '=').collect();
-        if kv.len() == 2 && kv[0].trim() == "session_id" {
-            let sid = kv[1].trim();
-            if let Ok(Some(u)) = state.store.get_user_by_session(sid).await {
-                return Some(u);
-            }
-        }
-    }
-    None
+    let sid = session_id(headers)?;
+    state.store.get_user_by_session(&sid).await.ok().flatten()
 }
 async fn sidebar_data(
     store: &crate::store::Store,
@@ -373,31 +361,6 @@ fn layout_html(
     headers: &HeaderMap,
 ) -> String {
     let ui = |en, zh, ru| crate::i18n::ui(locale, en, zh, ru);
-    let account_html = if let Some(u) = user {
-        let admin_link = if u.is_admin {
-            format!(
-                r#"<a href="/admin">{}</a>"#,
-                crate::i18n::translate(locale, "nav.admin")
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            r#"<div class="account-name">{}</div><div class="account-links">{}<form method="POST" action="/logout">{}<button class="btn-sm" aria-label="{}">{}</button></form></div>"#,
-            html_escape(&u.username),
-            admin_link,
-            csrf_field(headers),
-            crate::i18n::translate(locale, "nav.logout"),
-            crate::i18n::translate(locale, "nav.logout")
-        )
-    } else {
-        format!(
-            r#"<div class="account-links"><a class="btn-link" href="/login">{}</a><a class="btn-link" href="/register">{}</a></div><div class="muted account-note">{}</div>"#,
-            crate::i18n::translate(locale, "nav.login"),
-            crate::i18n::translate(locale, "nav.register"),
-            crate::i18n::translate(locale, "account.login_hint")
-        )
-    };
     let flash_html = if let Some((msg, kind)) = flash {
         format!(
             r#"<div class="flash flash-{}" role="alert" aria-live="polite">{}</div>"#,
@@ -406,35 +369,6 @@ fn layout_html(
         )
     } else {
         "".to_string()
-    };
-    let boards_html = if boards.is_empty() {
-        format!(
-            r#"<div class="muted">{}</div>"#,
-            ui("No boards", "暂无版块", "Нет разделов")
-        )
-    } else {
-        let mut s = String::new();
-        for b in boards {
-            s.push_str(&format!(r#"<div class="board-list-item"><a href="/b/{}" title="{}">{}</a> <span class="muted">/{}</span></div>"#, html_escape(&b.slug), html_escape(&b.description), html_escape(&b.name), html_escape(&b.slug)));
-        }
-        s
-    };
-    let recent_html = if recent.is_empty() {
-        format!(
-            r#"<div class="muted" style="padding:6px 0">{}</div>"#,
-            ui("None", "暂无", "Нет")
-        )
-    } else {
-        let mut s = String::new();
-        for t in recent {
-            s.push_str(&format!(
-                r#"<div class="recent-item"><a href="/t/{}" title="{}">{}</a></div>"#,
-                t.id,
-                html_escape(&t.title),
-                html_escape(&t.title)
-            ));
-        }
-        s
     };
     // Always emit an explicit theme. Without data-theme="dark", the CSS
     // prefers-color-scheme fallback can override a NoScript dark selection.
@@ -472,19 +406,45 @@ fn layout_html(
     context.insert("theme", if theme == "light" { "light" } else { "dark" });
     context.insert("need_pow", &need_pow);
     context.insert("flash_html", &flash_html);
-    context.insert("account_html", &account_html);
-    context.insert("boards_html", &boards_html);
+    context.insert("csrf_field", &csrf_field(headers));
+    context.insert(
+        "account_user",
+        &user.map(|u| serde_json::json!({"username": u.username, "is_admin": u.is_admin})),
+    );
+    context.insert("boards", &boards.iter().map(|b| serde_json::json!({"slug": b.slug, "name": b.name, "description": b.description})).collect::<Vec<_>>());
     context.insert("boards_len", &boards.len());
     context.insert("content", &content);
     context.insert("pow_minutes", pow_minutes);
     context.insert("stats_threads", &stats_threads);
     context.insert("stats_posts", &stats_posts);
     context.insert("stats_users", &stats_users);
-    context.insert("recent_html", &recent_html);
+    context.insert(
+        "recent",
+        &recent
+            .iter()
+            .map(|t| serde_json::json!({"id": t.id, "title": t.title}))
+            .collect::<Vec<_>>(),
+    );
     context.insert("announcement_body", &announcement_body);
     for (key, value) in [
         ("search_label", search_label),
         ("account_label", account_label),
+        ("admin_label", crate::i18n::translate(locale, "nav.admin")),
+        ("login_label", crate::i18n::translate(locale, "nav.login")),
+        (
+            "register_label",
+            crate::i18n::translate(locale, "nav.register"),
+        ),
+        ("logout_label", crate::i18n::translate(locale, "nav.logout")),
+        (
+            "login_hint",
+            crate::i18n::translate(locale, "account.login_hint"),
+        ),
+        (
+            "no_boards_label",
+            ui("No boards", "暂无版块", "Нет разделов"),
+        ),
+        ("no_recent_label", ui("None", "暂无", "Нет")),
         ("boards_label", boards_label),
         ("board_count", board_count),
         ("all_boards", all_boards),
@@ -636,6 +596,9 @@ pub fn routes(state: AppState) -> Router {
 }
 
 async fn pow_challenge(State(s): State<AppState>, Query(q): Query<PowQuery>) -> impl IntoResponse {
+    if !s.limits.allow_challenge() {
+        return apply_sec((StatusCode::TOO_MANY_REQUESTS, "challenge rate limit").into_response());
+    }
     let scope = match q.scope.as_str() {
         "register" => crate::pow::Scope::Register,
         "login" => crate::pow::Scope::Login,
@@ -1408,6 +1371,11 @@ async fn register_post(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if !s.limits.allow_auth() {
+        return apply_sec(
+            (StatusCode::TOO_MANY_REQUESTS, "authentication rate limit").into_response(),
+        );
+    }
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
@@ -1608,6 +1576,11 @@ async fn login_post(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if !s.limits.allow_auth() {
+        return apply_sec(
+            (StatusCode::TOO_MANY_REQUESTS, "authentication rate limit").into_response(),
+        );
+    }
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
@@ -1743,6 +1716,9 @@ async fn new_thread(
         let resp = (StatusCode::FORBIDDEN, "banned").into_response();
         return apply_sec(resp);
     }
+    if !s.limits.allow_post(session_id(&headers).as_deref()) {
+        return apply_sec((StatusCode::TOO_MANY_REQUESTS, "posting rate limit").into_response());
+    }
     let board_opt = s.store.get_board_by_slug(&slug).await.unwrap_or(None);
     let board = match board_opt {
         Some(b) => b,
@@ -1833,6 +1809,9 @@ async fn reply(
     if u.is_banned {
         let resp = (StatusCode::FORBIDDEN, "banned").into_response();
         return apply_sec(resp);
+    }
+    if !s.limits.allow_post(session_id(&headers).as_deref()) {
+        return apply_sec((StatusCode::TOO_MANY_REQUESTS, "posting rate limit").into_response());
     }
     let th_opt = s.store.get_thread(id).await.unwrap_or(None);
     let th = match th_opt {

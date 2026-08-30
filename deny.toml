@@ -1,0 +1,32 @@
+[graph]
+targets = []
+all-features = true
+
+[advisories]
+version = 2
+ignore = [
+  "RUSTSEC-2023-0071",
+  "RUSTSEC-2024-0320",
+  "RUSTSEC-2025-0141",
+  "RUSTSEC-2025-0081",
+  "RUSTSEC-2025-0075",
+  "RUSTSEC-2025-0080",
+  "RUSTSEC-2025-0079",
+  "RUSTSEC-2025-0074",
+  "RUSTSEC-2025-0104",
+  "RUSTSEC-2025-0098",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "AGPL-3.0-only", "MPL-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

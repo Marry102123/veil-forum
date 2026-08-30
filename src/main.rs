@@ -4,6 +4,7 @@ mod handler;
 mod i18n;
 mod markdown;
 mod pow;
+mod rate_limit;
 mod store;
 mod templates;
 
@@ -51,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let state = handler::AppState {
         store: store.clone(),
         pow,
+        limits: crate::rate_limit::Limits::new(),
         password_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let app = handler::routes(state).layer(ConcurrencyLimitLayer::new(64));

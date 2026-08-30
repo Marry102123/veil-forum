@@ -1,0 +1,1 @@
+{% if recent | length == 0 %}<div class="muted" style="padding:6px 0">{{ no_recent_label }}</div>{% else %}{% for thread in recent %}<div class="recent-item"><a href="/t/{{ thread.id }}" title="{{ thread.title }}">{{ thread.title }}</a></div>{% endfor %}{% endif %}

@@ -34,6 +34,7 @@ async fn app() -> anyhow::Result<axum::Router> {
     let store = Store { pool };
     let state = handler::AppState {
         pow: pow::Manager::new(store.clone()),
+        limits: veil_forum::rate_limit::Limits::new(),
         store,
         password_gate: Arc::new(Semaphore::new(8)),
     };

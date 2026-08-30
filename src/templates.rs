@@ -15,6 +15,21 @@ fn templates() -> &'static Tera {
         )
         .expect("embedded PoW fallback template must be valid");
         tera.add_raw_template(
+            "partials/account.html",
+            include_str!("../templates/partials/account.html"),
+        )
+        .expect("embedded account template must be valid");
+        tera.add_raw_template(
+            "partials/boards.html",
+            include_str!("../templates/partials/boards.html"),
+        )
+        .expect("embedded boards template must be valid");
+        tera.add_raw_template(
+            "partials/recent.html",
+            include_str!("../templates/partials/recent.html"),
+        )
+        .expect("embedded recent template must be valid");
+        tera.add_raw_template(
             "pages/home.html",
             include_str!("../templates/pages/home.html"),
         )

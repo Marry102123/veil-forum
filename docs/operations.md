@@ -2,16 +2,19 @@
 
 ## Backup
 
-Use the included online backup script while the service is running:
+Use the included SQLite maintenance script while the service is running:
 
 ```bash
-sudo scripts/backup.sh /var/lib/veil-forum /srv/veil-forum-backups
+sudo scripts/db-maintenance.sh check /var/lib/veil-forum
+sudo scripts/db-maintenance.sh backup /var/lib/veil-forum /srv/veil-forum-backups
 ```
 
-The script uses SQLite `VACUUM INTO` for a consistent online backup, keeps the
-30 most recent backups, and sets mode 600 on all backup files. Without
-`sqlite3` or `sqlite3-rsync` it falls back to a plain file copy, which is only
-consistent while the service is stopped or idle.
+`check` runs SQLite `PRAGMA integrity_check` and exits non-zero on corruption.
+`backup` uses SQLite's online `.backup` command, verifies the resulting file
+with `integrity_check`, atomically renames it into place, keeps the 30 most
+recent backups, and sets mode 600 on backup files. It requires `sqlite3` and
+never falls back to copying a live WAL database. The older `scripts/backup.sh`
+remains available for compatibility.
 
 Protect the database, `-wal`, and `-shm` files as sensitive data because they
 can contain sessions and deleted content.
@@ -64,6 +67,20 @@ sudo systemctl enable --now veil-forum
 sudo systemctl status veil-forum
 sudo journalctl -u veil-forum --since '-10 min'
 ```
+
+Validate the installed unit before enabling it and inspect the hardening score:
+
+```bash
+sudo systemd-analyze verify /etc/systemd/system/veil-forum.service
+systemd-analyze security veil-forum.service
+```
+
+`ProtectProc=invisible` and `ProcSubset=pid` need systemd 247 or newer. On an
+older systemd, remove only those two directives as noted in the unit comments,
+then rerun both commands. If `SystemCallFilter=@system-service` causes a
+startup failure on a vendor-specific systemd/kernel combination, remove that
+single filter and retain the other restrictions. Confirm the service still
+starts before deployment.
 
 Set `VEIL_ADMIN_PASSWORD` only for the first start using a protected service
 manager mechanism, then remove it and restart the service.
