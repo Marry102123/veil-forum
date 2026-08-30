@@ -1,0 +1,15 @@
+{% if boards | length == 0 %}
+<div class="empty">{{ empty_label | default(value="No boards yet") }}</div>
+{% else %}
+<h2>{{ boards_label | default(value="Boards") }}</h2>
+{% for board in boards %}
+<div class="card board-card">
+  <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+    <a href="/b/{{ board.slug | urlencode }}" class="board-link">{{ board.name }}</a>
+    <span class="slug">/{{ board.slug }}</span>
+    <span class="muted" style="font-size:11px">· {{ board.anonymous_label | default(value="Anonymous") }} · {{ board.access_label | default(value="Public") }}</span>
+  </div>
+  <p class="desc">{{ board.description }}</p>
+</div>
+{% endfor %}
+{% endif %}

@@ -1,0 +1,7 @@
+{% if total_pages > 1 %}
+<nav class="pagination" aria-label="{{ page_label | default(value="Page") }}">
+{% if page > 1 %}<a href="?page={{ page - 1 }}">&laquo;</a>{% endif %}
+<span>{{ page }} / {{ total_pages }}</span>
+{% if page < total_pages %}<a href="?page={{ page + 1 }}">&raquo;</a>{% endif %}
+</nav>
+{% endif %}

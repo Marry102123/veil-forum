@@ -1,5 +1,5 @@
 use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
+use sqlx::{sqlite::SqliteConnectOptions, Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 
 #[derive(Clone)]
@@ -154,101 +154,95 @@ impl Store {
         Ok(s)
     }
     async fn migrate(&self) -> anyhow::Result<()> {
-        // 001_init.sql: 全部为 CREATE IF NOT EXISTS / TRIGGER IF NOT EXISTS / INDEX IF NOT EXISTS，天然幂等，与 Go 的 migrate 行为一致
-        sqlx::raw_sql(include_str!("../migrations/001_init.sql"))
-            .execute(&self.pool)
+        // The marker table makes startup migrations observable and prevents a later
+        // migration from being skipped after a process is interrupted.
+        sqlx::query("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            .execute(&self.pool).await?;
+        self.apply_raw_migration(1, include_str!("../migrations/001_init.sql"))
             .await?;
-        // 002_i18n.sql: 依次执行 ALTER ADD COLUMN locale / name_i18n + INSERT default_locale
-        // 幂等性：INSERT 使用 OR IGNORE；ALTER 需容忍重复列（duplicate column / already exists），重复执行不报错
-        // raw_sql 多语句批量在中间 ALTER duplicate 时会中断，故逐条执行并单独容错，确保与 Go 的逐条 Exec 语义一致
-        for stmt in include_str!("../migrations/002_i18n.sql").split(';') {
-            let sql = stmt.trim();
-            if sql.is_empty() {
-                continue;
-            }
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("duplicate column")
-                    || msg.contains("already exists")
-                    || msg.contains("duplicate")
-                {
-                    continue;
-                }
-                return Err(anyhow::anyhow!("migrate 002 failed: {} stmt={:?}", e, sql));
-            }
+        for (version, sql) in [
+            (2, include_str!("../migrations/002_i18n.sql")),
+            (3, include_str!("../migrations/003_parent.sql")),
+            (4, include_str!("../migrations/004_security.sql")),
+            (5, include_str!("../migrations/005_default_english.sql")),
+            (
+                6,
+                include_str!("../migrations/006_default_board_english.sql"),
+            ),
+        ] {
+            self.apply_sql_migration(version, sql).await?;
         }
-        // 003_parent.sql: posts.parent_post_id 楼中楼
-        for stmt in include_str!("../migrations/003_parent.sql").split(';') {
-            let sql = stmt.trim();
-            if sql.is_empty() {
-                continue;
-            }
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("duplicate column")
-                    || msg.contains("already exists")
-                    || msg.contains("duplicate")
-                {
-                    continue;
-                }
-                return Err(anyhow::anyhow!("migrate 003 failed: {} stmt={:?}", e, sql));
-            }
-        }
-        // 004_security.sql: idle sessions and audit log. ALTER is intentionally idempotent.
-        for stmt in include_str!("../migrations/004_security.sql").split(';') {
-            let sql = stmt.trim();
-            if sql.is_empty() {
-                continue;
-            }
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("duplicate column")
-                    || msg.contains("already exists")
-                    || msg.contains("duplicate")
-                {
-                    continue;
-                }
-                return Err(anyhow::anyhow!("migrate 004 failed: {} stmt={:?}", e, sql));
-            }
-        }
-        for stmt in include_str!("../migrations/005_default_english.sql").split(';') {
-            let sql = stmt.trim();
-            if sql.is_empty() {
-                continue;
-            }
-            sqlx::query(sql).execute(&self.pool).await?;
-        }
-        for stmt in include_str!("../migrations/006_default_board_english.sql").split(';') {
-            let sql = stmt.trim();
-            if !sql.is_empty() {
-                sqlx::query(sql).execute(&self.pool).await?;
-            }
-        }
-        // 007_search_trigram.sql contains trigger bodies with semicolons. Run
-        // it once, rather than rebuilding the complete index on every startup.
-        let search_version: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM configs WHERE key='search_index_version'")
-                .fetch_optional(&self.pool)
-                .await?;
-        if search_version.as_ref().map(|v| v.0.as_str()) != Some("trigram-v1") {
-            sqlx::raw_sql(include_str!("../migrations/007_search_trigram.sql"))
-                .execute(&self.pool)
-                .await?;
-            sqlx::query(
-                "INSERT INTO configs(key,value) VALUES('search_index_version','trigram-v1') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            )
-            .execute(&self.pool)
+        // 007 contains semicolons inside trigger bodies, so execute it as one batch.
+        self.apply_raw_migration(7, include_str!("../migrations/007_search_trigram.sql"))
             .await?;
+        self.apply_sql_migration(
+            8,
+            "INSERT OR IGNORE INTO configs(key,value) VALUES('pow_login_minutes','0.02');",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn apply_sql_migration(&self, version: i64, sql: &str) -> anyhow::Result<()> {
+        if self.migration_applied(version).await? {
+            return Ok(());
         }
-        // 清除已下线功能（登录 PoW）遗留的配置键，幂等
-        sqlx::query("DELETE FROM configs WHERE key='pow_login_minutes'")
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await?;
+        for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Err(e) = sqlx::query(stmt).execute(&mut *tx).await {
+                let msg = e.to_string().to_lowercase();
+                if !(msg.contains("duplicate column")
+                    || msg.contains("already exists")
+                    || msg.contains("duplicate"))
+                {
+                    return Err(anyhow::anyhow!(
+                        "migration {version} failed: {e}; statement={stmt:?}"
+                    ));
+                }
+            }
+        }
+        self.record_migration(&mut tx, version).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn apply_raw_migration(&self, version: i64, sql: &str) -> anyhow::Result<()> {
+        if self.migration_applied(version).await? {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::raw_sql(sql).execute(&mut *tx).await?;
+        self.record_migration(&mut tx, version).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn migration_applied(&self, version: i64) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?)",
+        )
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+
+    async fn record_migration(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        version: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)")
+            .bind(version)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **tx)
             .await?;
         Ok(())
     }
     async fn seed_defaults(&self) -> anyhow::Result<()> {
         let defaults = [
             ("pow_register_minutes", "0.02"),
+            ("pow_login_minutes", "0.02"),
             ("pow_post_minutes", "0.02"),
             ("registration_mode", "invite"),
             ("site_name", "secure-forum"),
@@ -645,14 +639,22 @@ impl Store {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
-        let q = query.trim();
+        // FTS5 MATCH has a query language of its own. Treat search as plain
+        // text, not an FTS expression: strip control bytes and quotes that can
+        // otherwise produce parser errors such as "unterminated string".
+        let normalized = query
+            .chars()
+            .filter(|c| !c.is_control() && *c != '"')
+            .take(1024)
+            .collect::<String>();
+        let q = normalized.trim();
         if q.is_empty() {
             return Ok((Vec::new(), Vec::new(), 0));
         }
         let short_query = q.chars().count() < 3;
-        // MATCH has its own query language. Quote the whole user input so
-        // punctuation cannot turn into operators or malformed FTS syntax.
-        let fts_query = format!("\"{}\"", q.replace('"', "\"\""));
+        // Quote the complete normalized input so punctuation cannot become an
+        // operator. Quotes were removed above, so this is always valid FTS5.
+        let fts_query = format!("\"{q}\"");
         let total: (i64,) = if short_query {
             sqlx::query_as(
                 "SELECT COUNT(*) FROM posts p JOIN threads th ON th.id=p.thread_id WHERE th.title LIKE ? OR p.content_md LIKE ?",
@@ -1082,6 +1084,22 @@ mod tests {
         assert_eq!(hits[0].id, pid3);
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].title, "hello world");
+        let (short_hits, _, short_total) = s.search_posts("ba", 1, 10).await?;
+        assert_eq!(short_total, 1);
+        assert_eq!(short_hits[0].id, pid3);
+        let (bounded_hits, _, bounded_total) = s.search_posts("a", 1, 10_000).await?;
+        assert_eq!(bounded_total, 1);
+        assert_eq!(bounded_hits.len(), 1);
+        let (late_hits, _, late_total) = s.search_posts("banana", 2, 10_000).await?;
+        assert_eq!(late_total, 1);
+        assert!(late_hits.is_empty());
+        let (quoted_hits, _, quoted_total) = s.search_posts("banana\"", 1, 10).await?;
+        assert_eq!(quoted_total, 1);
+        assert_eq!(quoted_hits[0].id, pid3);
+        let (empty_hits, empty_threads, empty_total) = s.search_posts("  ", 1, 1000).await?;
+        assert!(empty_hits.is_empty());
+        assert!(empty_threads.is_empty());
+        assert_eq!(empty_total, 0);
         s.delete_post(pid1).await?;
         assert!(s.get_post(pid1).await?.is_none());
         let (hits3, _, _) = s.search_posts("first", 1, 10).await?;

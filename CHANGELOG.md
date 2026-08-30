@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0-alpha.14
+
+- Replace hand-built server HTML with embedded Tera templates. Templates are
+  compiled into the binary, while page handlers pass structured values with
+  automatic HTML escaping by default.
+- Restore proof of work for login. JavaScript pages calculate it automatically;
+  no-JavaScript pages provide a copyable, standard-library Python fallback for
+  registration, login, new threads, and replies.
+- Add regression, HTTP contract, fuzz-input, migration, Markdown-sanitization,
+  and release-archive verification coverage. Harden migration bookkeeping and
+  the systemd service unit.
+- Keep the experimental privacy posture: the application does not log IP
+  addresses, usernames, or session identifiers by default. This remains an
+  Alpha release and does not claim absolute anonymity or security.
+
 ## 0.1.0-alpha.13
 
 - Fix the PoW challenge API and switch proof of work verification to SHA-256.

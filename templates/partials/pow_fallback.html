@@ -1,0 +1,16 @@
+<noscript>
+<div class="pow-fallback">
+<input type="hidden" name="pow_challenge" value="{{ challenge }}">
+<input type="hidden" name="pow_salt" value="{{ salt }}">
+<input type="hidden" name="pow_difficulty" value="{{ difficulty }}">
+<input type="hidden" name="pow_expires_at" value="{{ expires_at }}">
+<input type="hidden" name="pow_hmac" value="{{ hmac }}">
+<input type="hidden" name="pow_scope" value="{{ scope }}">
+<label style="font-size:12px">{{ nonce_label }}: <input name="pow_nonce" placeholder="{{ nonce_hint }}" required style="width:55%"></label>
+<div style="border:1px solid var(--border);padding:6px;margin-top:6px;font-size:11.5px;background:var(--input);border-radius:var(--radius-sm)">
+<b>{{ manual_title }}</b><br>
+{{ manual_help }}<br>
+<pre style="white-space:pre-wrap">{{ python }}</pre>
+        <small class="muted">Python 3 standard library | {{ difficulty_label }} {{ difficulty }} | {{ expires_label }} {{ expires_at }} | curl /api/pow/challenge?scope={{ scope }}</small>
+</div>
+</noscript>

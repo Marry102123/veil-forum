@@ -67,6 +67,26 @@ jobs:
           cp target/${{ matrix.target }}/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
           cp -r static locales migrations deploy docs LICENSE README.md CHANGELOG.md SECURITY.md package/veil-forum-${GITHUB_REF_NAME}/
           tar -czf veil-forum-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz -C package veil-forum-${GITHUB_REF_NAME}
+      - name: Verify release archive and ELF target
+        run: |
+          set -eu
+          archive="veil-forum-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          binary="target/${{ matrix.target }}/release/veil-forum"
+          test -s "$binary"
+          test "$(head -c 4 "$binary")" = "$(printf '\177ELF')"
+          case "${{ matrix.target }}" in
+            x86_64-*) expected='Advanced Micro Devices X86-64' ;;
+            aarch64-*) expected='AArch64' ;;
+            armv7-*) expected='ARM' ;;
+            riscv64gc-*) expected='RISC-V' ;;
+            i686-*) expected='Intel 80386' ;;
+            powerpc64le-*) expected='PowerPC64' ;;
+            s390x-*) expected='IBM S/390' ;;
+          esac
+          readelf -h "$binary" | grep -F "$expected"
+          tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/veil-forum"
+          tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/deploy/veil-forum.service"
+          tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/static/style.css"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
@@ -85,8 +105,10 @@ jobs:
           pattern: release-*
           merge-multiple: true
       - run: |
+          set -eu
           ls -l veil-forum-*.tar.gz
           sha256sum veil-forum-*.tar.gz > veil-forum-${GITHUB_REF_NAME}-checksums.txt
+          sha256sum -c veil-forum-${GITHUB_REF_NAME}-checksums.txt
       - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}

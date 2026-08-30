@@ -1,5 +1,10 @@
 /target
 /data
+/dist/
+/package/
+/.deploy-*/
+/.release-*/
+/.veil-forum-*.gz
 *.db
 *.db-shm
 *.db-wal

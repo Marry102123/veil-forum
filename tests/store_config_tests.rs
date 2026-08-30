@@ -4,6 +4,45 @@
 use veil_forum::store::Store;
 
 #[tokio::test]
+async fn migrations_are_versioned_and_idempotent() -> anyhow::Result<()> {
+    let store = Store::open(":memory:").await?;
+    let versions: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(versions.0, 8);
+    let applied: Vec<(i64,)> =
+        sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&store.pool)
+            .await?;
+    assert_eq!(
+        applied.iter().map(|v| v.0).collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+
+    // A second open must not rerun destructive SQL or create duplicate markers.
+    let path = std::env::temp_dir().join(format!("veil-forum-migrate-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let first = Store::open(&path).await?;
+    sqlx::query("INSERT INTO configs(key, value) VALUES('migration_test', 'preserved')")
+        .execute(&first.pool)
+        .await?;
+    drop(first);
+    let second = Store::open(&path).await?;
+    let value: (String,) = sqlx::query_as("SELECT value FROM configs WHERE key='migration_test'")
+        .fetch_one(&second.pool)
+        .await?;
+    assert_eq!(value.0, "preserved");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
+        .fetch_one(&second.pool)
+        .await?;
+    assert_eq!(count.0, 8);
+    drop(second);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_config_missing_key_returns_none_not_error() -> anyhow::Result<()> {
     let store = Store::open(":memory:").await?;
     // 不存在的 key：Go 返回 sql.ErrNoRows + ""；Rust 返回 Ok(None)

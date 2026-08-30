@@ -68,3 +68,24 @@ pub fn render(md: &str) -> String {
         .to_string();
     cleansed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+
+    #[test]
+    fn render_removes_remote_images_and_dangerous_markup() {
+        let html = render("![tracking](https://example.test/x)\n\n<script>alert(1)</script>");
+        assert!(!html.contains("example.test"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("alert(1)"));
+    }
+
+    #[test]
+    fn render_keeps_safe_formatting() {
+        let html = render("**bold** and [link](https://example.test)");
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("link"));
+        assert!(!html.contains("href="));
+    }
+}

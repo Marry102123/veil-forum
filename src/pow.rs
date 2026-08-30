@@ -21,18 +21,21 @@ pub struct Manager {
 #[derive(Clone, Debug)]
 pub enum Scope {
     Register,
+    Login,
     Post,
 }
 impl Scope {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Register => "register",
+            Self::Login => "login",
             Self::Post => "post",
         }
     }
     fn config_key(&self) -> &'static str {
         match self {
             Self::Register => "pow_register_minutes",
+            Self::Login => "pow_login_minutes",
             Self::Post => "pow_post_minutes",
         }
     }
@@ -127,7 +130,10 @@ impl Manager {
         }
         // 预占用防重放，短临界区，不跨 await
         {
-            let mut used = self.used.lock().unwrap();
+            let mut used = self
+                .used
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if used.contains_key(hmac_hex) {
                 anyhow::bail!("challenge already used");
             }
@@ -147,7 +153,10 @@ impl Manager {
         let cur = self.get_difficulty(&scope).await;
         if diff < cur {
             // 回滚预占用
-            self.used.lock().unwrap().remove(hmac_hex);
+            self.used
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(hmac_hex);
             anyhow::bail!("difficulty too low: got {} want {}", diff, cur);
         }
         let mut hasher = Sha256::new();
@@ -157,7 +166,10 @@ impl Manager {
         hasher.update(nonce.as_bytes());
         let hash = hasher.finalize();
         if !has_leading_zeros(&hash, diff) {
-            self.used.lock().unwrap().remove(hmac_hex);
+            self.used
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(hmac_hex);
             anyhow::bail!("pow failed");
         }
         Ok(())

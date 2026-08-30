@@ -1,6 +1,8 @@
 [Unit]
 Description=veil-forum experimental Tor/I2P forum
 After=network.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,13 +12,20 @@ WorkingDirectory=/var/lib/veil-forum
 ExecStart=/usr/local/bin/veil-forum --addr 127.0.0.1:8001 --data /var/lib/veil-forum/forum.db
 Restart=on-failure
 RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
 ReadWritePaths=/var/lib/veil-forum
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
 MemoryDenyWriteExecute=true
 LockPersonality=true
 RestrictSUIDSGID=true

@@ -26,7 +26,7 @@ ARCHIVE="${DIST_DIR}/${DIR_NAME}.tar.gz"
 CHECKSUMS="${DIST_DIR}/${BIN_NAME}-v${VERSION}-checksums.txt"
 
 rm -rf "${STAGE}"
-mkdir -p "${STAGE}/docs" "${STAGE}/deploy"
+mkdir -p "${STAGE}/docs" "${STAGE}/deploy" "${STAGE}/static" "${STAGE}/locales" "${STAGE}/migrations"
 
 cargo build --release
 
@@ -34,12 +34,15 @@ cp "target/release/${BIN_NAME}" "${STAGE}/${BIN_NAME}"
 cp README.md LICENSE CHANGELOG.md "${STAGE}/"
 cp docs/*.md "${STAGE}/docs/"
 cp deploy/*.service "${STAGE}/deploy/"
+cp -r static/. "${STAGE}/static/"
+cp -r locales/. "${STAGE}/locales/"
+cp -r migrations/. "${STAGE}/migrations/"
 
 cd "${DIST_DIR}"
 tar -czf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
 (
     cd "${DIR_NAME}"
-    sha256sum "${BIN_NAME}" README.md LICENSE CHANGELOG.md docs/*.md deploy/*.service
+    find . -type f -print | sort | xargs sha256sum
 ) > "${CHECKSUMS}"
 cd ..
 

@@ -1,0 +1,20 @@
+<h2><a href="/">{{ boards_label | default(value="Boards") }}</a> / {{ board.name }} <span class="muted" style="font-weight:400">· {{ board.description }}</span></h2>
+<p class="muted" style="margin:4px 0 8px">{{ page_label | default(value="Page") }} {{ page }} / {{ total_pages }} · {{ total }} {{ posts_label | default(value="posts") }}</p>
+{% if can_post %}
+<div class="card">
+  <h3>{{ new_thread_label | default(value="New thread") }} <span class="muted" style="font-weight:400">· {{ pow_title }}</span></h3>
+  <p class="muted pow-explanation">{{ pow_description }}</p>
+  <div id="pow-status" data-computing="{{ pow_computing }}" data-done="{{ pow_done }}" data-failed="{{ pow_failed }}" data-submitting="{{ pow_submitting }}"></div><div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
+  <form method="POST" action="/b/{{ board.slug | urlencode }}/new" data-pow-scope="post">{{ csrf_field | default(value="") | safe }}
+    <input name="title" placeholder="{{ title_hint | default(value="Title, 5-120 characters") }}" required maxlength="120" style="width:100%;margin:5px 0">
+    <textarea name="content" placeholder="{{ markdown_hint }}" required rows="4" style="width:100%"></textarea>
+    {{ pow_fallback | default(value="") | safe }}
+    {% if board.allow_anonymous %}<label style="font-size:12px"><input type="checkbox" name="anonymous"> {{ anonymous_label | default(value="Anonymous") }}</label>{% endif %}
+    <button class="btn-primary">{{ post_label | default(value="Post") }}</button>
+  </form>
+</div>
+{% else %}<div class="card" style="padding:6px 8px;font-size:12.5px"><a href="/login">{{ login_to_post_label | default(value="Log in to post") }}</a></div>{% endif %}
+<div class="thread-list" role="list">
+{% for thread in threads %}<div class="thread-row{% if thread.is_pinned %} pinned{% endif %}{% if thread.is_locked %} locked{% endif %}" role="listitem"><div style="min-width:0">{% if thread.is_pinned %}<span class="badge-pinned">[{{ pinned_label | default(value="pinned") }}]</span> {% endif %}{% if thread.is_locked %}<span class="badge-locked">[{{ locked_label | default(value="locked") }}]</span> {% endif %}<a href="/t/{{ thread.id }}" class="title">{{ thread.title }}</a></div><div class="author">{{ thread.author_name }}</div><div class="replies"><b>{{ thread.reply_count }}</b></div><div class="last">{{ thread.last_reply_at }}</div></div>{% else %}<div class="empty" style="border:none">{{ empty_label | default(value="No threads yet") }}</div>{% endfor %}
+</div>
+{% include "pages/_pagination.html" ignore missing %}

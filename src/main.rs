@@ -5,6 +5,7 @@ mod i18n;
 mod markdown;
 mod pow;
 mod store;
+mod templates;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -8,7 +8,7 @@ function hasLeadingZeros(hash, bits){
   return true;
 }
 
-// fallback main-thread solve (old, kept for Tor fallback where Worker blocked)
+// Fallback main-thread solver when Worker execution is unavailable.
 async function solvePowMainThread(challenge, salt, difficulty){
   const start = Date.now();
   let nonce = 0;
@@ -139,7 +139,10 @@ async function solvePow(challenge, salt, difficulty){
 }
 
 async function attachPow(form, scope){
-  const btn = form.querySelector('button[type=submit]');
+  // HTML defaults a button inside a form to submit, but server-rendered forms
+  // do not need to spell that attribute out. Support both forms so the PoW UI
+  // consistently disables the actual submit control while solving.
+  const btn = form.querySelector('button[type=submit], button:not([type])');
   const origText = btn ? btn.textContent : '';
   if(btn) { btn.disabled=true; btn.textContent='PoW computing…'; }
   const pcon = document.getElementById('pow-progress-container');
@@ -182,6 +185,10 @@ async function attachPow(form, scope){
   }
 }
 document.addEventListener('DOMContentLoaded', ()=>{
+  // The page defaults to the visible manual fallback. Remove no-js only after
+  // this script has actually executed, so per-site script blocking remains a
+  // safe and usable fallback.
+  document.body.classList.remove('no-js');
   document.querySelectorAll('form[data-pow-scope]').forEach(form=>{
     form.addEventListener('submit', async (e)=>{
       if(form.dataset.powSolved === "1"){

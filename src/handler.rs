@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use tera::Context;
 use tokio::sync::Semaphore;
 
 #[derive(Clone)]
@@ -63,20 +64,6 @@ fn csrf_field(headers: &HeaderMap) -> String {
         html_escape(&csrf_token(headers))
     )
 }
-fn inject_csrf_fields(mut html: String, headers: &HeaderMap) -> String {
-    let field = csrf_field(headers);
-    let mut search_from = 0;
-    while let Some(start_rel) = html[search_from..].find("<form method=\"POST\"") {
-        let start = search_from + start_rel;
-        let Some(end_rel) = html[start..].find('>') else {
-            break;
-        };
-        let end = start + end_rel + 1;
-        html.insert_str(end, &field);
-        search_from = end + field.len();
-    }
-    html
-}
 fn valid_csrf(headers: &HeaderMap, form: &HashMap<String, String>) -> bool {
     let supplied = form.get("csrf_token").map(String::as_str).unwrap_or("");
     if supplied.len() != 128 || !supplied.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -120,6 +107,27 @@ fn valid_origin(headers: &HeaderMap) -> bool {
 }
 fn require_form_security(headers: &HeaderMap, form: &HashMap<String, String>) -> bool {
     valid_csrf(headers, form) && valid_origin(headers)
+}
+
+fn registration_error_response(error: anyhow::Error) -> Response {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("unique constraint failed: users.username")
+        || message.contains("users.username") && message.contains("unique")
+    {
+        return apply_sec((StatusCode::CONFLICT, "username taken").into_response());
+    }
+    if message.contains("invite invalid or already used") {
+        return apply_sec(
+            (StatusCode::BAD_REQUEST, "invite invalid or already used").into_response(),
+        );
+    }
+    apply_sec(
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registration temporarily unavailable",
+        )
+            .into_response(),
+    )
 }
 
 #[cfg(test)]
@@ -172,6 +180,25 @@ mod security_tests {
         headers.insert(header::ORIGIN, "null".parse().unwrap());
         assert!(valid_origin(&headers));
     }
+
+    #[test]
+    fn registration_errors_do_not_mislabel_non_conflicts() {
+        assert_eq!(
+            registration_error_response(anyhow::anyhow!("invite invalid or already used")).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            registration_error_response(anyhow::anyhow!("database is locked")).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            registration_error_response(anyhow::anyhow!(
+                "UNIQUE constraint failed: users.username"
+            ))
+            .status(),
+            StatusCode::CONFLICT
+        );
+    }
 }
 
 fn sec_headers() -> HeaderMap {
@@ -208,80 +235,6 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn render_flat_posts(
-    posts: &[crate::store::Post],
-    thread_id: i64,
-    page: i64,
-    is_admin: bool,
-    can_reply: bool,
-    locked: bool,
-    locale: &str,
-) -> String {
-    let ui = |en, zh, ru| crate::i18n::ui(locale, en, zh, ru);
-    let names: HashMap<i64, String> = posts
-        .iter()
-        .map(|p| {
-            (
-                p.id,
-                if p.is_anonymous {
-                    ui("Anonymous", "匿名", "Аноним")
-                } else {
-                    html_escape(&p.author_name)
-                },
-            )
-        })
-        .collect();
-    let mut out = String::new();
-    for (idx, p) in posts.iter().enumerate() {
-        let author = if p.is_anonymous {
-            ui("Anonymous", "匿名", "Аноним")
-        } else {
-            html_escape(&p.author_name)
-        };
-        let reply_to = p.parent_post_id.map(|pid| format!(r##"<span class="reply-context"><span class="reply-label">{}</span> <a href="#p{}">@{}</a></span>"##, ui("Replying to", "回复", "Ответ на"), pid, names.get(&pid).cloned().unwrap_or_else(|| ui("deleted", "已删除", "удалён")))).unwrap_or_default();
-        let reply = if can_reply && !locked {
-            format!(
-                r#"<a class="btn-link btn-sm" href="/t/{}?page={}&reply_to={}#reply-card">{}</a>"#,
-                thread_id,
-                page,
-                p.id,
-                ui("Reply", "回复", "Ответить")
-            )
-        } else {
-            String::new()
-        };
-        let admin = if is_admin {
-            format!(
-                r#"<form method="POST" action="/admin/post/{}/delete" style="display:inline"><button class="btn-sm">{}</button></form>"#,
-                p.id,
-                ui("Delete", "删除", "Удалить")
-            )
-        } else {
-            String::new()
-        };
-        let quote = p
-            .parent_post_id
-            .and_then(|pid| posts.iter().find(|parent| parent.id == pid))
-            .map(|parent| {
-                let text = parent.content_md.chars().take(120).collect::<String>();
-                format!(
-                    r#"<div class="reply-quote">@{}：{}</div>"#,
-                    names.get(&parent.id).cloned().unwrap_or_else(|| ui(
-                        "deleted",
-                        "已删除",
-                        "удалён"
-                    )),
-                    html_escape(&text)
-                )
-            })
-            .unwrap_or_default();
-        out.push_str(&format!(r#"<article class="social-post" id="p{id}">
-<div class="post-head"><span class="floor">#{floor}</span><span class="author">{author}</span>{reply_to}<span class="post-time">{time}</span><span class="post-actions">{reply}{admin}</span></div>
-{quote}<div class="post-body">{html}</div>
-</article>"#, id=p.id, floor=idx+1, author=author, reply_to=reply_to, time=p.created_at.format("%m-%d %H:%M:%S"), reply=reply, admin=admin, quote=quote, html=p.content_html));
-    }
-    out
-}
 fn get_theme(headers: &HeaderMap) -> &'static str {
     if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
         for part in cookie.split(';') {
@@ -345,7 +298,11 @@ async fn sidebar_data(
     {
         stats_threads = row.0;
     }
-    if let Ok(row) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM posts")
+    // Each thread has one opening post. The sidebar label is "Replies", so
+    // exclude those opening posts instead of reporting the total post count.
+    if let Ok(row) = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM posts p WHERE p.id != (SELECT MIN(op.id) FROM posts op WHERE op.thread_id = p.thread_id)",
+    )
         .fetch_one(pool)
         .await
     {
@@ -396,6 +353,7 @@ async fn sidebar_data(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_html(
     title: &str,
     site_name: &str,
@@ -478,19 +436,8 @@ fn layout_html(
         }
         s
     };
-    let pow_scripts = if need_pow {
-        r#"<script src="/static/pow.js?v=2"></script>"#
-    } else {
-        ""
-    };
     // Always emit an explicit theme. Without data-theme="dark", the CSS
     // prefers-color-scheme fallback can override a NoScript dark selection.
-    let theme_attr = if theme == "light" {
-        r#" data-theme="light""#
-    } else {
-        r#" data-theme="dark""#
-    };
-    let content = inject_csrf_fields(content.to_string(), headers);
     let search_label = crate::i18n::translate(locale, "nav.search");
     let boards_label = crate::i18n::translate(locale, "nav.boards");
     let account_label = crate::i18n::translate(locale, "account.title");
@@ -518,63 +465,43 @@ fn layout_html(
         "仅 127.0.0.1:8001",
         "только 127.0.0.1:8001",
     );
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="{locale}"{theme_attr}>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>{title} - {site_name2}</title>
-<script src="/static/theme.js?v=2"></script>
-<link rel="stylesheet" href="/static/style.css">
-<script src="/static/app.js"></script>
-{pow_scripts}
-</head>
-<body>
-{flash_html}
-<div class="layout">
-<aside class="side">
-<div class="card brand-card"><a href="/" class="brand-name">{site_name}</a></div>
-<div class="card search-card"><b>{search_label}</b><form method="GET" action="/search" role="search"><input name="q" placeholder="{search_label}" aria-label="{search_label}"><button>{search_label}</button></form></div>
-<div class="card account-card"><b>{account_label}</b>{account_html}</div>
-<div class="card board-card-side"><b>{boards_label}</b>
-{boards_html}
-<div class="muted" style="margin-top:6px;font-size:11px">{boards_len} {board_count} · <a href="/" style="font-size:11px">{all_boards}</a></div>
-</div>
-</aside>
-<main>{content}</main>
-<aside class="side">
-<div class="card announcement-card"><b>{announcement_label}</b><div class="announcement-body">{announcement_body}</div></div>
-<div class="card display-card"><b>{display_label}</b><button id="theme-toggle" type="button" aria-label="{display_label}" style="display:none">☼</button><span class="noscript-themes"><a class="theme-choice" href="/theme?to=light" aria-label="{light_label}">☼ {light_label}</a><a class="theme-choice" href="/theme?to=dark" aria-label="{dark_label}">☾ {dark_label}</a></span></div>
-<div class="card"><b>{stats_label}</b><div class="muted" style="margin-top:6px;font-size:11.5px;line-height:1.6">PoW {pow_minutes} min<br>{threads_label} {stats_threads} · {replies_label} {stats_posts}<br>{users_label} {stats_users}</div></div>
-<div class="card"><b>{recent_label}</b><div style="margin-top:4px">{recent_html}</div></div>
-</aside>
-</div>
-<footer><span>no log / no ip / csp default-src 'none' · veil-forum</span><span class="foot-right">{site_name} · {loopback_label} · <a href="https://github.com/Marry102123/veil-forum">Source</a></span>
-</footer>
-</body>
-</html>"#,
-        title = html_escape(title),
-        site_name2 = html_escape(site_name),
-        site_name = html_escape(site_name),
-        pow_scripts = pow_scripts,
-        account_html = account_html,
-        flash_html = flash_html,
-        boards_html = boards_html,
-        boards_len = boards.len(),
-        content = content,
-        pow_minutes = html_escape(pow_minutes),
-        stats_threads = stats_threads,
-        stats_posts = stats_posts,
-        stats_users = stats_users,
-        recent_html = recent_html,
-        announcement_body = announcement_body,
-        locale = html_escape(locale),
-        search_label = html_escape(&search_label),
-        account_label = html_escape(&account_label),
-        boards_label = html_escape(&boards_label),
-    )
+    let mut context = tera::Context::new();
+    context.insert("title", title);
+    context.insert("site_name", site_name);
+    context.insert("locale", locale);
+    context.insert("theme", if theme == "light" { "light" } else { "dark" });
+    context.insert("need_pow", &need_pow);
+    context.insert("flash_html", &flash_html);
+    context.insert("account_html", &account_html);
+    context.insert("boards_html", &boards_html);
+    context.insert("boards_len", &boards.len());
+    context.insert("content", &content);
+    context.insert("pow_minutes", pow_minutes);
+    context.insert("stats_threads", &stats_threads);
+    context.insert("stats_posts", &stats_posts);
+    context.insert("stats_users", &stats_users);
+    context.insert("recent_html", &recent_html);
+    context.insert("announcement_body", &announcement_body);
+    for (key, value) in [
+        ("search_label", search_label),
+        ("account_label", account_label),
+        ("boards_label", boards_label),
+        ("board_count", board_count),
+        ("all_boards", all_boards),
+        ("announcement_label", announcement_label),
+        ("display_label", display_label),
+        ("light_label", light_label),
+        ("dark_label", dark_label),
+        ("stats_label", stats_label),
+        ("threads_label", threads_label),
+        ("replies_label", replies_label),
+        ("users_label", users_label),
+        ("recent_label", recent_label),
+        ("loopback_label", loopback_label),
+    ] {
+        context.insert(key, &value);
+    }
+    crate::templates::render_layout(&context).expect("embedded layout template must render")
 }
 
 fn verify_pow_form(
@@ -641,39 +568,33 @@ for nonce in range(20000000):
         diff = ch.difficulty,
         exp = 1u64 << ch.difficulty
     );
-    let py_esc = html_escape(&py);
-    format!(
-        r#"<noscript>
-<div class="pow-fallback">
-<input type="hidden" name="pow_challenge" value="{ch}">
-<input type="hidden" name="pow_salt" value="{salt}">
-<input type="hidden" name="pow_difficulty" value="{diff}">
-<input type="hidden" name="pow_expires_at" value="{exp}">
-<input type="hidden" name="pow_hmac" value="{hmac}">
-<input type="hidden" name="pow_scope" value="{scope}">
-<label style="font-size:12px">{nonce_label}: <input name="pow_nonce" placeholder="{nonce_hint}" required style="width:55%"></label>
-<div style="border:1px solid var(--border);padding:6px;margin-top:6px;font-size:11.5px;background:var(--input);border-radius:var(--radius-sm)">
-<b>{manual_title}</b><br>
-{manual_help}<br>
-<pre style="white-space:pre-wrap">{py_esc}</pre>
-        <small class="muted">Python 3 standard library | {difficulty_label} {diff} | {expires_label} {exp} | curl /api/pow/challenge?scope={scope}</small>
-</div>
-</div>
-</noscript>"#,
-        ch = html_escape(&ch.challenge),
-        salt = html_escape(&ch.salt),
-        diff = ch.difficulty,
-        exp = ch.expires_at,
-        hmac = html_escape(&ch.hmac),
-        scope = html_escape(&ch.scope),
-        py_esc = py_esc,
-        nonce_label = ui("PoW nonce (manual when JavaScript is disabled)", "PoW Nonce（Tor 无JS请手算）", "PoW nonce (вручную без JavaScript)"),
-        nonce_hint = ui("Paste nonce", "粘贴 nonce", "Вставьте nonce"),
-        manual_title = ui("JavaScript disabled: manual PoW", "JS 已禁用 - 手动 PoW", "JavaScript отключён: ручной PoW"),
-        manual_help = ui("This form requires a SHA-256 proof of work. Run this locally when JavaScript is unavailable.", "本表单需 SHA-256 PoW，JS 自动完成；Tor 最高安全级请本地运行：", "Для формы требуется SHA-256 proof of work. Выполните локально без JavaScript."),
-        difficulty_label = ui("difficulty", "难度", "сложность"),
-        expires_label = ui("expires", "过期", "истекает")
-    )
+    let mut context = Context::new();
+    // Tera auto-escapes these ordinary template fields. Escaping them here as
+    // well turns the displayed Python fallback into invalid source code.
+    context.insert("challenge", &ch.challenge);
+    context.insert("salt", &ch.salt);
+    context.insert("difficulty", &ch.difficulty);
+    context.insert("expires_at", &ch.expires_at);
+    context.insert("hmac", &ch.hmac);
+    context.insert("scope", &ch.scope);
+    context.insert("python", &py);
+    context.insert("nonce_label", &ui("PoW nonce", "PoW nonce", "PoW nonce"));
+    context.insert(
+        "nonce_hint",
+        &ui("Paste nonce", "粘贴 nonce", "Вставьте nonce"),
+    );
+    context.insert(
+        "manual_title",
+        &ui(
+            "JavaScript disabled: manual PoW",
+            "JS 已禁用 - 手动 PoW",
+            "JavaScript отключён: ручной PoW",
+        ),
+    );
+    context.insert("manual_help", &ui("This form requires a SHA-256 proof of work. Run this locally when JavaScript is unavailable.", "本表单需要 SHA-256 工作量证明。无 JavaScript 环境请在本地运行。", "Для формы требуется SHA-256 proof of work. Выполните локально без JavaScript."));
+    context.insert("difficulty_label", &ui("difficulty", "难度", "сложность"));
+    context.insert("expires_label", &ui("expires", "过期", "истекает"));
+    crate::templates::render_pow_fallback(&context).expect("PoW fallback template must render")
 }
 
 pub fn routes(state: AppState) -> Router {
@@ -717,6 +638,7 @@ pub fn routes(state: AppState) -> Router {
 async fn pow_challenge(State(s): State<AppState>, Query(q): Query<PowQuery>) -> impl IntoResponse {
     let scope = match q.scope.as_str() {
         "register" => crate::pow::Scope::Register,
+        "login" => crate::pow::Scope::Login,
         "post" => crate::pow::Scope::Post,
         _ => return (StatusCode::BAD_REQUEST, "invalid PoW scope").into_response(),
     };
@@ -908,7 +830,6 @@ async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespons
     let user = current_user(&s, &headers).await;
     let site = get_site_name(&s.store).await;
     let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
-    // visible filter
     let visible: Vec<_> = boards
         .iter()
         .filter(|b| b.guest_readable || user.is_some())
@@ -916,35 +837,24 @@ async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespons
         .collect();
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
-    let mut content = String::new();
-    content.push_str(&format!("<h2>{}</h2>\n", ui("Boards", "版块", "Разделы")));
-    if visible.is_empty() {
-        content.push_str(&format!(
-            r#"<div class="empty">{}</div>"#,
-            ui(
-                "No boards yet",
-                "暂无版块 · 等待管理员创建",
-                "Разделов пока нет"
-            )
-        ));
-    } else {
-        for b in &visible {
-            let anon = if b.allow_anonymous {
-                ui("Anonymous", "匿名", "Анонимно")
-            } else {
-                ui("Named", "实名", "С именем")
-            };
-            let guest = if b.guest_readable {
-                ui("Public", "公开", "Публичный")
-            } else {
-                ui("Login required", "需登录", "Требуется вход")
-            };
-            content.push_str(&format!(r#"<div class="card board-card">
-<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap"><a href="/b/{}" class="board-link">{}</a> <span class="slug">/{}</span> <span class="muted" style="font-size:11px">· {} · {}</span></div>
-<p class="desc">{}</p>
-</div>"#, html_escape(&b.slug), html_escape(&b.name), html_escape(&b.slug), anon, guest, html_escape(&b.description)));
-        }
-    }
+    let rendered_boards: Vec<_> = visible.iter().map(|b| serde_json::json!({
+        "slug": b.slug, "name": b.name, "description": b.description,
+        "anonymous_label": ui(if b.allow_anonymous { "Anonymous" } else { "Named" }, if b.allow_anonymous { "匿名" } else { "实名" }, if b.allow_anonymous { "Анонимно" } else { "С именем" }),
+        "access_label": ui(if b.guest_readable { "Public" } else { "Login required" }, if b.guest_readable { "公开" } else { "需登录" }, if b.guest_readable { "Публичный" } else { "Требуется вход" }),
+    })).collect();
+    let mut context = Context::new();
+    context.insert("boards", &rendered_boards);
+    context.insert("boards_label", &ui("Boards", "版块", "Разделы"));
+    context.insert(
+        "empty_label",
+        &ui(
+            "No boards yet",
+            "暂无版块 · 等待管理员创建",
+            "Разделов пока нет",
+        ),
+    );
+    let content = crate::templates::render_page("home", &context)
+        .expect("embedded home template must render");
     let full = layout_html(
         &ui("Home", "首页", "Главная"),
         &site,
@@ -963,8 +873,7 @@ async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespons
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 
 // ---------- Board ----------
@@ -979,18 +888,13 @@ async fn board(
     Query(q): Query<PageQ>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let board_opt = s.store.get_board_by_slug(&slug).await.unwrap_or(None);
-    let board = match board_opt {
-        Some(b) => b,
-        None => {
-            let resp = (StatusCode::NOT_FOUND, "board not found").into_response();
-            return apply_sec(resp);
-        }
+    let board = match s.store.get_board_by_slug(&slug).await.unwrap_or(None) {
+        Some(board) => board,
+        None => return apply_sec((StatusCode::NOT_FOUND, "board not found").into_response()),
     };
     let user = current_user(&s, &headers).await;
     if !board.guest_readable && user.is_none() {
-        let resp = Redirect::to("/login").into_response();
-        return apply_sec(resp);
+        return apply_sec(Redirect::to("/login").into_response());
     }
     let page = q.page.unwrap_or(1).max(1);
     let page_size = 20;
@@ -1009,113 +913,79 @@ async fn board(
         .unwrap_or(None)
         .unwrap_or_else(|| "0.02".to_string());
     let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
-    let need_pow = user.is_some();
-    let pow_fallback = if need_pow {
-        let ch = s.pow.generate(crate::pow::Scope::Post).await;
-        pow_fallback_html(&ch, &locale)
-    } else {
-        String::new()
-    };
-    // content
-    let mut content = String::new();
-    content.push_str(&format!(
-        r#"<h2><a href="/">{}</a> / {} <span class="muted" style="font-weight:400">· {}</span></h2>
-<p class="muted" style="margin:4px 0 8px">{} {}/{} · {} {}</p>"#,
-        ui("Boards", "版块", "Разделы"),
-        html_escape(&board.name),
-        html_escape(&board.description),
-        ui("Page", "页", "Страница"),
-        page,
-        total_pages,
-        total,
-        ui("posts", "帖", "сообщений")
-    ));
+    let mut context = Context::new();
+    let rendered_threads: Vec<_>=threads.iter().map(|t| serde_json::json!({"id":t.id,"title":t.title,"author_name":t.author_name,"reply_count":t.reply_count,"last_reply_at":t.last_reply_at.format("%m-%d %H:%M").to_string(),"is_pinned":t.is_pinned,"is_locked":t.is_locked})).collect();
+    context.insert("board",&serde_json::json!({"slug":board.slug,"name":board.name,"description":board.description,"allow_anonymous":board.allow_anonymous}));
+    context.insert("threads", &rendered_threads);
+    context.insert("page", &page);
+    context.insert("total_pages", &total_pages);
+    context.insert("total", &total);
+    context.insert("can_post", &user.is_some());
+    context.insert("csrf_field", &csrf_field(&headers));
     if user.is_some() {
-        let pow_title = crate::i18n::translate(&locale, "pow.post_title");
-        let pow_description = crate::i18n::translate(&locale, "pow.description");
-        let pow_computing = crate::i18n::translate(&locale, "pow.computing");
-        let pow_done = crate::i18n::translate(&locale, "pow.done");
-        let pow_failed = crate::i18n::translate(&locale, "pow.failed");
-        let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
-        content.push_str(&format!(r#"<div class="card">
-<h3>{} <span class="muted" style="font-weight:400">· {}</span></h3>
-<p class="muted pow-explanation">{}</p>
-<div id="pow-status" data-computing="{}" data-done="{}" data-failed="{}" data-submitting="{}"></div>
-<div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
-<form method="POST" action="/b/{}/new" data-pow-scope="post">
-<input name="title" placeholder="{}" required maxlength="120" style="width:100%;margin:5px 0">
-<textarea name="content" placeholder="{}" required rows="4" style="width:100%"></textarea>
-{}
- {}<button class="btn-primary">{}</button>
-</form>
-</div>"#, ui("New thread", "发新帖", "Новая тема"), pow_title, pow_description, pow_computing, pow_done, pow_failed, pow_submitting, html_escape(&board.slug), ui("Title, 5-120 characters", "标题 5-120字", "Заголовок, 5-120 символов"), ui("Markdown supported. Images are disabled.", "正文 Markdown 支持 基础+代码块+表格 · 禁图", "Поддерживается Markdown. Изображения отключены."), pow_fallback, if board.allow_anonymous { format!(r#"<label style="font-size:12px"><input type="checkbox" name="anonymous"> {}</label> "#, ui("Anonymous", "匿名", "Анонимно")) } else { String::new() }, ui("Post", "发帖", "Опубликовать")));
-    } else {
-        content.push_str(&format!(r#"<div class="card" style="padding:6px 8px;font-size:12.5px"><a href="/login">{}</a> <span class="muted">· {}</span></div>"#, ui("Log in to post", "登录后发帖", "Войдите, чтобы создать тему"), ui("Proof of work protects posting", "PoW 解放过滤", "Proof of work защищает публикации")));
+        let ch = s.pow.generate(crate::pow::Scope::Post).await;
+        context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
     }
-    content.push_str(r#"<div class="thread-list" role="list">"#);
-    if threads.is_empty() {
-        content.push_str(&format!(
-            r#"<div class="empty" style="border:none">{}</div>"#,
-            ui("No threads yet", "暂无主题 · 抢沙发", "Тем пока нет")
-        ));
-    } else {
-        for t in &threads {
-            let pinned = if t.is_pinned {
-                &format!(
-                    r#"<span class="badge-pinned">[{}]</span> "#,
-                    ui("pinned", "置顶", "закреплено")
-                )
-            } else {
-                ""
-            };
-            let locked = if t.is_locked {
-                &format!(
-                    r#"<span class="badge-locked">[{}]</span> "#,
-                    ui("locked", "锁定", "закрыто")
-                )
-            } else {
-                ""
-            };
-            let author = html_escape(&t.author_name);
-            let last = t.last_reply_at.format("%m-%d %H:%M").to_string();
-            let row_class = if t.is_pinned && t.is_locked {
-                "thread-row pinned locked"
-            } else if t.is_pinned {
-                "thread-row pinned"
-            } else if t.is_locked {
-                "thread-row locked"
-            } else {
-                "thread-row"
-            };
-            content.push_str(&format!(r#"<div class="{}" role="listitem"><div style="min-width:0">{}<a href="/t/{}" class="title">{}</a></div><div class="author">{}</div><div class="replies"><b>{}</b></div><div class="last">{}</div></div>"#, row_class, format!("{}{}", pinned, locked), t.id, html_escape(&t.title), author, t.reply_count, last));
-        }
+    for (key, value) in [
+        ("boards_label", ui("Boards", "版块", "Разделы")),
+        ("page_label", ui("Page", "页", "Страница")),
+        ("posts_label", ui("posts", "帖", "сообщений")),
+        ("new_thread_label", ui("New thread", "发新帖", "Новая тема")),
+        (
+            "title_hint",
+            ui(
+                "Title, 5-120 characters",
+                "标题 5-120字",
+                "Заголовок, 5-120 символов",
+            ),
+        ),
+        (
+            "markdown_hint",
+            ui(
+                "Markdown supported. Images are disabled.",
+                "正文 Markdown 支持 基础+代码块+表格 · 禁图",
+                "Поддерживается Markdown. Изображения отключены.",
+            ),
+        ),
+        ("anonymous_label", ui("Anonymous", "匿名", "Анонимно")),
+        ("post_label", ui("Post", "发帖", "Опубликовать")),
+        (
+            "login_to_post_label",
+            ui(
+                "Log in to post",
+                "登录后发帖",
+                "Войдите, чтобы создать тему",
+            ),
+        ),
+        (
+            "empty_label",
+            ui("No threads yet", "暂无主题 · 抢沙发", "Тем пока нет"),
+        ),
+        ("pinned_label", ui("pinned", "置顶", "закреплено")),
+        ("locked_label", ui("locked", "锁定", "закрыто")),
+        (
+            "pow_title",
+            crate::i18n::translate(&locale, "pow.post_title"),
+        ),
+        (
+            "pow_description",
+            crate::i18n::translate(&locale, "pow.description"),
+        ),
+        (
+            "pow_computing",
+            crate::i18n::translate(&locale, "pow.computing"),
+        ),
+        ("pow_done", crate::i18n::translate(&locale, "pow.done")),
+        ("pow_failed", crate::i18n::translate(&locale, "pow.failed")),
+        (
+            "pow_submitting",
+            crate::i18n::translate(&locale, "pow.submitting"),
+        ),
+    ] {
+        context.insert(key, &value);
     }
-    content.push_str("</div>\n");
-    content.push_str(&format!(
-        r#"<div class="pagination"><span class="muted">{} / {}</span> {} {}</div>"#,
-        page,
-        total_pages,
-        if page > 1 {
-            format!(
-                r#"<a href="/b/{}?page={}">‹ {}</a>"#,
-                html_escape(&slug),
-                page - 1,
-                ui("Previous", "上一页", "Назад")
-            )
-        } else {
-            "".to_string()
-        },
-        if page < total_pages {
-            format!(
-                r#"<a href="/b/{}?page={}">{} ›</a>"#,
-                html_escape(&slug),
-                page + 1,
-                ui("Next", "下一页", "Далее")
-            )
-        } else {
-            "".to_string()
-        }
-    ));
+    let content = crate::templates::render_page("board", &context)
+        .expect("embedded board template must render");
     let full = layout_html(
         &board.name,
         &get_site_name(&s.store).await,
@@ -1128,14 +998,13 @@ async fn board(
         &recent,
         &announcement,
         &content,
-        need_pow,
+        user.is_some(),
         None,
         get_theme(&headers),
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 
 // ---------- Thread ----------
@@ -1147,153 +1016,171 @@ async fn thread(
 ) -> impl IntoResponse {
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
-    let th_opt = s.store.get_thread(id).await.unwrap_or(None);
-    let th = match th_opt {
+    let th = match s.store.get_thread(id).await.unwrap_or(None) {
         Some(t) => t,
-        None => {
-            let resp = (StatusCode::NOT_FOUND, "thread not found").into_response();
-            return apply_sec(resp);
-        }
+        None => return apply_sec((StatusCode::NOT_FOUND, "thread not found").into_response()),
     };
     let board = s.store.get_board_by_id(th.board_id).await.unwrap_or(None);
     let user = current_user(&s, &headers).await;
-    if let Some(b) = &board {
-        if !b.guest_readable && user.is_none() {
-            let resp = Redirect::to("/login").into_response();
-            return apply_sec(resp);
-        }
+    if board.as_ref().is_some_and(|b| !b.guest_readable) && user.is_none() {
+        return apply_sec(Redirect::to("/login").into_response());
     }
     let page = q.page.unwrap_or(1).max(1);
-    let page_size: i64 = 50;
+    let page_size = 50;
     let (posts, total) = s
         .store
         .list_posts(th.id, page, page_size)
         .await
         .unwrap_or((Vec::new(), 0));
-    let reply_post = match q.reply_to.filter(|post_id| *post_id > 0) {
-        Some(post_id) => s
-            .store
-            .get_post(post_id)
-            .await
-            .ok()
-            .flatten()
-            .filter(|post| post.thread_id == th.id),
-        None => None,
-    };
     let total_pages = ((total + page_size - 1) / page_size).max(1);
+    let is_admin = user.as_ref().is_some_and(|u| u.is_admin);
     let pow_min = s
         .store
         .get_config("pow_post_minutes")
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "0.02".to_string());
-    let is_admin = user.as_ref().map(|u| u.is_admin).unwrap_or(false);
     let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
-    let pow_fallback = if user.is_some() && !th.is_locked {
+    let names: HashMap<i64, String> = posts
+        .iter()
+        .map(|p| {
+            (
+                p.id,
+                if p.is_anonymous {
+                    ui("Anonymous", "匿名", "Аноним")
+                } else {
+                    p.author_name.clone()
+                },
+            )
+        })
+        .collect();
+    let rendered_posts:Vec<_>=posts.iter().enumerate().map(|(idx,p)|{let quote=p.parent_post_id.and_then(|pid|posts.iter().find(|parent|parent.id==pid)).map(|parent|serde_json::json!({"author_name":names.get(&parent.id).cloned().unwrap_or_else(||ui("deleted","已删除","удалён")),"text":parent.content_md.chars().take(120).collect::<String>()}));serde_json::json!({"id":p.id,"author_name":names.get(&p.id).cloned().unwrap_or_default(),"is_anonymous":p.is_anonymous,"created_at":p.created_at.format("%m-%d %H:%M:%S").to_string(),"content_html":p.content_html,"reply_to":p.parent_post_id.map(|pid|serde_json::json!({"id":pid,"author_name":names.get(&pid).cloned().unwrap_or_else(||ui("deleted","已删除","удалён"))})),"quote":quote,"floor":(page-1)*page_size+idx as i64+1} )}).collect();
+    let mut context = Context::new();
+    context.insert("thread",&serde_json::json!({"id":th.id,"board_slug":th.board_slug,"title":th.title,"author_name":th.author_name,"created_at":th.created_at.format("%Y-%m-%d %H:%M").to_string(),"is_pinned":th.is_pinned,"is_locked":th.is_locked}));
+    context.insert("posts", &rendered_posts);
+    context.insert("can_reply", &user.is_some());
+    context.insert("is_admin", &is_admin);
+    context.insert(
+        "allow_anonymous",
+        &board.as_ref().is_some_and(|b| b.allow_anonymous),
+    );
+    context.insert("page", &page);
+    context.insert("total_pages", &total_pages);
+    context.insert("csrf_field", &csrf_field(&headers));
+    if user.is_some() && !th.is_locked {
         let ch = s.pow.generate(crate::pow::Scope::Post).await;
-        pow_fallback_html(&ch, &locale)
-    } else {
-        String::new()
-    };
-    let mut content = String::new();
-    content.push_str(&format!(r#"<div class="thread-hero"><div class="thread-kicker"><a href="/b/{board}">/{board}</a><span>{thread_label}</span></div><h1>{title}</h1>
-<div class="thread-meta"><span>by <b>{author}</b></span><span>{time}</span>{pinned}{locked}</div></div>"#, board=html_escape(&th.board_slug), title=html_escape(&th.title), author=html_escape(&th.author_name), time=th.created_at.format("%Y-%m-%d %H:%M"),
-        thread_label = ui("Thread", "主题", "Тема"),
-        pinned = if th.is_pinned { format!(r#"<span class="badge-pinned">[{}]</span>"#, ui("pinned", "置顶", "закреплено")) } else { String::new() },
-        locked = if th.is_locked { format!(r#"<span class="badge-locked">[{}]</span>"#, ui("locked", "锁定", "закрыто")) } else { String::new() }
-    ));
-    if posts.is_empty() {
-        content.push_str(&format!(
-            r#"<div class="empty">{}</div>"#,
-            ui("No replies yet", "暂无回帖", "Ответов пока нет")
-        ));
-    } else {
-        content.push_str(&render_flat_posts(
-            &posts,
-            th.id,
-            page,
-            is_admin,
-            user.is_some(),
-            th.is_locked,
-            &locale,
-        ));
-    }
-    content.push_str(&format!(
-        r#"<div class="pagination"><span class="muted">{} / {}</span> {} {}</div>"#,
-        page,
-        total_pages,
-        if page > 1 {
-            format!(
-                r#"<a href="/t/{}?page={}">‹ {}</a>"#,
-                th.id,
-                page - 1,
-                ui("Previous", "上一页", "Назад")
-            )
-        } else {
-            "".to_string()
-        },
-        if page < total_pages {
-            format!(
-                r#"<a href="/t/{}?page={}">{} ›</a>"#,
-                th.id,
-                page + 1,
-                ui("Next", "下一页", "Далее")
-            )
-        } else {
-            "".to_string()
-        }
-    ));
-    if user.is_some() {
-        if th.is_locked {
-            content.push_str(&format!(
-                r#"<p class="notice-locked">{}</p>"#,
-                ui(
-                    "This thread is locked.",
-                    "已锁定，禁止回帖",
-                    "Эта тема закрыта."
+        context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+        let reply_post = match q.reply_to.filter(|post_id| *post_id > 0) {
+            Some(post_id) => s
+                .store
+                .get_post(post_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|post| post.thread_id == th.id),
+            None => None,
+        };
+        context.insert("reply_to_id", &reply_post.as_ref().map(|post| post.id));
+        let hint = reply_post
+            .as_ref()
+            .map(|post| {
+                let author = if post.is_anonymous {
+                    ui("Anonymous", "匿名", "Аноним")
+                } else {
+                    post.author_name.clone()
+                };
+                format!(
+                    r#"<div class="reply-target"><b>{} @{}</b><span>“{}”</span><a href="/t/{}#reply-card">{}</a></div>"#,
+                    ui("Reply to", "回复", "Ответить"),
+                    html_escape(&author),
+                    html_escape(&post.content_md.chars().take(120).collect::<String>()),
+                    th.id,
+                    ui("Cancel", "取消", "Отмена")
                 )
-            ));
-        } else {
-            let reply_hint = reply_post.as_ref().map(|post| {
-                let name = if post.is_anonymous { &ui("Anonymous", "匿名", "Аноним") } else { &post.author_name };
-                let excerpt = post.content_md.chars().take(120).collect::<String>();
-                format!(r#"<div class="reply-target"><b>{} @{}</b><span>“{}”</span><a href="/t/{}#reply-card">{}</a></div>"#, ui("Reply to", "回复", "Ответить"), html_escape(name), html_escape(&excerpt), th.id, ui("Cancel", "取消", "Отмена"))
-            }).unwrap_or_default();
-            let reply_to_value = reply_post
-                .as_ref()
-                .map(|post| post.id.to_string())
-                .unwrap_or_default();
-            let pow_title = crate::i18n::translate(&locale, "pow.reply_title");
-            let pow_description = crate::i18n::translate(&locale, "pow.description");
-            let pow_computing = crate::i18n::translate(&locale, "pow.computing");
-            let pow_done = crate::i18n::translate(&locale, "pow.done");
-            let pow_failed = crate::i18n::translate(&locale, "pow.failed");
-            let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
-            content.push_str(&format!(r#"<div class="card" id="reply-card">
-<h3>{reply_label} <span class="muted" style="font-weight:400">· {pow_title}</span></h3>
-<p class="muted pow-explanation">{pow_description}</p>
-<div id="pow-status" data-computing="{pow_computing}" data-done="{pow_done}" data-failed="{pow_failed}" data-submitting="{pow_submitting}"></div>
-<div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
-<form method="POST" action="/t/{thread_id}/reply" data-pow-scope="post" id="reply-form">
-{reply_hint}
-<input type="hidden" name="parent_post_id" value="{reply_to}">
-<textarea name="content" required rows="4" style="width:100%" placeholder="{markdown_hint}"></textarea>
-{pow_fallback}
- {anonymous_field}<button class="btn-primary">{reply_label}</button>
-</form>
-</div>"#, reply_label = ui("Reply", "回帖", "Ответить"), pow_title = pow_title, pow_description = pow_description, pow_computing = pow_computing, pow_done = pow_done, pow_failed = pow_failed, pow_submitting = pow_submitting, thread_id = th.id, reply_hint = reply_hint, reply_to = reply_to_value, markdown_hint = ui("Markdown supported.", "Markdown 支持 基础+代码块+表格", "Поддерживается Markdown."), pow_fallback = pow_fallback, anonymous_field = if board.as_ref().map(|b| b.allow_anonymous).unwrap_or(false) { format!(r#"<label style="font-size:12px"><input type="checkbox" name="anonymous"> {}</label> "#, ui("Anonymous", "匿名", "Анонимно")) } else { String::new() }));
-        }
-    } else {
-        content.push_str(&format!(r#"<div class="card" style="padding:6px 8px;font-size:12.5px"><a href="/login">{}</a></div>"#, ui("Log in to reply", "登录后回帖", "Войдите, чтобы ответить")));
+            })
+            .unwrap_or_default();
+        context.insert("reply_hint", &hint);
     }
-    if is_admin {
-        content.push_str(&format!(r#"<div class="card">
-<b>{}</b>
-<form method="POST" action="/admin/thread/{}/pin" style="display:inline"><button>{}</button></form>
-<form method="POST" action="/admin/thread/{}/lock" style="display:inline"><button>{}</button></form>
-<form method="POST" action="/admin/thread/{}/delete" style="display:inline" onsubmit="return confirm('{}')"><button class="btn-danger">{}</button></form>
-</div>"#, ui("Moderator actions", "管理员操作", "Действия модератора"), th.id, if th.is_pinned {ui("Unpin", "取消置顶", "Открепить")} else {ui("Pin", "置顶", "Закрепить")}, th.id, if th.is_locked {ui("Unlock", "解锁", "Открыть") } else {ui("Lock", "锁定", "Закрыть")}, th.id, ui("Delete this thread and all replies?", "删主题及全部回帖?", "Удалить тему и все ответы?"), ui("Delete thread", "删主题", "Удалить тему")));
+    for (key, value) in [
+        ("thread_label", ui("Thread", "主题", "Тема")),
+        ("pinned_label", ui("pinned", "置顶", "закреплено")),
+        ("locked_label", ui("locked", "锁定", "закрыто")),
+        ("anonymous_label", ui("Anonymous", "匿名", "Аноним")),
+        ("replying_label", ui("Replying to", "回复", "Ответ на")),
+        ("reply_label", ui("Reply", "回帖", "Ответить")),
+        ("delete_label", ui("Delete", "删除", "Удалить")),
+        (
+            "empty_label",
+            ui("No replies yet", "暂无回帖", "Ответов пока нет"),
+        ),
+        (
+            "locked_notice",
+            ui(
+                "This thread is locked.",
+                "已锁定，禁止回帖",
+                "Эта тема закрыта.",
+            ),
+        ),
+        (
+            "login_to_reply_label",
+            ui("Log in to reply", "登录后回帖", "Войдите, чтобы ответить"),
+        ),
+        (
+            "moderator_actions_label",
+            ui("Moderator actions", "管理员操作", "Действия модератора"),
+        ),
+        (
+            "pin_label",
+            if th.is_pinned {
+                ui("Unpin", "取消置顶", "Открепить")
+            } else {
+                ui("Pin", "置顶", "Закрепить")
+            },
+        ),
+        (
+            "lock_label",
+            if th.is_locked {
+                ui("Unlock", "解锁", "Открыть")
+            } else {
+                ui("Lock", "锁定", "Закрыть")
+            },
+        ),
+        (
+            "delete_thread_label",
+            ui("Delete thread", "删主题", "Удалить тему"),
+        ),
+        (
+            "markdown_hint",
+            ui(
+                "Markdown supported.",
+                "Markdown 支持 基础+代码块+表格",
+                "Поддерживается Markdown.",
+            ),
+        ),
+        ("page_label", ui("Page", "页", "Страница")),
+        (
+            "pow_title",
+            crate::i18n::translate(&locale, "pow.reply_title"),
+        ),
+        (
+            "pow_description",
+            crate::i18n::translate(&locale, "pow.description"),
+        ),
+        (
+            "pow_computing",
+            crate::i18n::translate(&locale, "pow.computing"),
+        ),
+        ("pow_done", crate::i18n::translate(&locale, "pow.done")),
+        ("pow_failed", crate::i18n::translate(&locale, "pow.failed")),
+        (
+            "pow_submitting",
+            crate::i18n::translate(&locale, "pow.submitting"),
+        ),
+    ] {
+        context.insert(key, &value);
     }
+    let content = crate::templates::render_page("thread", &context)
+        .expect("embedded thread template must render");
     let full = layout_html(
         &th.title,
         &get_site_name(&s.store).await,
@@ -1312,8 +1199,7 @@ async fn thread(
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 
 // ---------- Search ----------
@@ -1323,7 +1209,7 @@ async fn search(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let query = q.get("q").cloned().unwrap_or_default().trim().to_string();
-    let page: i64 = q
+    let page = q
         .get("page")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
@@ -1333,79 +1219,60 @@ async fn search(
     let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
-    let mut content = String::new();
-    content.push_str(&format!(r#"<h2>{}</h2>
-<form method="GET" action="/search" role="search" style="display:flex;gap:6px"><input name="q" value="{}" placeholder="{}" aria-label="{}" style="flex:1;min-width:0"><button aria-label="{}">{}</button></form>"#, ui("Search", "搜索", "Поиск"), html_escape(&query), ui("Search terms", "关键词", "Поисковый запрос"), ui("Search terms", "搜索关键词", "Поисковый запрос"), ui("Search", "搜索", "Поиск"), ui("Search", "搜", "Найти")));
+    let mut context = Context::new();
+    context.insert("query", &query);
+    context.insert("page", &page);
+    let mut total = 0;
+    let mut total_pages = 1;
+    let mut results = Vec::new();
     if !query.is_empty() {
-        let page_size: i64 = 20;
-        let (posts, _threads, total) = s
+        let page_size = 20;
+        let (posts, _, count) = s
             .store
             .search_posts(&query, page, page_size)
             .await
             .unwrap_or((Vec::new(), Vec::new(), 0));
-        let total_pages = ((total + page_size - 1) / page_size).max(1);
-        content.push_str(&format!(
-            r#"<p class="muted" style="margin:8px 0">{} {} · {} {}/{}</p>"#,
-            total,
-            ui("results", "条结果", "результатов"),
-            ui("Page", "页", "Страница"),
-            page,
-            total_pages
-        ));
-        if posts.is_empty() {
-            content.push_str(&format!(
-                r#"<div class="empty">{}</div>"#,
-                ui("No results", "无结果 · 换词再试", "Ничего не найдено")
-            ));
-        } else {
-            for p in posts {
-                let th = s.store.get_thread(p.thread_id).await.unwrap_or(None);
-                let title = th.map(|t| t.title).unwrap_or_else(|| query.clone());
-                let snip_raw = p.content_md.chars().take(200).collect::<String>();
-                let snip_raw = if p.content_md.chars().count() > 200 {
-                    format!("{}...", snip_raw)
-                } else {
-                    snip_raw
-                };
-                let snip = crate::markdown::render(&snip_raw);
-                let author = if p.is_anonymous {
-                    ui("Anonymous", "匿名", "Аноним")
-                } else {
-                    html_escape(&p.author_name)
-                };
-                let time = p.created_at.format("%m-%d").to_string();
-                content.push_str(&format!(r#"<div class="card" style="padding:7px 9px">
-<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap"><a href="/t/{}#p{}" style="font-weight:650">{}</a> <span class="muted" style="font-size:11px">by {} {}</span></div>
-<div class="post-body" style="padding:4px 0 2px;font-size:13px">{}</div>
-</div>"#, p.thread_id, p.id, html_escape(&title), author, time, snip));
-            }
+        total = count;
+        total_pages = ((total + page_size - 1) / page_size).max(1);
+        for post in posts {
+            let title = s
+                .store
+                .get_thread(post.thread_id)
+                .await
+                .unwrap_or(None)
+                .map(|t| t.title)
+                .unwrap_or_else(|| query.clone());
+            let raw = post.content_md.chars().take(200).collect::<String>();
+            let snippet_source = if post.content_md.chars().count() > 200 {
+                format!("{raw}...")
+            } else {
+                raw
+            };
+            let snippet = crate::markdown::render(&snippet_source);
+            results.push(serde_json::json!({"thread_id":post.thread_id,"id":post.id,"title":title,"author_name":if post.is_anonymous {ui("Anonymous","匿名","Аноним")} else {post.author_name},"created_at":post.created_at.format("%m-%d").to_string(),"snippet":snippet}));
         }
-        content.push_str(&format!(
-            r#"<div class="pagination"><span class="muted">{} / {}</span> {} {}</div>"#,
-            page,
-            total_pages,
-            if page > 1 {
-                format!(
-                    r#"<a href="/search?q={}&page={}">‹ {}</a>"#,
-                    html_escape(&query),
-                    page - 1,
-                    ui("Previous", "上一页", "Назад")
-                )
-            } else {
-                "".to_string()
-            },
-            if page < total_pages {
-                format!(
-                    r#"<a href="/search?q={}&page={}">{} ›</a>"#,
-                    html_escape(&query),
-                    page + 1,
-                    ui("Next", "下一页", "Далее")
-                )
-            } else {
-                "".to_string()
-            }
-        ));
     }
+    context.insert("results", &results);
+    context.insert("total", &total);
+    context.insert("total_pages", &total_pages);
+    for (key, value) in [
+        ("search_label", ui("Search", "搜索", "Поиск")),
+        (
+            "search_hint",
+            ui("Search terms", "关键词", "Поисковый запрос"),
+        ),
+        ("search_button", ui("Search", "搜", "Найти")),
+        ("results_label", ui("results", "条结果", "результатов")),
+        ("page_label", ui("Page", "页", "Страница")),
+        (
+            "empty_label",
+            ui("No results", "无结果 · 换词再试", "Ничего не найдено"),
+        ),
+    ] {
+        context.insert(key, &value);
+    }
+    let content = crate::templates::render_page("search", &context)
+        .expect("embedded search template must render");
     let full = layout_html(
         &ui("Search", "搜索", "Поиск"),
         &site,
@@ -1424,16 +1291,13 @@ async fn search(
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 
 // ---------- Register ----------
 async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user = current_user(&s, &headers).await;
-    if user.is_some() {
-        let resp = Redirect::to("/").into_response();
-        return apply_sec(resp);
+    if current_user(&s, &headers).await.is_some() {
+        return apply_sec(Redirect::to("/").into_response());
     }
     let reg_mode = s
         .store
@@ -1452,62 +1316,75 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
     let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
-    let username = crate::i18n::translate(&locale, "auth.username");
-    let password = crate::i18n::translate(&locale, "auth.password");
-    let register = crate::i18n::translate(&locale, "nav.register");
-    let login = crate::i18n::translate(&locale, "nav.login");
-    let register_button = crate::i18n::format(
-        crate::i18n::translate(&locale, "auth.register_pow"),
-        "minutes",
-        &pow_min,
+    let mut context = Context::new();
+    let ch = s.pow.generate(crate::pow::Scope::Register).await;
+    context.insert("csrf_field", &csrf_field(&headers));
+    context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+    context.insert("need_invite", &need_invite);
+    context.insert(
+        "registration_mode",
+        &ui("Registration mode", "注册模式", "Режим регистрации"),
     );
-    let pow_title = crate::i18n::translate(&locale, "pow.register_title");
-    let pow_description = crate::i18n::translate(&locale, "pow.description");
-    let pow_computing = crate::i18n::translate(&locale, "pow.computing");
-    let pow_done = crate::i18n::translate(&locale, "pow.done");
-    let pow_failed = crate::i18n::translate(&locale, "pow.failed");
-    let pow_submitting = crate::i18n::translate(&locale, "pow.submitting");
-    let invite_field = if need_invite {
-        &format!(
-            r#"<input name="invite_code" placeholder="{}" required style="width:100%;margin:5px 0">"#,
-            ui("Invite code", "邀请码", "Код приглашения")
-        )
-    } else {
-        ""
-    };
-    let pow_ch = s.pow.generate(crate::pow::Scope::Register).await;
-    let pow_fallback = pow_fallback_html(&pow_ch, &locale);
-    let content = format!(
-        r#"<h2>{register} <span class="muted" style="font-weight:400">· {pow_title}</span></h2>
-<p class="muted pow-explanation">{pow_description}</p>
-<div id="pow-status" data-computing="{pow_computing}" data-done="{pow_done}" data-failed="{pow_failed}" data-submitting="{pow_submitting}"></div>
-<div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
-<form method="POST" action="/register" data-pow-scope="register" style="max-width:420px">
-<input name="username" placeholder="{username}" aria-label="{username}" required pattern="[a-zA-Z0-9_]{{3,20}}" style="width:100%;margin:5px 0">
-<input name="password" type="password" placeholder="{password}" aria-label="{password}" required minlength="6" maxlength="72" style="width:100%;margin:5px 0">
-{invite_field}
-{pow_fallback}<button class="btn-primary" style="width:100%;margin-top:6px">{register_button}</button>
-</form>
-<p style="font-size:12.5px">{login}? <a href="/login">{login}</a></p>
-<p class="muted" style="font-size:11.5px">{registration_mode}: {reg_mode} · {recovery_hint}</p>"#,
-        invite_field = invite_field,
-        pow_fallback = pow_fallback,
-        pow_title = pow_title,
-        pow_description = pow_description,
-        pow_computing = pow_computing,
-        pow_done = pow_done,
-        pow_failed = pow_failed,
-        pow_submitting = pow_submitting,
-        registration_mode = ui("Registration mode", "注册模式", "Режим регистрации"),
-        reg_mode = html_escape(&reg_mode),
-        recovery_hint = ui(
+    context.insert("reg_mode", &reg_mode);
+    context.insert(
+        "recovery_hint",
+        &ui(
             "No email recovery. Keep your password safe.",
             "无邮箱找回，丢密即丢号",
-            "Восстановления по email нет. Сохраните пароль."
-        )
+            "Восстановления по email нет. Сохраните пароль.",
+        ),
     );
+    for (key, value) in [
+        (
+            "username_label",
+            crate::i18n::translate(&locale, "auth.username"),
+        ),
+        (
+            "password_label",
+            crate::i18n::translate(&locale, "auth.password"),
+        ),
+        (
+            "register_label",
+            crate::i18n::translate(&locale, "nav.register"),
+        ),
+        ("login_label", crate::i18n::translate(&locale, "nav.login")),
+        (
+            "register_button",
+            crate::i18n::format(
+                crate::i18n::translate(&locale, "auth.register_pow"),
+                "minutes",
+                &pow_min,
+            ),
+        ),
+        (
+            "pow_title",
+            crate::i18n::translate(&locale, "pow.register_title"),
+        ),
+        (
+            "pow_description",
+            crate::i18n::translate(&locale, "pow.description"),
+        ),
+        (
+            "pow_computing",
+            crate::i18n::translate(&locale, "pow.computing"),
+        ),
+        ("pow_done", crate::i18n::translate(&locale, "pow.done")),
+        ("pow_failed", crate::i18n::translate(&locale, "pow.failed")),
+        (
+            "pow_submitting",
+            crate::i18n::translate(&locale, "pow.submitting"),
+        ),
+        (
+            "invite_label",
+            ui("Invite code", "邀请码", "Код приглашения"),
+        ),
+    ] {
+        context.insert(key, &value);
+    }
+    let content = crate::templates::render_page("register", &context)
+        .expect("embedded register template must render");
     let full = layout_html(
-        &register,
+        &crate::i18n::translate(&locale, "nav.register"),
         &site,
         None,
         &boards,
@@ -1524,8 +1401,7 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 async fn register_post(
     State(s): State<AppState>,
@@ -1625,10 +1501,7 @@ async fn register_post(
         s.store.create_user(&username, &hash, false).await
     } {
         Ok(id) => id,
-        Err(_) => {
-            let resp = (StatusCode::CONFLICT, "username taken").into_response();
-            return apply_sec(resp);
-        }
+        Err(error) => return registration_error_response(error),
     };
     let _ = s.store.delete_sessions_by_user(uid).await;
     let sid = match s.store.create_session(uid).await {
@@ -1654,35 +1527,64 @@ async fn register_post(
 }
 // ---------- Login ----------
 async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user = current_user(&s, &headers).await;
-    if user.is_some() {
-        let resp = Redirect::to("/").into_response();
-        return apply_sec(resp);
+    if current_user(&s, &headers).await.is_some() {
+        return apply_sec(Redirect::to("/").into_response());
     }
     let site = get_site_name(&s.store).await;
     let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
-    let username = crate::i18n::translate(&locale, "auth.username");
-    let password = crate::i18n::translate(&locale, "auth.password");
-    let register = crate::i18n::translate(&locale, "nav.register");
-    let login = crate::i18n::translate(&locale, "nav.login");
-    let content = format!(
-        r#"<h2>{login}</h2>
-<form method="POST" action="/login" style="max-width:420px">
-<input name="username" placeholder="{username}" aria-label="{username}" required style="width:100%;margin:5px 0">
-<input name="password" type="password" placeholder="{password}" aria-label="{password}" required style="width:100%;margin:5px 0">
-<button class="btn-primary" style="width:100%;margin-top:6px">{login}</button>
-</form>
-<p style="font-size:12.5px"><a href="/register">{register}</a> <span class="muted">· {email_hint}</span></p>"#,
-        email_hint = crate::i18n::ui(
-            &locale,
-            "no email required",
-            "无需邮箱",
-            "email не требуется"
-        )
-    );
+    let mut context = Context::new();
+    let ch = s.pow.generate(crate::pow::Scope::Login).await;
+    context.insert("csrf_field", &csrf_field(&headers));
+    context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+    for (key, value) in [
+        (
+            "username_label",
+            crate::i18n::translate(&locale, "auth.username"),
+        ),
+        (
+            "password_label",
+            crate::i18n::translate(&locale, "auth.password"),
+        ),
+        (
+            "register_label",
+            crate::i18n::translate(&locale, "nav.register"),
+        ),
+        ("login_label", crate::i18n::translate(&locale, "nav.login")),
+        (
+            "pow_title",
+            crate::i18n::translate(&locale, "pow.login_title"),
+        ),
+        (
+            "pow_description",
+            crate::i18n::translate(&locale, "pow.description"),
+        ),
+        (
+            "pow_computing",
+            crate::i18n::translate(&locale, "pow.computing"),
+        ),
+        ("pow_done", crate::i18n::translate(&locale, "pow.done")),
+        ("pow_failed", crate::i18n::translate(&locale, "pow.failed")),
+        (
+            "pow_submitting",
+            crate::i18n::translate(&locale, "pow.submitting"),
+        ),
+        (
+            "email_hint",
+            crate::i18n::ui(
+                &locale,
+                "no email required",
+                "无需邮箱",
+                "email не требуется",
+            ),
+        ),
+    ] {
+        context.insert(key, &value);
+    }
+    let content = crate::templates::render_page("login", &context)
+        .expect("embedded login template must render");
     let full = layout_html(
-        &login,
+        &crate::i18n::translate(&locale, "nav.login"),
         &site,
         None,
         &boards,
@@ -1693,14 +1595,13 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         &recent,
         &announcement,
         &content,
-        false,
+        true,
         None,
         get_theme(&headers),
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 async fn login_post(
     State(s): State<AppState>,
@@ -1709,6 +1610,27 @@ async fn login_post(
 ) -> impl IntoResponse {
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Login) {
+        Ok(v) => v,
+        Err(e) => {
+            return apply_sec((StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response())
+        }
+    };
+    if let Err(e) = s
+        .pow
+        .verify(
+            crate::pow::Scope::Login,
+            &pow_fields.0,
+            &pow_fields.1,
+            pow_fields.2,
+            pow_fields.3,
+            &pow_fields.4,
+            &pow_fields.5,
+        )
+        .await
+    {
+        return apply_sec((StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response());
     }
     let username = form
         .get("username")
@@ -2029,10 +1951,7 @@ async fn audit_admin(
 async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user = match require_admin_state(&s, &headers).await {
         Some(u) => u,
-        None => {
-            let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
-            return apply_sec(resp);
-        }
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
     };
     let boards = s.store.list_boards().await.unwrap_or_default();
     let users = s.store.list_users(100).await.unwrap_or_default();
@@ -2042,149 +1961,214 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
     let (sboards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
-    // build admin content similar to admin.html
-    let mut content = String::new();
-    content.push_str(&format!(
-        "<h2>{}</h2>\n<div class=\"admin-grid\">\n<div class=\"card\">\n<h3>{}</h3>\n",
-        ui("Administration", "管理后台", "Администрирование"),
-        ui("Site settings", "站点配置", "Настройки сайта")
-    ));
-    content.push_str(&format!(r#"<form method="POST" action="/admin/config/site">
-<label>{site_name_label} <input name="site_name" value="{}" style="width:100%"></label>
-<button>{save}</button>
-</form>
-<hr>
-<form method="POST" action="/admin/config/locale">
-<label>{locale_label} <select name="default_locale">
-<option value="en" {}>English</option>
-<option value="zh" {}>中文</option>
-<option value="ru" {}>Русский</option>
-</select></label><button>{save}</button>
-</form>
-<hr>
-<form method="POST" action="/admin/config/announcement">
-<label>{announcement_label} <textarea name="announcement" rows="4" maxlength="1000" style="width:100%" placeholder="{announcement_hint}">{}</textarea></label>
-<small style="color:#888">{announcement_help}</small><br><button>{save_announcement}</button>
-</form>
-<hr>
-<form method="POST" action="/admin/config/pow">
-<label>{register_pow} <input name="pow_register_minutes" value="{}" style="width:100%"></label>
-<label>{post_pow} <input name="pow_post_minutes" value="{}" style="width:100%"></label>
-<small style="color:#888">{pow_help}</small><br>
-<button>{save_pow}</button>
-</form>
-<hr>
-<form method="POST" action="/admin/config/registration">
-<label>{registration_mode}
-<select name="registration_mode">
-<option value="open" {}>{open}</option>
-<option value="invite" {}>{invite}</option>
-<option value="closed" {}>{closed}</option>
-</select></label><button>{save}</button>
-</form>
-    </div>"#, html_escape(configs.get("site_name").map(|x| x.as_str()).unwrap_or("secure-forum")),
-        if configs.get("default_locale").map(|x| x=="en").unwrap_or(true) {"selected"} else {""},
-        if configs.get("default_locale").map(|x| x=="zh").unwrap_or(false) {"selected"} else {""},
-        if configs.get("default_locale").map(|x| x=="ru").unwrap_or(false) {"selected"} else {""},
-        html_escape(configs.get("announcement").map(|x| x.as_str()).unwrap_or("")),
-        html_escape(configs.get("pow_register_minutes").map(|x| x.as_str()).unwrap_or("0.02")),
-        html_escape(configs.get("pow_post_minutes").map(|x| x.as_str()).unwrap_or("0.02")),
-        if configs.get("registration_mode").map(|x| x=="open").unwrap_or(false) {"selected"} else {""},
-        if configs.get("registration_mode").map(|x| x=="invite").unwrap_or(false) {"selected"} else {""},
-        if configs.get("registration_mode").map(|x| x=="closed").unwrap_or(false) {"selected"} else {""},
-        site_name_label = ui("Site name", "站点名", "Название сайта"), save = crate::i18n::translate(&locale, "admin.save"),
-        locale_label = crate::i18n::translate(&locale, "admin.default_locale"),
-        announcement_label = ui("Announcement", "公告", "Объявление"), announcement_hint = ui("Leave blank to hide", "留空则不显示", "Оставьте пустым, чтобы скрыть"), announcement_help = ui("Shown on every page.", "显示在所有页面右侧。", "Показывается на каждой странице."), save_announcement = ui("Save announcement", "保存公告", "Сохранить объявление"),
-        register_pow = ui("Registration PoW minutes", "注册 PoW 分钟", "Минуты PoW регистрации"), post_pow = ui("Posting PoW minutes", "发帖 PoW 分钟", "Минуты PoW публикации"), pow_help = ui("Argon2id minutes, from 0.005 to 10.", "Argon2id 小数分钟 0.005~10", "Минуты Argon2id, от 0.005 до 10."), save_pow = ui("Save PoW", "保存PoW", "Сохранить PoW"), registration_mode = ui("Registration mode", "注册模式", "Режим регистрации"), open = ui("Open", "开放", "Открытая"), invite = ui("Invite only", "需邀请码", "Только по приглашению"), closed = ui("Closed", "关闭", "Закрыта"),
-    ));
-    content.push_str(&format!(
-        r#"<div class="card">
-<h3>{} ({})</h3>
-<form method="POST" action="/admin/change-password">
-<input name="old_password" type="password" placeholder="{}" style="width:100%">
-<input name="new_password" type="password" placeholder="{}" style="width:100%">
-<button>{}</button>
-</form>
-<hr>
-<h3>{}</h3>
-<form method="POST" action="/admin/invite/create"><button>{}</button></form>
-<ul>"#,
-        ui("Change password", "改密", "Сменить пароль"),
-        html_escape(&user.username),
-        ui("Current password", "旧密码", "Текущий пароль"),
-        ui("New password", "新密码", "Новый пароль"),
-        ui("Change password", "改密", "Сменить пароль"),
-        ui("Invite codes", "生成邀请码", "Коды приглашений"),
-        ui("Create code", "生成1枚", "Создать код")
-    ));
-    if invites.is_empty() {
-        content.push_str(&format!(
-            "<li>{}</li>",
-            ui("No invite codes", "无邀请码", "Нет кодов приглашения")
-        ));
-    } else {
-        for inv in &invites {
-            if let Some(used_by) = inv.used_by {
-                content.push_str(&format!(
-                    r#"<li><code>{}</code> {} {}</li>"#,
-                    html_escape(&inv.code),
-                    ui("used by", "已用 by", "использован"),
-                    used_by
-                ));
-            } else {
-                content.push_str(&format!(r#"<li><code>{}</code> {}<form method="POST" action="/admin/invite/{}/delete" style="display:inline"><button>{}</button></form></li>"#, html_escape(&inv.code), ui("unused", "未用", "не использован"), html_escape(&inv.code), ui("Revoke", "作废", "Отозвать")));
-            }
-        }
-    }
-    content.push_str("</ul></div></div>\n");
-    // boards
-    content.push_str(&format!(r#"<div class="card">
-<h3>{}</h3>
-<form method="POST" action="/admin/board/create" style="border:1px solid #333;padding:6px">
-<input name="slug" placeholder="slug a-z 0-9 _ -" required pattern="[a-z0-9_-]{{2,20}}"> <input name="name" placeholder="{}" required> <input name="description" placeholder="{}" style="width:40%">
-<label><input type="checkbox" name="allow_anonymous" checked>{}</label>
-<label><input type="checkbox" name="guest_readable" checked>{}</label>
-<button>{}</button>
-</form>
-<table>
-<tr><th>slug</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr>"#, ui("Board management", "版块管理", "Управление разделами"), ui("Name", "名称", "Название"), ui("Description", "描述", "Описание"), ui("Allow anonymous", "允许匿名", "Разрешить анонимно"), ui("Guest readable", "游客可读", "Доступно гостям"), ui("Create board", "创建版块", "Создать раздел"), ui("Name", "名称", "Название"), ui("Anonymous", "匿名", "Анонимно"), ui("Guest readable", "游客可读", "Доступно гостям"), ui("Actions", "操作", "Действия")));
-    for b in &boards {
-        content.push_str(&format!(r#"<tr>
-<td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td>
-<form method="POST" action="/admin/board/{}/update" style="display:inline">
-<input type="hidden" name="name" value="{}"><input type="hidden" name="description" value="{}">
-<label><input type="checkbox" name="allow_anonymous" {}>{}</label>
-<label><input type="checkbox" name="guest_readable" {}>{}</label>
-<button>{}</button>
-</form>
-<form method="POST" action="/admin/board/{}/delete" style="display:inline" onsubmit="return confirm('{}')"><button>{}</button></form>
-</td></tr>"#, html_escape(&b.slug), html_escape(&b.name), if b.allow_anonymous {ui("Yes", "是", "Да")} else {ui("No", "否", "Нет")}, if b.guest_readable {ui("Yes", "是", "Да")} else {ui("No", "否", "Нет")}, b.id, html_escape(&b.name), html_escape(&b.description), if b.allow_anonymous {"checked"} else {""}, ui("Anonymous", "匿名", "Анонимно"), if b.guest_readable {"checked"} else {""}, ui("Readable", "可读", "Чтение"), ui("Update", "更新", "Обновить"), b.id, ui("Delete this board and its threads?", "删版及帖?", "Удалить раздел и темы?"), ui("Delete", "删", "Удалить")));
-    }
-    content.push_str("</table></div>\n");
-    content.push_str(&format!(
-        r#"<div class="card">
-<h3>{}</h3>
-<table>
-<tr><th>ID</th><th>{}</th><th>admin</th><th>{}</th><th>{}</th></tr>"#,
-        ui(
-            "User management (latest 100)",
-            "用户管理 (近100)",
-            "Управление пользователями (100 последних)"
+    let mut context = Context::new();
+    context.insert("csrf_field", &csrf_field(&headers));
+    context.insert("username", &user.username);
+    context.insert(
+        "site_name_value",
+        configs
+            .get("site_name")
+            .map(String::as_str)
+            .unwrap_or("secure-forum"),
+    );
+    context.insert(
+        "default_locale",
+        configs
+            .get("default_locale")
+            .map(String::as_str)
+            .unwrap_or("en"),
+    );
+    context.insert(
+        "announcement",
+        configs
+            .get("announcement")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    context.insert(
+        "pow_register_minutes",
+        configs
+            .get("pow_register_minutes")
+            .map(String::as_str)
+            .unwrap_or("0.02"),
+    );
+    context.insert(
+        "pow_login_minutes",
+        configs
+            .get("pow_login_minutes")
+            .map(String::as_str)
+            .unwrap_or("0.02"),
+    );
+    context.insert(
+        "pow_post_minutes",
+        configs
+            .get("pow_post_minutes")
+            .map(String::as_str)
+            .unwrap_or("0.02"),
+    );
+    context.insert(
+        "registration_mode",
+        configs
+            .get("registration_mode")
+            .map(String::as_str)
+            .unwrap_or("invite"),
+    );
+    let rendered_invites: Vec<_> = invites
+        .iter()
+        .map(|invite| serde_json::json!({"code": invite.code, "used_by": invite.used_by}))
+        .collect();
+    let rendered_users: Vec<_> = users
+        .iter()
+        .map(|user| serde_json::json!({"id": user.id, "username": user.username, "is_admin": user.is_admin, "is_banned": user.is_banned}))
+        .collect();
+    context.insert("invites", &rendered_invites);
+    context.insert("users", &rendered_users);
+    let render_boards:Vec<_>=boards.iter().map(|b|serde_json::json!({"id":b.id,"slug":b.slug,"name":b.name,"description":b.description,"allow_anonymous":b.allow_anonymous,"guest_readable":b.guest_readable,"allow_anonymous_label":ui(if b.allow_anonymous{"Yes"}else{"No"},if b.allow_anonymous{"是"}else{"否"},if b.allow_anonymous{"Да"}else{"Нет"}),"guest_readable_label":ui(if b.guest_readable{"Yes"}else{"No"},if b.guest_readable{"是"}else{"否"},if b.guest_readable{"Да"}else{"Нет"})})).collect();
+    context.insert("boards", &render_boards);
+    for (key, value) in [
+        (
+            "admin_label",
+            ui("Administration", "管理后台", "Администрирование"),
         ),
-        ui("User", "用户", "Пользователь"),
-        ui("Banned", "banned", "Заблокирован"),
-        ui("Actions", "操作", "Действия")
-    ));
-    for u in &users {
-        content.push_str(&format!(r#"<tr>
-<td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td>
-{} </td></tr>"#, u.id, html_escape(&u.username), u.is_admin, u.is_banned,
-            if u.is_banned { format!(r#"<form method="POST" action="/admin/user/{}/unban" style="display:inline"><button>{}</button></form>"#, u.id, ui("Unban", "解封", "Разблокировать")) } else { format!(r#"<form method="POST" action="/admin/user/{}/ban" style="display:inline"><button>{}</button></form>"#, u.id, ui("Ban", "封禁", "Заблокировать")) }
-        ));
+        (
+            "site_settings_label",
+            ui("Site settings", "站点配置", "Настройки сайта"),
+        ),
+        (
+            "site_name_label",
+            ui("Site name", "站点名", "Название сайта"),
+        ),
+        ("save_label", crate::i18n::translate(&locale, "admin.save")),
+        (
+            "locale_label",
+            crate::i18n::translate(&locale, "admin.default_locale"),
+        ),
+        (
+            "announcement_label",
+            ui("Announcement", "公告", "Объявление"),
+        ),
+        (
+            "announcement_hint",
+            ui(
+                "Leave blank to hide",
+                "留空则不显示",
+                "Оставьте пустым, чтобы скрыть",
+            ),
+        ),
+        (
+            "announcement_help",
+            ui(
+                "Shown on every page.",
+                "显示在所有页面右侧。",
+                "Показывается на каждой странице.",
+            ),
+        ),
+        (
+            "save_announcement_label",
+            ui("Save announcement", "保存公告", "Сохранить объявление"),
+        ),
+        (
+            "register_pow_label",
+            ui(
+                "Registration PoW minutes",
+                "注册 PoW 分钟",
+                "Минуты PoW регистрации",
+            ),
+        ),
+        (
+            "login_pow_label",
+            ui("Login PoW minutes", "登录 PoW 分钟", "Минуты PoW входа"),
+        ),
+        (
+            "post_pow_label",
+            ui(
+                "Posting PoW minutes",
+                "发帖 PoW 分钟",
+                "Минуты PoW публикации",
+            ),
+        ),
+        (
+            "pow_help",
+            ui(
+                "SHA-256 PoW minutes, from 0.005 to 10.",
+                "SHA-256 PoW 小数分钟 0.005~10",
+                "Минуты SHA-256 PoW, от 0.005 до 10.",
+            ),
+        ),
+        ("save_pow_label", ui("Save PoW", "保存PoW", "Сохранить PoW")),
+        (
+            "registration_mode_label",
+            ui("Registration mode", "注册模式", "Режим регистрации"),
+        ),
+        ("open_label", ui("Open", "开放", "Открытая")),
+        (
+            "invite_label",
+            ui("Invite only", "需邀请码", "Только по приглашению"),
+        ),
+        ("closed_label", ui("Closed", "关闭", "Закрыта")),
+        (
+            "change_password_label",
+            ui("Change password", "改密", "Сменить пароль"),
+        ),
+        (
+            "current_password_label",
+            ui("Current password", "旧密码", "Текущий пароль"),
+        ),
+        (
+            "new_password_label",
+            ui("New password", "新密码", "Новый пароль"),
+        ),
+        (
+            "invite_codes_label",
+            ui("Invite codes", "生成邀请码", "Коды приглашений"),
+        ),
+        (
+            "create_code_label",
+            ui("Create code", "生成1枚", "Создать код"),
+        ),
+        ("used_label", ui("used by", "已用 by", "использован")),
+        ("unused_label", ui("unused", "未用", "не использован")),
+        ("revoke_label", ui("Revoke", "作废", "Отозвать")),
+        (
+            "no_invites_label",
+            ui("No invite codes", "无邀请码", "Нет кодов приглашения"),
+        ),
+        (
+            "board_management_label",
+            ui("Board management", "版块管理", "Управление разделами"),
+        ),
+        ("name_label", ui("Name", "名称", "Название")),
+        ("description_label", ui("Description", "描述", "Описание")),
+        ("anonymous_label", ui("Anonymous", "匿名", "Анонимно")),
+        (
+            "guest_readable_label",
+            ui("Guest readable", "游客可读", "Доступно гостям"),
+        ),
+        ("readable_label", ui("Readable", "可读", "Чтение")),
+        (
+            "create_board_label",
+            ui("Create board", "创建版块", "Создать раздел"),
+        ),
+        ("actions_label", ui("Actions", "操作", "Действия")),
+        ("update_label", ui("Update", "更新", "Обновить")),
+        ("delete_label", ui("Delete", "删", "Удалить")),
+        (
+            "user_management_label",
+            ui(
+                "User management (latest 100)",
+                "用户管理 (近100)",
+                "Управление пользователями (100 последних)",
+            ),
+        ),
+        ("user_label", ui("User", "用户", "Пользователь")),
+        ("banned_label", ui("Banned", "banned", "Заблокирован")),
+        ("ban_label", ui("Ban", "封禁", "Заблокировать")),
+        ("unban_label", ui("Unban", "解封", "Разблокировать")),
+    ] {
+        context.insert(key, &value);
     }
-    content.push_str("</table></div>\n");
+    let content = crate::templates::render_page("admin", &context)
+        .expect("embedded admin template must render");
     let full = layout_html(
         &ui("Administration", "管理后台", "Администрирование"),
         &site,
@@ -2203,8 +2187,7 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
         &locale,
         &headers,
     );
-    let resp = Html(full).into_response();
-    apply_sec(resp)
+    apply_sec(Html(full).into_response())
 }
 async fn admin_site(
     State(s): State<AppState>,
@@ -2282,7 +2265,11 @@ async fn admin_pow(
         return apply_sec(resp);
     }
     let mut ok = true;
-    for k in ["pow_register_minutes", "pow_post_minutes"] {
+    for k in [
+        "pow_register_minutes",
+        "pow_login_minutes",
+        "pow_post_minutes",
+    ] {
         let v = form
             .get(k)
             .map(|x| x.trim().to_string())

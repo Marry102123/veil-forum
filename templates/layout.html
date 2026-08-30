@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="{{ locale }}" data-theme="{{ theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} - {{ site_name }}</title>
+<script src="/static/theme.js?v=2"></script>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js"></script>
+{% if need_pow %}<script src="/static/pow.js?v=2"></script>{% endif %}
+</head>
+<body class="no-js">
+{{ flash_html | safe }}
+<div class="layout">
+<aside class="side">
+<div class="card brand-card"><a href="/" class="brand-name">{{ site_name }}</a></div>
+<div class="card search-card"><b>{{ search_label }}</b><form method="GET" action="/search" role="search"><input name="q" placeholder="{{ search_label }}" aria-label="{{ search_label }}"><button>{{ search_label }}</button></form></div>
+<div class="card account-card"><b>{{ account_label }}</b>{{ account_html | safe }}</div>
+<div class="card board-card-side"><b>{{ boards_label }}</b>
+{{ boards_html | safe }}
+<div class="muted" style="margin-top:6px;font-size:11px">{{ boards_len }} {{ board_count }} · <a href="/" style="font-size:11px">{{ all_boards }}</a></div>
+</div>
+</aside>
+<main>{{ content | safe }}</main>
+<aside class="side">
+<div class="card announcement-card"><b>{{ announcement_label }}</b><div class="announcement-body">{{ announcement_body | safe }}</div></div>
+<div class="card display-card"><b>{{ display_label }}</b><button id="theme-toggle" type="button" aria-label="{{ display_label }}" style="display:none">☼</button><span class="noscript-themes"><a class="theme-choice" href="/theme?to=light" aria-label="{{ light_label }}">☼ {{ light_label }}</a><a class="theme-choice" href="/theme?to=dark" aria-label="{{ dark_label }}">☾ {{ dark_label }}</a></span></div>
+<div class="card"><b>{{ stats_label }}</b><div class="muted" style="margin-top:6px;font-size:11.5px;line-height:1.6">PoW {{ pow_minutes }} min<br>{{ threads_label }} {{ stats_threads }} · {{ replies_label }} {{ stats_posts }}<br>{{ users_label }} {{ stats_users }}</div></div>
+<div class="card"><b>{{ recent_label }}</b><div style="margin-top:4px">{{ recent_html | safe }}</div></div>
+</aside>
+</div>
+<footer><span>no log / no ip / csp default-src 'none' · veil-forum</span><span class="foot-right">{{ site_name }} · {{ loopback_label }} · <a href="https://github.com/Marry102123/veil-forum">Source</a></span></footer>
+</body>
+</html>
