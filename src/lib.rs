@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod captcha;
 pub mod handler;
 pub mod i18n;
 pub mod markdown;

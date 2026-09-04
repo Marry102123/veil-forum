@@ -1,14 +1,18 @@
-<h2>{{ admin_label }}</h2>
-<div class="admin-grid">
-  <div class="card">
-    <h3>{{ site_settings_label }}</h3>
-    <form method="POST" action="/admin/config/site">{{ csrf_field | safe }}<label>{{ site_name_label }} <input name="site_name" value="{{ site_name_value }}" style="width:100%"></label><button>{{ save_label }}</button></form><hr>
-    <form method="POST" action="/admin/config/locale">{{ csrf_field | safe }}<label>{{ locale_label }} <select name="default_locale"><option value="en"{% if default_locale == "en" %} selected{% endif %}>English</option><option value="zh"{% if default_locale == "zh" %} selected{% endif %}>中文</option><option value="ru"{% if default_locale == "ru" %} selected{% endif %}>Русский</option></select></label><button>{{ save_label }}</button></form><hr>
-    <form method="POST" action="/admin/config/announcement">{{ csrf_field | safe }}<label>{{ announcement_label }} <textarea name="announcement" rows="4" maxlength="1000" style="width:100%" placeholder="{{ announcement_hint }}">{{ announcement }}</textarea></label><small class="muted">{{ announcement_help }}</small><br><button>{{ save_announcement_label }}</button></form><hr>
-    <form method="POST" action="/admin/config/pow">{{ csrf_field | safe }}<label>{{ register_pow_label }} <input name="pow_register_minutes" value="{{ pow_register_minutes }}" style="width:100%"></label><label>{{ login_pow_label }} <input name="pow_login_minutes" value="{{ pow_login_minutes }}" style="width:100%"></label><label>{{ post_pow_label }} <input name="pow_post_minutes" value="{{ pow_post_minutes }}" style="width:100%"></label><small class="muted">{{ pow_help }}</small><br><button>{{ save_pow_label }}</button></form><hr>
-    <form method="POST" action="/admin/config/registration">{{ csrf_field | safe }}<label>{{ registration_mode_label }} <select name="registration_mode"><option value="open"{% if registration_mode == "open" %} selected{% endif %}>{{ open_label }}</option><option value="invite"{% if registration_mode == "invite" %} selected{% endif %}>{{ invite_label }}</option><option value="closed"{% if registration_mode == "closed" %} selected{% endif %}>{{ closed_label }}</option></select></label><button>{{ save_label }}</button></form>
+<section class="admin-hub">
+  <header class="admin-hub-header">
+    <h2>{{ admin_label }}</h2>
+    <p class="muted">{{ admin_help }}</p>
+  </header>
+  <div class="admin-hub-grid">
+    <a class="admin-hub-entry" href="/governance">
+      <span class="admin-hub-entry-label">{{ governance_label }}</span>
+      <span class="admin-hub-entry-help">{{ governance_help }}</span>
+      <span class="admin-hub-entry-arrow" aria-hidden="true">→</span>
+    </a>
+    <a class="admin-hub-entry" href="/admin/settings">
+      <span class="admin-hub-entry-label">{{ system_settings_label }}</span>
+      <span class="admin-hub-entry-help">{{ system_settings_help }}</span>
+      <span class="admin-hub-entry-arrow" aria-hidden="true">→</span>
+    </a>
   </div>
-  <div class="card"><h3>{{ change_password_label }} ({{ username }})</h3><form method="POST" action="/admin/change-password">{{ csrf_field | safe }}<input name="old_password" type="password" placeholder="{{ current_password_label }}" style="width:100%"><input name="new_password" type="password" placeholder="{{ new_password_label }}" style="width:100%"><button>{{ change_password_label }}</button></form><hr><h3>{{ invite_codes_label }}</h3><form method="POST" action="/admin/invite/create">{{ csrf_field | safe }}<button>{{ create_code_label }}</button></form><ul>{% for invite in invites %}<li><code>{{ invite.code }}</code> {% if invite.used_by %}{{ used_label }} {{ invite.used_by }}{% else %}{{ unused_label }} <form method="POST" action="/admin/invite/{{ invite.code }}/delete" style="display:inline">{{ csrf_field | safe }}<button>{{ revoke_label }}</button></form>{% endif %}</li>{% else %}<li>{{ no_invites_label }}</li>{% endfor %}</ul></div>
-</div>
-<div class="card"><h3>{{ board_management_label }}</h3><form method="POST" action="/admin/board/create">{{ csrf_field | safe }}<input name="slug" placeholder="slug a-z 0-9 _ -" required pattern="[a-z0-9_-]{2,20}"><input name="name" placeholder="{{ name_label }}" required><input name="description" placeholder="{{ description_label }}"><label><input type="checkbox" name="allow_anonymous" checked>{{ anonymous_label }}</label><label><input type="checkbox" name="guest_readable" checked>{{ guest_readable_label }}</label><button>{{ create_board_label }}</button></form><table><tr><th>slug</th><th>{{ name_label }}</th><th>{{ anonymous_label }}</th><th>{{ guest_readable_label }}</th><th>{{ actions_label }}</th></tr>{% for board in boards %}<tr><td>{{ board.slug }}</td><td>{{ board.name }}</td><td>{{ board.allow_anonymous_label }}</td><td>{{ board.guest_readable_label }}</td><td><form method="POST" action="/admin/board/{{ board.id }}/update" style="display:inline">{{ csrf_field | safe }}<input type="hidden" name="name" value="{{ board.name }}"><input type="hidden" name="description" value="{{ board.description }}"><label><input type="checkbox" name="allow_anonymous"{% if board.allow_anonymous %} checked{% endif %}>{{ anonymous_label }}</label><label><input type="checkbox" name="guest_readable"{% if board.guest_readable %} checked{% endif %}>{{ readable_label }}</label><button>{{ update_label }}</button></form><form method="POST" action="/admin/board/{{ board.id }}/delete" style="display:inline">{{ csrf_field | safe }}<button>{{ delete_label }}</button></form></td></tr>{% endfor %}</table></div>
-<div class="card"><h3>{{ user_management_label }}</h3><table><tr><th>ID</th><th>{{ user_label }}</th><th>admin</th><th>{{ banned_label }}</th><th>{{ actions_label }}</th></tr>{% for user in users %}<tr><td>{{ user.id }}</td><td>{{ user.username }}</td><td>{{ user.is_admin }}</td><td>{{ user.is_banned }}</td><td><form method="POST" action="/admin/user/{{ user.id }}/{% if user.is_banned %}unban{% else %}ban{% endif %}">{{ csrf_field | safe }}<button>{% if user.is_banned %}{{ unban_label }}{% else %}{{ ban_label }}{% endif %}</button></form></td></tr>{% endfor %}</table></div>
+</section>

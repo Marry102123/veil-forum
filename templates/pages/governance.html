@@ -1,0 +1,34 @@
+<section class="governance-shell">
+  <aside class="workspace-context">
+  <header class="governance-header">
+    <div>
+      <h2>{{ governance_label }}</h2>
+      <p class="muted">{{ governance_help }}</p>
+    </div>
+  </header>
+
+  <nav class="governance-nav" aria-label="{{ governance_sections_label }}"><a href="#queue">{{ reports_label }}</a>{% if can_manage_roles %}<a href="#access">{{ user_roles_label }}</a><a href="#recovery">{{ trash_label }}</a><a href="#sessions">{{ sessions_label }}</a>{% endif %}<a href="#audit">{{ audit_label }}</a></nav>
+  </aside>
+
+  <div class="workspace-main">
+  <div class="governance-workspace">
+  <section class="governance-section governance-queue" id="queue">
+    <h3>{{ reports_label }}</h3>
+    <div class="table-wrap"><table><tr><th>ID</th><th>{{ target_label }}</th><th>{{ report_reason_label }}</th><th>{{ status_label }}</th><th>{{ actions_label }}</th></tr>
+    {% for report in reports %}<tr><td class="mono">{{ report.id }}</td><td>{{ report.target_type }} #{{ report.target_id }}</td><td>{{ report.reason }}</td><td><span class="governance-status {% if report.status == "open" %}is-open{% endif %}">{{ report.status }}</span></td><td>{% if report.status == "open" %}<form method="POST" action="/governance/report/{{ report.id }}/resolve" class="governance-actions">{{ csrf_field | safe }}<input name="note" maxlength="500" placeholder="{{ note_label }}"><button>{{ resolve_label }}</button></form><form method="POST" action="/governance/report/{{ report.id }}/dismiss" class="governance-actions">{{ csrf_field | safe }}<button class="governance-quiet-action">{{ dismiss_label }}</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="governance-empty">{{ no_reports_label }}</td></tr>{% endfor %}</table></div>
+  </section>
+
+  {% if can_manage_roles %}<aside class="governance-control-rail">
+  <section class="governance-section" id="access">
+    <h3>{{ user_roles_label }}</h3>
+    <div class="table-wrap"><table class="governance-role-table"><tr><th>ID</th><th>{{ user_label }}</th><th>{{ roles_label }}</th><th>{{ actions_label }}</th></tr>{% for user in users %}<tr><td class="mono">{{ user.id }}</td><td>{{ user.username }}</td><td class="mono">{{ user.roles | join(sep=", ") }}</td><td><form method="POST" action="/governance/user/{{ user.id }}/role" class="governance-role-actions">{{ csrf_field | safe }}<select name="role"><option value="moderator">moderator</option><option value="admin">admin</option></select><span class="governance-role-commit"><select name="operation"><option value="grant">{{ grant_label }}</option><option value="revoke">{{ revoke_label }}</option></select><button>{{ save_label }}</button></span></form></td></tr>{% endfor %}</table></div>
+  </section>
+  <section class="governance-section" id="sessions"><h3>{{ sessions_label }}</h3><div class="table-wrap"><table><tr><th>{{ user_label }}</th><th>{{ session_count_label }}</th><th>{{ actions_label }}</th></tr>{% for user in session_users %}<tr><td>{{ user.username }}</td><td class="mono">{{ user.session_count }}</td><td><form method="POST" action="/governance/user/{{ user.id }}/sessions/revoke">{{ csrf_field | safe }}<button class="governance-quiet-action">{{ revoke_all_label }}</button></form></td></tr>{% endfor %}</table></div></section>
+  </aside>{% endif %}
+  </div>
+
+  {% if can_manage_roles %}<section class="governance-section governance-recovery" id="recovery"><h3>{{ trash_label }}</h3><div class="governance-split"><div><h4>{{ threads_label }}</h4><div class="table-wrap"><table>{% for thread in deleted_threads %}<tr><td>#{{ thread.id }} {{ thread.title }}</td><td><form method="POST" action="/governance/thread/{{ thread.id }}/restore">{{ csrf_field | safe }}<button>{{ restore_label }}</button></form></td></tr>{% else %}<tr><td class="governance-empty">{{ none_label }}</td></tr>{% endfor %}</table></div></div><div><h4>{{ posts_label }}</h4><div class="table-wrap"><table>{% for post in deleted_posts %}<tr><td>#{{ post.id }}: {{ post.content }}</td><td><form method="POST" action="/governance/post/{{ post.id }}/restore">{{ csrf_field | safe }}<button>{{ restore_label }}</button></form></td></tr>{% else %}<tr><td class="governance-empty">{{ none_label }}</td></tr>{% endfor %}</table></div></div></div></section>{% endif %}
+
+  <section class="governance-section governance-audit" id="audit"><h3>{{ audit_label }}</h3><div class="table-wrap"><table><tr><th>ID</th><th>{{ action_label }}</th><th>{{ target_label }}</th><th>{{ status_label }}</th><th>{{ time_label }}</th></tr>{% for entry in audit_logs %}<tr><td class="mono">{{ entry.id }}</td><td class="mono">{{ entry.action }}</td><td>{{ entry.target }}</td><td><span class="governance-status {% if entry.success %}is-ok{% else %}is-failed{% endif %}">{% if entry.success %}ok{% else %}failed{% endif %}</span></td><td class="mono">{{ entry.created_at }}</td></tr>{% else %}<tr><td colspan="5" class="governance-empty">{{ no_audit_label }}</td></tr>{% endfor %}</table></div></section>
+  </div>
+</section>

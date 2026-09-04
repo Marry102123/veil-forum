@@ -37,6 +37,26 @@ I2P Destination keys, passwords, or service environment files in a backup.
 Migrations are applied during startup. Do not interrupt a migration and do not
 run tests against the production database.
 
+Migration 009 replaces the board-thread index with one that includes the
+listing query's `id DESC` tie-breaker. This avoids a temporary SQLite sort for
+paginated board listings while retaining the same query and result order.
+
+## Governance roles and recovery
+
+The governance migration keeps the legacy `is_admin` flag for compatibility but
+assigns an initial `owner` role to every existing administrator. An `owner` can
+manage site settings, global administrators, audit records, and sessions;
+`admin` manages global users and content; `moderator` is restricted to boards
+explicitly assigned to it. Keep at least two separately protected owner
+accounts when practical. The application refuses changes that would leave no
+owner or allow a lower role to alter an equal or higher role.
+
+Use the administration audit view after granting roles, assigning moderators,
+moderating reports, restoring content, or revoking sessions. Audit records must
+never include client IP addresses, User-Agent strings, or cookie values. Deleted
+content enters the recovery queue first. Only an owner may permanently purge it;
+make and verify an encrypted database backup before doing so.
+
 ### Rollback
 
 Only roll back after stopping the service and preserving the failed release's

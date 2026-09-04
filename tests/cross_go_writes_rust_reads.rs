@@ -21,7 +21,7 @@ fn assert_within_1ms(a: DateTime<Utc>, b: DateTime<Utc>) {
 #[test]
 fn parse_go_rfc3339nano_with_nanos_9digits() {
     let s = "2026-08-26T08:19:02.853853123Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     // 必须解析成功：时间戳应精确到纳秒
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
@@ -34,7 +34,7 @@ fn parse_go_rfc3339nano_with_nanos_9digits() {
 fn parse_go_rfc3339nano_with_nanos_6digits_micro() {
     // Go 可能写入 6 位微秒（若纳秒尾 3 位为 0 会被裁剪到 6 位）
     let s = "2026-08-26T08:19:02.123456Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         123_456_000
@@ -48,7 +48,7 @@ fn parse_go_rfc3339nano_with_nanos_6digits_micro() {
 #[test]
 fn parse_go_rfc3339nano_with_nanos_3digits_milli() {
     let s = "2026-08-26T08:19:02.123Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         123_000_000
@@ -61,7 +61,7 @@ fn parse_go_rfc3339nano_with_nanos_3digits_milli() {
 #[test]
 fn parse_go_rfc3339nano_with_nanos_1digit() {
     let s = "2026-08-26T08:19:02.1Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         100_000_000
@@ -72,7 +72,7 @@ fn parse_go_rfc3339nano_with_nanos_1digit() {
 fn parse_go_rfc3339nano_with_offset() {
     // Go 以本地时区 Format 时会带 +08:00
     let s = "2026-08-26T16:19:02.123456789+08:00";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     // 应正确转为 UTC: 08:19:02.123456789Z
     assert_eq!(
         dt.to_rfc3339_opts(SecondsFormat::Nanos, true),
@@ -89,8 +89,8 @@ fn parse_go_rfc3339nano_zero_nanos_trailing() {
     // Go 对整秒也可能输出 .000000000 或裁剪到无小数；两种都应兼容
     let s_full = "2026-08-26T08:19:02.000000000Z";
     let s_trim = "2026-08-26T08:19:02Z";
-    let dt_full = parse_time(s_full);
-    let dt_trim = parse_time(s_trim);
+    let dt_full = parse_time(s_full).expect("valid test timestamp");
+    let dt_trim = parse_time(s_trim).expect("valid test timestamp");
     assert_eq!(dt_full.timestamp(), dt_trim.timestamp());
     assert_eq!(dt_full.timestamp_nanos_opt().unwrap() % 1_000_000_000, 0);
 }
@@ -99,7 +99,7 @@ fn parse_go_rfc3339nano_zero_nanos_trailing() {
 #[test]
 fn parse_go_rfc3339_without_nanos_utc_z() {
     let s = "2026-08-26T08:19:02Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(dt.to_rfc3339_opts(SecondsFormat::Secs, true), s);
     assert_eq!(dt.timestamp_nanos_opt().unwrap() % 1_000_000_000, 0);
 }
@@ -107,7 +107,7 @@ fn parse_go_rfc3339_without_nanos_utc_z() {
 #[test]
 fn parse_go_rfc3339_without_nanos_offset() {
     let s = "2026-08-26T16:19:02+08:00";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.to_rfc3339_opts(SecondsFormat::Secs, true),
         "2026-08-26T08:19:02Z"
@@ -117,7 +117,7 @@ fn parse_go_rfc3339_without_nanos_offset() {
 #[test]
 fn parse_go_rfc3339_without_nanos_offset_negative() {
     let s = "2026-08-26T00:19:02-08:00";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.to_rfc3339_opts(SecondsFormat::Secs, true),
         "2026-08-26T08:19:02Z"
@@ -129,7 +129,7 @@ fn parse_go_rfc3339_without_nanos_offset_negative() {
 fn parse_space_format_without_tz() {
     // Go sqlite 旧代码或某些 TEXT 默认： "2006-01-02 15:04:05"
     let s = "2026-08-26 08:19:02";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.to_rfc3339_opts(SecondsFormat::Secs, true),
         "2026-08-26T08:19:02Z"
@@ -140,7 +140,7 @@ fn parse_space_format_without_tz() {
 fn parse_space_format_with_nanos_should_fallback_or_parse() {
     // 边界：空格 + 纳秒，已扩展 parse_time 支持 " %Y-%m-%d %H:%M:%S%.f"
     let s = "2026-08-26 08:19:02.123456789";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     let expected = Utc.with_ymd_and_hms(2026, 8, 26, 8, 19, 2).unwrap()
         + chrono::Duration::nanoseconds(123_456_789);
     assert_within_1ms(dt, expected);
@@ -153,7 +153,7 @@ fn parse_space_format_with_nanos_should_fallback_or_parse() {
 #[test]
 fn parse_space_format_with_nanos_milli() {
     let s = "2026-08-26 08:19:02.123";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         123_000_000
@@ -163,7 +163,7 @@ fn parse_space_format_with_nanos_milli() {
 #[test]
 fn parse_space_format_with_z_and_nanos() {
     let s = "2026-08-26 08:19:02.123456789Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         123_456_789
@@ -174,7 +174,7 @@ fn parse_space_format_with_z_and_nanos() {
 fn parse_t_format_with_nanos_z() {
     // 对应 parse_time 第 4 分支 NaiveDateTime "%Y-%m-%dT%H:%M:%S%.fZ"
     let s = "2026-08-26T08:19:02.123456789Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         123_456_789
@@ -185,7 +185,7 @@ fn parse_t_format_with_nanos_z() {
 #[test]
 fn parse_t_format_with_nanos_zero_padded() {
     let s = "2026-08-26T08:19:02.000000001Z";
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(dt.timestamp_nanos_opt().unwrap() % 1_000_000_000, 1);
 }
 
@@ -195,11 +195,11 @@ fn go_rfc3339nano_roundtrip_diff_lt_1ms() {
     // 模拟 Go time.Now().UTC().Format(time.RFC3339Nano)
     let now = Utc::now();
     let go_written = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let rust_parsed = parse_time(&go_written);
+    let rust_parsed = parse_time(&go_written).expect("valid test timestamp");
     assert_within_1ms(now, rust_parsed);
     // 二次往返也应 <1ms
     let go_reformatted = rust_parsed.to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let rust_reparsed = parse_time(&go_reformatted);
+    let rust_reparsed = parse_time(&go_reformatted).expect("valid test timestamp");
     assert_within_1ms(rust_parsed, rust_reparsed);
 }
 
@@ -207,7 +207,7 @@ fn go_rfc3339nano_roundtrip_diff_lt_1ms() {
 fn go_rfc3339_roundtrip_diff_lt_1ms() {
     let now = Utc::now();
     let go_written = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let rust_parsed = parse_time(&go_written);
+    let rust_parsed = parse_time(&go_written).expect("valid test timestamp");
     // 秒级截断必然 <1s，但需验证 <1000ms（实际 <1ms 仅纳秒可保证，秒级为截断误差 <1000ms）
     let diff_ms = (now.timestamp_millis() - rust_parsed.timestamp_millis()).abs();
     assert!(diff_ms < 1000, "RFC3339 秒级截断差值 {}ms", diff_ms);
@@ -253,10 +253,10 @@ async fn cross_sqlite_go_writes_rust_reads_users_and_posts() -> anyhow::Result<(
     let u0 = store.get_user_by_username("go_user_0").await?.expect("u0");
     assert_within_1ms(u0.created_at, go_nano);
     let u1 = store.get_user_by_username("go_user_1").await?.expect("u1");
-    let exp1 = parse_time(go_rfc_str);
+    let exp1 = parse_time(go_rfc_str).expect("valid test timestamp");
     assert_within_1ms(u1.created_at, exp1);
     let u2 = store.get_user_by_username("go_user_2").await?.expect("u2");
-    let exp2 = parse_time(go_space_str);
+    let exp2 = parse_time(go_space_str).expect("valid test timestamp");
     assert_within_1ms(u2.created_at, exp2);
 
     // 插入 boards / threads / posts 链路，验证 threads/posts 时间解析
@@ -324,7 +324,10 @@ async fn cross_sqlite_go_writes_rust_reads_users_and_posts() -> anyhow::Result<(
     let (posts2, total2) = store.list_posts(tid, 1, 10).await?;
     assert_eq!(total2, 2);
     let second = posts2.iter().find(|p| p.content_md == "second").unwrap();
-    assert_within_1ms(second.created_at, parse_time(rfc_post_str));
+    assert_within_1ms(
+        second.created_at,
+        parse_time(rfc_post_str).expect("valid test timestamp"),
+    );
 
     // 用 +08:00 偏移写入，验证偏移解析
     let off_str = go_nano_offset_str;
@@ -343,7 +346,7 @@ async fn cross_sqlite_go_writes_rust_reads_users_and_posts() -> anyhow::Result<(
     let (posts3, _) = store.list_posts(tid, 1, 10).await?;
     let off_post = posts3.iter().find(|p| p.content_md == "offset").unwrap();
     // +08:00 对应 UTC 08:19:02.123456789Z
-    let off_expected = parse_time(off_str);
+    let off_expected = parse_time(off_str).expect("valid test timestamp");
     assert_within_1ms(off_post.created_at, off_expected);
     assert_eq!(
         off_post
@@ -374,7 +377,7 @@ async fn cross_sqlite_store_api_writes_rust_reads_roundtrip() -> anyhow::Result<
         "Rust Store 写入应为 RFC3339Nano Zulu, got {}",
         raw
     );
-    let parsed = parse_time(&raw);
+    let parsed = parse_time(&raw).expect("valid test timestamp");
     // 解析成功且时间差 <1ms（包含在 before..after 区间内 ±1ms）
     assert!(parsed >= before - chrono::Duration::milliseconds(1));
     assert!(parsed <= after + chrono::Duration::milliseconds(1));
@@ -388,8 +391,8 @@ async fn cross_sqlite_store_api_writes_rust_reads_roundtrip() -> anyhow::Result<
         .await?;
     let c_raw: String = srow.get("created_at");
     let e_raw: String = srow.get("expires_at");
-    let c_parsed = parse_time(&c_raw);
-    let e_parsed = parse_time(&e_raw);
+    let c_parsed = parse_time(&c_raw).expect("valid test timestamp");
+    let e_parsed = parse_time(&e_raw).expect("valid test timestamp");
     // expires - created ≈ 30 天，误差 <1s
     let diff_days = (e_parsed - c_parsed).num_days();
     assert_eq!(diff_days, 30);
@@ -417,7 +420,10 @@ async fn cross_sqlite_invite_and_board_times() -> anyhow::Result<()> {
         .execute(&store.pool)
         .await?;
     let board = store.get_board_by_slug("go-board").await?.expect("board");
-    assert_within_1ms(board.created_at, parse_time(go_ts));
+    assert_within_1ms(
+        board.created_at,
+        parse_time(go_ts).expect("valid test timestamp"),
+    );
 
     // invite 用 nanos
     sqlx::query("INSERT INTO invite_codes(code,created_by,created_at) VALUES(?,?,?)")
@@ -428,7 +434,10 @@ async fn cross_sqlite_invite_and_board_times() -> anyhow::Result<()> {
         .await?;
     let invites = store.list_invites().await?;
     assert_eq!(invites.len(), 1);
-    assert_within_1ms(invites[0].created_at, parse_time(go_ts));
+    assert_within_1ms(
+        invites[0].created_at,
+        parse_time(go_ts).expect("valid test timestamp"),
+    );
     Ok(())
 }
 
@@ -437,8 +446,8 @@ async fn cross_sqlite_invite_and_board_times() -> anyhow::Result<()> {
 fn boundary_min_max_nanos() {
     let min = "2026-01-01T00:00:00.000000001Z";
     let max = "2026-12-31T23:59:59.999999999Z";
-    let dmin = parse_time(min);
-    let dmax = parse_time(max);
+    let dmin = parse_time(min).expect("valid test timestamp");
+    let dmax = parse_time(max).expect("valid test timestamp");
     assert_eq!(dmin.timestamp_nanos_opt().unwrap() % 1_000_000_000, 1);
     assert_eq!(
         dmax.timestamp_nanos_opt().unwrap() % 1_000_000_000,
@@ -450,8 +459,8 @@ fn boundary_min_max_nanos() {
 #[test]
 fn parse_with_trailing_newline_trim() {
     let s = "2026-08-26T08:19:02.123456789Z\n";
-    let dt_trimmed = parse_time(s.trim());
-    let dt_raw = parse_time(s);
+    let dt_trimmed = parse_time(s.trim()).expect("valid test timestamp");
+    let dt_raw = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt_trimmed.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         123_456_789
