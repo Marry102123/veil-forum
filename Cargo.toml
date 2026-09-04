@@ -24,11 +24,11 @@ rand = "0.8"
 captcha = "1.0.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-axum-extra = { version = "0.9", features = ["cookie"] }
-governor = "0.6"
+axum-extra = { version = "0.12", features = ["cookie"] }
+governor = "0.10"
 tera = "1.19"
-tower = { version = "0.4", features = ["limit", "util"] }
-tower-http = { version = "0.5", features = ["trace", "fs", "limit"] }
+tower = { version = "0.5", features = ["limit", "util"] }
+tower-http = { version = "0.7", features = ["trace", "fs", "limit"] }
 serde_json = "1"
 regex = "1"
 hex = "0.4"
