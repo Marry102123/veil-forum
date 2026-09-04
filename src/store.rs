@@ -317,6 +317,7 @@ impl Store {
             ("captcha_difficulty", "low"),
             ("registration_invite_enabled", "1"),
             ("site_name", "secure-forum"),
+            ("footer_text", ""),
         ];
         for (k, v) in defaults {
             sqlx::query("INSERT OR IGNORE INTO configs(key,value) VALUES(?,?)")
