@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.17
+
+- Let administrators configure the forum footer from System settings, with a localised privacy default when blank. The required Source link to veil-forum remains fixed and cannot be removed.
+- Consolidate compatible Dependabot updates for `axum-extra`, `governor`, `tower`, `tower-http`, and GitHub Actions artifacts.
+- Ignore local preview runtime data to keep development databases and logs out of releases.
+
 ## 0.1.0-alpha.16
 
 - Add self-hosted image CAPTCHA with scoped, single-use HMAC challenges, configurable difficulty, and independent registration, login, and posting policies.
