@@ -286,6 +286,22 @@ async fn get_site_name(store: &crate::store::Store) -> String {
         .unwrap_or(None)
         .unwrap_or_else(|| "secure-forum".to_string())
 }
+async fn get_footer_text(store: &crate::store::Store, locale: &str) -> String {
+    store
+        .get_config("footer_text")
+        .await
+        .unwrap_or(None)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            crate::i18n::ui(
+                locale,
+                "No application IP logging · CSP enforced",
+                "应用不记录 IP · CSP 已启用",
+                "Приложение не ведёт журнал IP · CSP включён",
+            )
+            .to_string()
+        })
+}
 async fn current_user(state: &AppState, headers: &HeaderMap) -> Option<crate::store::User> {
     let sid = session_id(headers)?;
     state.store.get_user_by_session(&sid).await.ok().flatten()
@@ -384,6 +400,7 @@ fn layout_html(
     stats_users: i64,
     recent: &[crate::store::Thread],
     announcement: &str,
+    footer_text: &str,
     content: &str,
     need_pow: bool,
     flash: Option<(&str, &str)>,
@@ -457,6 +474,7 @@ fn layout_html(
             .collect::<Vec<_>>(),
     );
     context.insert("announcement_body", &announcement_body);
+    context.insert("footer_text", footer_text);
     for (key, value) in [
         ("search_label", search_label),
         ("account_label", account_label),
@@ -670,6 +688,7 @@ pub fn routes(state: AppState) -> Router {
         .route("/admin/settings", get(admin_settings))
         .route("/admin/config/site", post(admin_site))
         .route("/admin/config/announcement", post(admin_announcement))
+        .route("/admin/config/footer", post(admin_footer))
         .route("/admin/config/pow", post(admin_pow))
         .route("/admin/config/registration", post(admin_regmode))
         .route("/admin/config/policies", post(admin_policies))
@@ -942,6 +961,7 @@ async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespons
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
@@ -1085,6 +1105,7 @@ async fn board(
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         user.is_some(),
         None,
@@ -1312,6 +1333,7 @@ async fn thread(
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         user.is_some(),
         None,
@@ -1404,6 +1426,7 @@ async fn search(
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
@@ -1539,6 +1562,7 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         true,
         None,
@@ -1786,6 +1810,7 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         true,
         None,
@@ -2396,6 +2421,7 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
@@ -2692,6 +2718,7 @@ async fn admin_hub(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
@@ -2778,6 +2805,10 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
             .get("announcement")
             .map(String::as_str)
             .unwrap_or(""),
+    );
+    context.insert(
+        "footer_text_value",
+        configs.get("footer_text").map(String::as_str).unwrap_or(""),
     );
     context.insert(
         "pow_register_minutes",
@@ -2947,6 +2978,22 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
             ui("Announcement", "公告", "Объявление"),
         ),
         (
+            "footer_text_label",
+            ui("Footer text", "底栏文本", "Текст нижнего колонтитула"),
+        ),
+        (
+            "footer_text_help",
+            ui(
+                "Shown on every page. Leave blank to use the privacy-focused default. The Source link is always retained.",
+                "显示在所有页面。留空使用隐私默认文案。Source 链接始终保留。",
+                "Показывается на каждой странице. Оставьте пустым для приватного текста по умолчанию. Ссылка Source сохраняется всегда.",
+            ),
+        ),
+        (
+            "save_footer_label",
+            ui("Save footer", "保存底栏", "Сохранить нижний колонтитул"),
+        ),
+        (
             "announcement_hint",
             ui(
                 "Leave blank to hide",
@@ -3079,6 +3126,7 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
         su,
         &recent,
         &announcement,
+        &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
@@ -3149,6 +3197,32 @@ async fn admin_announcement(
         ok,
     )
     .await;
+    apply_sec(Redirect::to("/admin/settings").into_response())
+}
+async fn admin_footer(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    if require_admin_state(&s, &headers).await.is_none() {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let mut footer_text = form
+        .get("footer_text")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    if footer_text.chars().count() > 280 {
+        footer_text = footer_text.chars().take(280).collect();
+    }
+    let ok = s
+        .store
+        .set_config("footer_text", &footer_text)
+        .await
+        .is_ok();
+    audit_admin(&s, &headers, "config.footer", Some("config"), None, ok).await;
     apply_sec(Redirect::to("/admin/settings").into_response())
 }
 async fn admin_pow(

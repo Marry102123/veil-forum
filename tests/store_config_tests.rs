@@ -22,6 +22,7 @@ async fn migrations_are_versioned_and_idempotent() -> anyhow::Result<()> {
         ("reports_enabled", "1"),
         ("registration_pow_enabled", "1"),
         ("registration_invite_enabled", "1"),
+        ("footer_text", ""),
     ] {
         assert_eq!(store.get_config(key).await?.as_deref(), Some(expected));
     }
@@ -118,6 +119,7 @@ async fn get_all_configs_contains_defaults_and_inserted() -> anyhow::Result<()> 
         "pow_post_minutes",
         "registration_mode",
         "site_name",
+        "footer_text",
         "default_locale",
     ] {
         assert!(all.contains_key(k), "seed 缺失 {}", k);
