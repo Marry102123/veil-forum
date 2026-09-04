@@ -64,6 +64,16 @@ fn templates() -> &'static Tera {
             include_str!("../templates/pages/admin.html"),
         )
         .expect("embedded admin template must be valid");
+        tera.add_raw_template(
+            "pages/admin_settings.html",
+            include_str!("../templates/pages/admin_settings.html"),
+        )
+        .expect("embedded admin settings template must be valid");
+        tera.add_raw_template(
+            "pages/governance.html",
+            include_str!("../templates/pages/governance.html"),
+        )
+        .expect("embedded governance template must be valid");
         // Keep the pagination include optional for older deployments, while
         // embedding it when present so page templates are self-contained.
         tera.add_raw_template(

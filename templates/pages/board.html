@@ -2,13 +2,12 @@
 <p class="muted" style="margin:4px 0 8px">{{ page_label | default(value="Page") }} {{ page }} / {{ total_pages }} · {{ total }} {{ posts_label | default(value="posts") }}</p>
 {% if can_post %}
 <div class="card">
-  <h3>{{ new_thread_label | default(value="New thread") }} <span class="muted" style="font-weight:400">· {{ pow_title }}</span></h3>
-  <p class="muted pow-explanation">{{ pow_description }}</p>
-  <div id="pow-status" data-computing="{{ pow_computing }}" data-done="{{ pow_done }}" data-failed="{{ pow_failed }}" data-submitting="{{ pow_submitting }}"></div><div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>
-  <form method="POST" action="/b/{{ board.slug | urlencode }}/new" data-pow-scope="post">{{ csrf_field | default(value="") | safe }}
+  <h3>{{ new_thread_label | default(value="New thread") }}{% if need_pow %} <span class="muted" style="font-weight:400">· {{ pow_title }}</span>{% endif %}</h3>
+  {% if need_pow %}<p class="muted pow-explanation">{{ pow_description }}</p><div id="pow-status" data-computing="{{ pow_computing }}" data-done="{{ pow_done }}" data-failed="{{ pow_failed }}" data-submitting="{{ pow_submitting }}"></div><div id="pow-progress-container" style="display:none"><div id="pow-progress"></div></div>{% endif %}
+  <form method="POST" action="/b/{{ board.slug | urlencode }}/new"{% if need_pow %} data-pow-scope="post"{% endif %}>{{ csrf_field | default(value="") | safe }}
     <input name="title" placeholder="{{ title_hint | default(value="Title, 5-120 characters") }}" required maxlength="120" style="width:100%;margin:5px 0">
     <textarea name="content" placeholder="{{ markdown_hint }}" required rows="4" style="width:100%"></textarea>
-    {{ pow_fallback | default(value="") | safe }}
+    {% if need_captcha %}{{ captcha_html | safe }}{% endif %}{% if need_pow %}{{ pow_fallback | default(value="") | safe }}{% endif %}
     {% if board.allow_anonymous %}<label style="font-size:12px"><input type="checkbox" name="anonymous"> {{ anonymous_label | default(value="Anonymous") }}</label>{% endif %}
     <button class="btn-primary">{{ post_label | default(value="Post") }}</button>
   </form>

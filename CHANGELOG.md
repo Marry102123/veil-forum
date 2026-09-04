@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.16
+
+- Add self-hosted image CAPTCHA with scoped, single-use HMAC challenges, configurable difficulty, and independent registration, login, and posting policies.
+- Add governance and system-settings workspaces for moderation, recovery, roles, sessions, audit history, registration policy, and locale configuration.
+- Improve operational safeguards, error handling, migrations, and integration coverage.
+
+
 ## 0.1.0-alpha.15
 
 - Add process-local privacy-preserving rate limits using `governor`: global

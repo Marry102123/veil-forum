@@ -39,11 +39,24 @@ pub async fn ensure_admin(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
         anyhow::bail!("VEIL_ADMIN_PASSWORD must contain 12-128 characters");
     }
     let h = hash_password(&password)?;
-    sqlx::query("INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,1,?)")
-        .bind("admin")
-        .bind(h)
-        .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
-        .execute(pool)
-        .await?;
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let result = sqlx::query(
+        "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,1,?)",
+    )
+    .bind("admin")
+    .bind(h)
+    .bind(&created_at)
+    .execute(pool)
+    .await?;
+    // Store migrations run before first-run initialization, so the normalized
+    // role tables already exist. The bootstrap account must be an owner rather
+    // than relying on the legacy is_admin compatibility flag.
+    sqlx::query(
+        "INSERT INTO user_roles(user_id,role_name,granted_by_user_id,created_at) VALUES(?,'owner',NULL,?)",
+    )
+    .bind(result.last_insert_rowid())
+    .bind(created_at)
+    .execute(pool)
+    .await?;
     Ok(())
 }

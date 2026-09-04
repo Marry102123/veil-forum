@@ -1,6 +1,6 @@
 [package]
 name = "veil-forum"
-version = "0.1.0-alpha.15"
+version = "0.1.0-alpha.16"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
@@ -14,13 +14,14 @@ external-go-interop = []
 [dependencies]
 axum = { version = "0.7", features = ["macros","form"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8.1", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
 comrak = { version = "0.22", features = [] }
 ammonia = "4"
 argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+captcha = "1.0.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 axum-extra = { version = "0.9", features = ["cookie"] }

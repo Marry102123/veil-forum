@@ -38,7 +38,7 @@ fn assert_normalizes(input: &str, expected_z: &str) {
     );
 
     // 2) via parse_time wrapper (which internally does with_timezone(&Utc) or and_utc)
-    let via_parse_time = parse_time(input);
+    let via_parse_time = parse_time(input).expect("valid test timestamp");
     assert_eq!(
         via_parse_time.timestamp_nanos_opt().unwrap(),
         expected_utc().timestamp_nanos_opt().unwrap(),
@@ -76,7 +76,7 @@ fn utc_normalization_z_variant() {
     let s = "2026-08-26T08:19:02.123456789Z";
     assert_normalizes(s, EXPECTED_Z);
     // also verify fractional nanos preserved
-    let dt = parse_time(s);
+    let dt = parse_time(s).expect("valid test timestamp");
     assert_eq!(
         dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
         EXPECTED_NANOS
@@ -91,8 +91,8 @@ fn utc_normalization_plus00_variant() {
 
 #[test]
 fn utc_normalization_plus00_vs_z_equivalence() {
-    let z = parse_time("2026-08-26T08:19:02.123456789Z");
-    let plus00 = parse_time("2026-08-26T08:19:02.123456789+00:00");
+    let z = parse_time("2026-08-26T08:19:02.123456789Z").expect("valid test timestamp");
+    let plus00 = parse_time("2026-08-26T08:19:02.123456789+00:00").expect("valid test timestamp");
     // identical timestamp_nanos
     assert_eq!(
         z.timestamp_nanos_opt().unwrap(),
@@ -106,8 +106,8 @@ fn utc_normalization_plus00_vs_z_equivalence() {
     );
     assert_eq!(z.to_rfc3339_opts(SecondsFormat::Nanos, true), EXPECTED_Z);
     // also without nanos
-    let z_secs = parse_time("2026-08-26T08:19:02Z");
-    let plus00_secs = parse_time("2026-08-26T08:19:02+00:00");
+    let z_secs = parse_time("2026-08-26T08:19:02Z").expect("valid test timestamp");
+    let plus00_secs = parse_time("2026-08-26T08:19:02+00:00").expect("valid test timestamp");
     assert_eq!(
         z_secs.timestamp_nanos_opt().unwrap(),
         plus00_secs.timestamp_nanos_opt().unwrap()
@@ -187,7 +187,7 @@ fn utc_normalization_all_variants_identical() {
             "variant {:?} Z string",
             s
         );
-        let via = parse_time(s);
+        let via = parse_time(s).expect("valid test timestamp");
         assert_eq!(via.timestamp_nanos_opt().unwrap(), expected_nanos);
         assert_eq!(via.to_rfc3339_opts(SecondsFormat::Nanos, true), expected_z);
     }
@@ -232,7 +232,7 @@ fn utc_normalization_secs_variants() {
             dt.to_rfc3339_opts(SecondsFormat::Nanos, true),
             "2026-08-26T08:19:02.000000000Z"
         );
-        let via = parse_time(s);
+        let via = parse_time(s).expect("valid test timestamp");
         assert_eq!(
             via.timestamp_nanos_opt().unwrap(),
             dt.timestamp_nanos_opt().unwrap()

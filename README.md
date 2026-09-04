@@ -27,6 +27,18 @@ traffic analysis.
 - SQLite persistence with migrations and restrictive data-directory permissions
 - Core posting and administration workflows work without JavaScript
 
+## Screenshots
+
+The following screenshots show the English demo instance and its server-rendered administration workspaces.
+
+![Forum home](docs/screenshots/home.png)
+
+![Technology board](docs/screenshots/board-tech.png)
+
+![System settings](docs/screenshots/settings.png)
+
+![Governance workspace](docs/screenshots/governance.png)
+
 ## Quick Start
 
 ### From a release archive

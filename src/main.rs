@@ -1,12 +1,5 @@
 use tower::limit::ConcurrencyLimitLayer;
-mod auth;
-mod handler;
-mod i18n;
-mod markdown;
-mod pow;
-mod rate_limit;
-mod store;
-mod templates;
+use veil_forum::{auth, handler, pow, rate_limit, store};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,7 +45,8 @@ async fn main() -> anyhow::Result<()> {
     let state = handler::AppState {
         store: store.clone(),
         pow,
-        limits: crate::rate_limit::Limits::new(),
+        captcha: veil_forum::captcha::Manager::new(),
+        limits: rate_limit::Limits::new(),
         password_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let app = handler::routes(state).layer(ConcurrencyLimitLayer::new(64));

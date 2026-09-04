@@ -73,42 +73,94 @@ pub struct User {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Owner,
+    Admin,
+    Moderator,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Moderator => "moderator",
+        }
+    }
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "owner" => Ok(Self::Owner),
+            "admin" => Ok(Self::Admin),
+            "moderator" => Ok(Self::Moderator),
+            _ => anyhow::bail!("unknown role: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub id: i64,
+    pub reporter_user_id: Option<i64>,
+    pub target_type: String,
+    pub target_id: i64,
+    pub reason: String,
+    pub status: String,
+    pub resolved_by_user_id: Option<i64>,
+    pub resolution_note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditLog {
+    pub id: i64,
+    pub actor_user_id: Option<i64>,
+    pub action: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<i64>,
+    pub success: bool,
+    pub metadata: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// 统一 RFC3339/RFC3339Nano 双格式解析
 /// 先试 RFC3339Nano 再回落 RFC3339，兼容 Go `time.RFC3339Nano` / `time.RFC3339` 写入的两种格式
-pub fn parse_time(s: &str) -> DateTime<Utc> {
+pub fn parse_time(s: &str) -> anyhow::Result<DateTime<Utc>> {
     let s = s.trim();
     // 1) RFC3339Nano: chrono::DateTime::parse_from_rfc3339 已支持纳秒（fractional 秒可选），等价 Go time.RFC3339Nano
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return dt.with_timezone(&Utc);
+        return Ok(dt.with_timezone(&Utc));
     }
     // 2) 兜底兼容带纳秒的 Z 格式（与 parse_from_rfc3339 互补，覆盖 "%Y-%m-%dT%H:%M:%S%.fZ"）
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return dt.and_utc();
+        return Ok(dt.and_utc());
     }
     // 3) 回落 RFC3339: 显式尝试不带纳秒的 RFC3339 变体（Go time.RFC3339），处理 Z 后缀的朴素时间
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ") {
-        return dt.and_utc();
+        return Ok(dt.and_utc());
     }
     // 4) 兼容遗留 SQLite 文本格式（无 T、无时区）—— 含纳秒变体
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        return dt.and_utc();
+        return Ok(dt.and_utc());
     }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return dt.and_utc();
+        return Ok(dt.and_utc());
     }
     // 5) 空格 + Z 变体（极少数遗留）
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.fZ") {
-        return dt.and_utc();
+        return Ok(dt.and_utc());
     }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%SZ") {
-        return dt.and_utc();
+        return Ok(dt.and_utc());
     }
-    Utc::now()
+    Err(anyhow::anyhow!("invalid timestamp: {s:?}"))
 }
 
 // 保留旧名兼容，内部统一委托 parse_time
 #[allow(dead_code)]
-fn parse_dt(s: &str) -> DateTime<Utc> {
+fn parse_dt(s: &str) -> anyhow::Result<DateTime<Utc>> {
     parse_time(s)
 }
 
@@ -180,6 +232,16 @@ impl Store {
             "INSERT OR IGNORE INTO configs(key,value) VALUES('pow_login_minutes','0.02');",
         )
         .await?;
+        self.apply_sql_migration(
+            9,
+            include_str!("../migrations/009_thread_listing_order.sql"),
+        )
+        .await?;
+        self.apply_sql_migration(
+            10,
+            include_str!("../migrations/010_moderation_data_layer.sql"),
+        )
+        .await?;
         Ok(())
     }
 
@@ -245,6 +307,15 @@ impl Store {
             ("pow_login_minutes", "0.02"),
             ("pow_post_minutes", "0.02"),
             ("registration_mode", "invite"),
+            ("reports_enabled", "1"),
+            ("registration_pow_enabled", "1"),
+            ("registration_captcha_enabled", "0"),
+            ("login_pow_enabled", "1"),
+            ("login_captcha_enabled", "0"),
+            ("post_pow_enabled", "1"),
+            ("post_captcha_enabled", "0"),
+            ("captcha_difficulty", "low"),
+            ("registration_invite_enabled", "1"),
             ("site_name", "secure-forum"),
         ];
         for (k, v) in defaults {
@@ -290,6 +361,38 @@ impl Store {
         sqlx::query("INSERT INTO configs(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key).bind(val).execute(&self.pool).await?;
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_registration_policies(
+        &self,
+        reports_enabled: bool,
+        registration_pow_enabled: bool,
+        registration_invite_enabled: bool,
+        registration_captcha_enabled: bool,
+        login_pow_enabled: bool,
+        login_captcha_enabled: bool,
+        post_pow_enabled: bool,
+        post_captcha_enabled: bool,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (key, enabled) in [
+            ("reports_enabled", reports_enabled),
+            ("registration_pow_enabled", registration_pow_enabled),
+            ("registration_invite_enabled", registration_invite_enabled),
+            ("registration_captcha_enabled", registration_captcha_enabled),
+            ("login_pow_enabled", login_pow_enabled),
+            ("login_captcha_enabled", login_captcha_enabled),
+            ("post_pow_enabled", post_pow_enabled),
+            ("post_captcha_enabled", post_captcha_enabled),
+        ] {
+            sqlx::query("INSERT INTO configs(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .bind(key)
+                .bind(if enabled { "1" } else { "0" })
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
     pub async fn get_all_configs(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
@@ -325,17 +428,18 @@ impl Store {
     pub async fn get_user_by_username(&self, username: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query("SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users WHERE username=?")
             .bind(username).fetch_optional(&self.pool).await?;
-        Ok(row.map(|r| {
+        row.map(|r| -> anyhow::Result<User> {
             let created: String = r.get("created_at");
-            User {
+            Ok(User {
                 id: r.get("id"),
                 username: r.get("username"),
                 password_hash: r.get("password_hash"),
                 is_admin: r.get::<i64, _>("is_admin") == 1,
                 is_banned: r.get::<i64, _>("is_banned") == 1,
-                created_at: parse_time(&created),
-            }
-        }))
+                created_at: parse_time(&created)?,
+            })
+        })
+        .transpose()
     }
     pub async fn get_user_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
         let row = sqlx::query(
@@ -344,35 +448,35 @@ impl Store {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| {
+        row.map(|r| -> anyhow::Result<User> {
             let created: String = r.get("created_at");
-            User {
+            Ok(User {
                 id: r.get("id"),
                 username: r.get("username"),
                 password_hash: r.get("password_hash"),
                 is_admin: r.get::<i64, _>("is_admin") == 1,
                 is_banned: r.get::<i64, _>("is_banned") == 1,
-                created_at: parse_time(&created),
-            }
-        }))
+                created_at: parse_time(&created)?,
+            })
+        })
+        .transpose()
     }
     pub async fn list_users(&self, limit: i64) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query("SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users ORDER BY id DESC LIMIT ?")
             .bind(limit).fetch_all(&self.pool).await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
+        rows.into_iter()
+            .map(|r| -> anyhow::Result<User> {
                 let created: String = r.get("created_at");
-                User {
+                Ok(User {
                     id: r.get("id"),
                     username: r.get("username"),
                     password_hash: r.get("password_hash"),
                     is_admin: r.get::<i64, _>("is_admin") == 1,
                     is_banned: r.get::<i64, _>("is_banned") == 1,
-                    created_at: parse_time(&created),
-                }
+                    created_at: parse_time(&created)?,
+                })
             })
-            .collect())
+            .collect::<anyhow::Result<Vec<_>>>()
     }
     pub async fn set_user_banned(&self, id: i64, banned: bool) -> anyhow::Result<()> {
         sqlx::query("UPDATE users SET is_banned=? WHERE id=?")
@@ -405,19 +509,189 @@ impl Store {
             .execute(&self.pool).await?;
         Ok(())
     }
+    pub async fn audit_with_metadata(
+        &self,
+        actor_user_id: Option<i64>,
+        action: &str,
+        target_type: Option<&str>,
+        target_id: Option<i64>,
+        success: bool,
+        metadata: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,success,metadata,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(actor_user_id).bind(action).bind(target_type).bind(target_id)
+            .bind(if success { 1 } else { 0 }).bind(metadata)
+            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true))
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn list_audit_logs(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<AuditLog>> {
+        let rows = sqlx::query("SELECT id,actor_user_id,action,target_type,target_id,success,metadata,created_at FROM audit_logs WHERE (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?")
+            .bind(before_id).bind(before_id).bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(AuditLog {
+                    id: r.get("id"),
+                    actor_user_id: r.get("actor_user_id"),
+                    action: r.get("action"),
+                    target_type: r.get("target_type"),
+                    target_id: r.get("target_id"),
+                    success: r.get::<i64, _>("success") != 0,
+                    metadata: r.get("metadata"),
+                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn grant_role(
+        &self,
+        user_id: i64,
+        role: Role,
+        granted_by_user_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO user_roles(user_id,role_name,granted_by_user_id,created_at) VALUES(?,?,?,?)")
+            .bind(user_id).bind(role.as_str()).bind(granted_by_user_id)
+            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn revoke_role(&self, user_id: i64, role: Role) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM user_roles WHERE user_id=? AND role_name=?")
+            .bind(user_id)
+            .bind(role.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    pub async fn list_user_roles(&self, user_id: i64) -> anyhow::Result<Vec<Role>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT role_name FROM user_roles WHERE user_id=? ORDER BY role_name",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|name| Role::from_str(&name))
+        .collect()
+    }
+    pub async fn user_has_role(&self, user_id: i64, role: Role) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=? AND role_name=?)",
+        )
+        .bind(user_id)
+        .bind(role.as_str())
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+    pub async fn add_board_moderator(
+        &self,
+        board_id: i64,
+        user_id: i64,
+        granted_by_user_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO board_moderators(board_id,user_id,granted_by_user_id,created_at) VALUES(?,?,?,?)")
+            .bind(board_id).bind(user_id).bind(granted_by_user_id).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn remove_board_moderator(&self, board_id: i64, user_id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM board_moderators WHERE board_id=? AND user_id=?")
+            .bind(board_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    pub async fn is_board_moderator(&self, board_id: i64, user_id: i64) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM board_moderators WHERE board_id=? AND user_id=?)",
+        )
+        .bind(board_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+    pub async fn can_moderate_board(&self, board_id: i64, user_id: i64) -> anyhow::Result<bool> {
+        if self.user_has_role(user_id, Role::Owner).await?
+            || self.user_has_role(user_id, Role::Admin).await?
+        {
+            return Ok(true);
+        }
+        Ok(self.user_has_role(user_id, Role::Moderator).await?
+            && self.is_board_moderator(board_id, user_id).await?)
+    }
+    pub async fn create_report(
+        &self,
+        reporter_user_id: Option<i64>,
+        target_type: &str,
+        target_id: i64,
+        reason: &str,
+    ) -> anyhow::Result<i64> {
+        if !matches!(target_type, "post" | "thread" | "user") {
+            anyhow::bail!("invalid report target type");
+        }
+        Ok(sqlx::query("INSERT INTO reports(reporter_user_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?)")
+            .bind(reporter_user_id).bind(target_type).bind(target_id).bind(reason).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).execute(&self.pool).await?.last_insert_rowid())
+    }
+    pub async fn list_reports(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Report>> {
+        let rows = sqlx::query("SELECT id,reporter_user_id,target_type,target_id,reason,status,resolved_by_user_id,resolution_note,created_at,resolved_at FROM reports WHERE (? IS NULL OR status=?) ORDER BY id DESC LIMIT ?")
+            .bind(status).bind(status).bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(Report {
+                    id: r.get("id"),
+                    reporter_user_id: r.get("reporter_user_id"),
+                    target_type: r.get("target_type"),
+                    target_id: r.get("target_id"),
+                    reason: r.get("reason"),
+                    status: r.get("status"),
+                    resolved_by_user_id: r.get("resolved_by_user_id"),
+                    resolution_note: r.get("resolution_note"),
+                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
+                    resolved_at: r
+                        .get::<Option<String>, _>("resolved_at")
+                        .as_deref()
+                        .map(parse_time)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+    pub async fn resolve_report(
+        &self,
+        id: i64,
+        resolver_user_id: i64,
+        status: &str,
+        resolution_note: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !matches!(status, "resolved" | "dismissed") {
+            anyhow::bail!("invalid report resolution status");
+        }
+        sqlx::query("UPDATE reports SET status=?,resolved_by_user_id=?,resolution_note=?,resolved_at=? WHERE id=? AND status='open'").bind(status).bind(resolver_user_id).bind(resolution_note).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
 
     // ---- boards — ported from Go internal/store/boards.go ----
-    fn row_to_board(row: &sqlx::sqlite::SqliteRow) -> Board {
+    fn row_to_board(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Board> {
         let created: String = row.get("created_at");
-        Board {
+        Ok(Board {
             id: row.get("id"),
             slug: row.get("slug"),
             name: row.get("name"),
             description: row.get("description"),
             allow_anonymous: row.get::<i64, _>("allow_anonymous") == 1,
             guest_readable: row.get::<i64, _>("guest_readable") == 1,
-            created_at: parse_time(&created),
-        }
+            created_at: parse_time(&created)?,
+        })
     }
 
     /// CreateBoard — INSERT INTO boards(...) VALUES(?,?,?,?,?,?) ; bool→int, created_at chrono RFC3339Nano
@@ -443,21 +717,21 @@ impl Store {
     pub async fn list_boards(&self) -> anyhow::Result<Vec<Board>> {
         let rows = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards ORDER BY id ASC")
             .fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(Self::row_to_board).collect())
+        rows.iter().map(Self::row_to_board).collect()
     }
 
     /// GetBoardBySlug — SELECT ... WHERE slug=?
     pub async fn get_board_by_slug(&self, slug: &str) -> anyhow::Result<Option<Board>> {
         let row = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards WHERE slug=?")
             .bind(slug).fetch_optional(&self.pool).await?;
-        Ok(row.as_ref().map(Self::row_to_board))
+        row.as_ref().map(Self::row_to_board).transpose()
     }
 
     /// GetBoardByID — SELECT ... WHERE id=?
     pub async fn get_board_by_id(&self, id: i64) -> anyhow::Result<Option<Board>> {
         let row = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards WHERE id=?")
             .bind(id).fetch_optional(&self.pool).await?;
-        Ok(row.as_ref().map(Self::row_to_board))
+        row.as_ref().map(Self::row_to_board).transpose()
     }
 
     /// UpdateBoard — UPDATE boards SET name=?,description=?,allow_anonymous=?,guest_readable=? WHERE id=?
@@ -542,14 +816,15 @@ impl Store {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=?")
-            .bind(thread_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=? AND deleted_at IS NULL")
+                .bind(thread_id)
+                .fetch_one(&self.pool)
+                .await?;
         let rows = sqlx::query(
             "SELECT p.id, p.thread_id, p.board_id, p.author_id, p.is_anonymous, p.parent_post_id, p.content_md, p.content_html, p.created_at, COALESCE(u.username,'deleted') \
              FROM posts p LEFT JOIN users u ON u.id=p.author_id \
-             WHERE p.thread_id=? ORDER BY p.id ASC LIMIT ? OFFSET ?"
+             WHERE p.thread_id=? AND p.deleted_at IS NULL ORDER BY p.id ASC LIMIT ? OFFSET ?"
         )
         .bind(thread_id).bind(page_size).bind(offset)
         .fetch_all(&self.pool).await?;
@@ -565,7 +840,7 @@ impl Store {
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
                 content_html: r.get("content_html"),
-                created_at: parse_time(&created),
+                created_at: parse_time(&created)?,
                 author_name: r.get::<String, _>(9),
             });
         }
@@ -575,7 +850,7 @@ impl Store {
     pub async fn get_post(&self, id: i64) -> anyhow::Result<Option<Post>> {
         let row = sqlx::query(
             "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted') \
-             FROM posts p LEFT JOIN users u ON u.id=p.author_id WHERE p.id=?"
+             FROM posts p LEFT JOIN users u ON u.id=p.author_id WHERE p.id=? AND p.deleted_at IS NULL"
         )
         .bind(id).fetch_optional(&self.pool).await?;
         if let Some(r) = row {
@@ -589,7 +864,7 @@ impl Store {
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
                 content_html: r.get("content_html"),
-                created_at: parse_time(&created),
+                created_at: parse_time(&created)?,
                 author_name: r.get::<String, _>(9),
             }));
         }
@@ -627,6 +902,52 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+    pub async fn soft_delete_post(
+        &self,
+        id: i64,
+        deleted_by_user_id: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE posts SET deleted_at=?, deleted_by_user_id=? WHERE id=? AND deleted_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true))
+        .bind(deleted_by_user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+    pub async fn restore_post(&self, id: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE posts SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=? AND deleted_at IS NOT NULL")
+            .bind(id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+    pub async fn list_deleted_posts(&self, limit: i64) -> anyhow::Result<Vec<Post>> {
+        let rows = sqlx::query(
+            "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at,COALESCE(u.username,'deleted') \
+             FROM posts p LEFT JOIN users u ON u.id=p.author_id \
+             WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC,p.id DESC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(Post {
+                    id: r.get("id"),
+                    thread_id: r.get("thread_id"),
+                    board_id: r.get("board_id"),
+                    author_id: r.get("author_id"),
+                    is_anonymous: r.get::<i64, _>("is_anonymous") != 0,
+                    parent_post_id: r.get("parent_post_id"),
+                    content_md: r.get("content_md"),
+                    content_html: r.get("content_html"),
+                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
+                    author_name: r.get(9),
+                })
+            })
+            .collect()
+    }
 
     /// SearchPosts: FTS5 posts_fts MATCH + rank 分页，返回 (posts, threads, total)
     /// 对齐 Go: SELECT ... FROM posts_fts JOIN posts ... JOIN threads ... WHERE posts_fts MATCH ? ORDER BY rank
@@ -657,21 +978,21 @@ impl Store {
         let fts_query = format!("\"{q}\"");
         let total: (i64,) = if short_query {
             sqlx::query_as(
-                "SELECT COUNT(*) FROM posts p JOIN threads th ON th.id=p.thread_id WHERE th.title LIKE ? OR p.content_md LIKE ?",
+                "SELECT COUNT(*) FROM posts p JOIN threads th ON th.id=p.thread_id WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND (th.title LIKE ? OR p.content_md LIKE ?)",
             )
             .bind(format!("%{}%", q))
             .bind(format!("%{}%", q))
             .fetch_one(&self.pool)
             .await?
         } else {
-            sqlx::query_as("SELECT COUNT(*) FROM posts_fts WHERE posts_fts MATCH ?")
+            sqlx::query_as("SELECT COUNT(*) FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN threads th ON th.id=p.thread_id WHERE posts_fts MATCH ? AND p.deleted_at IS NULL AND th.deleted_at IS NULL")
                 .bind(&fts_query)
                 .fetch_one(&self.pool)
                 .await?
         };
         let rows = if short_query {
             sqlx::query(
-                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts p JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE th.title LIKE ? OR p.content_md LIKE ? ORDER BY p.id DESC LIMIT ? OFFSET ?",
+                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts p JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND (th.title LIKE ? OR p.content_md LIKE ?) ORDER BY p.id DESC LIMIT ? OFFSET ?",
             )
             .bind(format!("%{}%", q))
             .bind(format!("%{}%", q))
@@ -681,7 +1002,7 @@ impl Store {
             .await?
         } else {
             sqlx::query(
-                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE posts_fts MATCH ? ORDER BY rank LIMIT ? OFFSET ?",
+                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE posts_fts MATCH ? AND p.deleted_at IS NULL AND th.deleted_at IS NULL ORDER BY rank LIMIT ? OFFSET ?",
             )
             .bind(&fts_query)
             .bind(page_size)
@@ -705,7 +1026,7 @@ impl Store {
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
                 content_html: r.get("content_html"),
-                created_at: parse_time(&created),
+                created_at: parse_time(&created)?,
                 author_name: r.get::<String, _>(9),
             });
             map.entry(tid).or_insert(ThreadBrief {
@@ -719,10 +1040,10 @@ impl Store {
     }
 
     // ---- threads — ported from Go internal/store/threads.go ----
-    fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> Thread {
+    fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Thread> {
         let last: String = row.get("last_reply_at");
         let created: String = row.get("created_at");
-        Thread {
+        Ok(Thread {
             id: row.get("id"),
             board_id: row.get("board_id"),
             title: row.get("title"),
@@ -730,11 +1051,11 @@ impl Store {
             is_pinned: row.get::<i64, _>("is_pinned") == 1,
             is_locked: row.get::<i64, _>("is_locked") == 1,
             reply_count: row.get("reply_count"),
-            last_reply_at: parse_time(&last),
-            created_at: parse_time(&created),
+            last_reply_at: parse_time(&last)?,
+            created_at: parse_time(&created)?,
             author_name: row.get::<String, _>("author_name"),
             board_slug: row.get::<String, _>("board_slug"),
-        }
+        })
     }
 
     /// CreateThread — 事务插入 threads+posts 首帖，对齐 Go: tx Begin→Insert thread→Insert post→Commit
@@ -768,10 +1089,10 @@ impl Store {
              FROM threads th \
              LEFT JOIN users u ON u.id=th.author_id \
              LEFT JOIN boards b ON b.id=th.board_id \
-             WHERE th.id=?"
+             WHERE th.id=? AND th.deleted_at IS NULL"
         )
         .bind(id).fetch_optional(&self.pool).await?;
-        Ok(row.as_ref().map(Self::row_to_thread))
+        row.as_ref().map(Self::row_to_thread).transpose()
     }
 
     /// ListThreads — board_id 分页 + pinned/last_reply 排序，对齐 Go: ORDER BY is_pinned DESC, last_reply_at DESC, id DESC
@@ -784,23 +1105,29 @@ impl Store {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM threads WHERE board_id=?")
-            .bind(board_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM threads WHERE board_id=? AND deleted_at IS NULL")
+                .bind(board_id)
+                .fetch_one(&self.pool)
+                .await?;
         let rows = sqlx::query(
             "SELECT th.id, th.board_id, th.title, th.author_id, th.is_pinned, th.is_locked, th.reply_count, th.last_reply_at, th.created_at, \
                     CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous=1) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
              FROM threads th \
              LEFT JOIN users u ON u.id=th.author_id \
              LEFT JOIN boards b ON b.id=th.board_id \
-             WHERE th.board_id=? \
+             WHERE th.board_id=? AND th.deleted_at IS NULL \
              ORDER BY th.is_pinned DESC, th.last_reply_at DESC, th.id DESC \
              LIMIT ? OFFSET ?"
         )
         .bind(board_id).bind(page_size).bind(offset)
         .fetch_all(&self.pool).await?;
-        Ok((rows.iter().map(Self::row_to_thread).collect(), total.0))
+        Ok((
+            rows.iter()
+                .map(Self::row_to_thread)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            total.0,
+        ))
     }
 
     /// SetThreadPinned — UPDATE threads SET is_pinned=?
@@ -830,6 +1157,32 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+    pub async fn soft_delete_thread(
+        &self,
+        id: i64,
+        deleted_by_user_id: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE threads SET deleted_at=?, deleted_by_user_id=? WHERE id=? AND deleted_at IS NULL")
+            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).bind(deleted_by_user_id).bind(id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+    pub async fn restore_thread(&self, id: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE threads SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=? AND deleted_at IS NOT NULL")
+            .bind(id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+    pub async fn list_deleted_threads(&self, limit: i64) -> anyhow::Result<Vec<Thread>> {
+        let rows = sqlx::query(
+            "SELECT th.id,th.board_id,th.title,th.author_id,th.is_pinned,th.is_locked,th.reply_count,th.last_reply_at,th.created_at, \
+                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous=1) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name,COALESCE(b.slug,'') AS board_slug \
+             FROM threads th LEFT JOIN users u ON u.id=th.author_id LEFT JOIN boards b ON b.id=th.board_id \
+             WHERE th.deleted_at IS NOT NULL ORDER BY th.deleted_at DESC,th.id DESC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::row_to_thread).collect()
     }
 
     // ---- invite_codes — ported from Go internal/store/invite.go ----
@@ -909,8 +1262,8 @@ impl Store {
                 code: r.get("code"),
                 created_by: r.get("created_by"),
                 used_by: r.get("used_by"),
-                created_at: parse_time(&created),
-                used_at: used.as_deref().map(parse_time),
+                created_at: parse_time(&created)?,
+                used_at: used.as_deref().map(parse_time).transpose()?,
             });
         }
         Ok(out)
@@ -954,9 +1307,9 @@ impl Store {
             let sess = Session {
                 id: r.get("id"),
                 user_id: r.get("user_id"),
-                created_at: parse_time(&created),
-                expires_at: parse_time(&exp),
-                last_seen_at: parse_time(&last_seen),
+                created_at: parse_time(&created)?,
+                expires_at: parse_time(&exp)?,
+                last_seen_at: parse_time(&last_seen)?,
             };
             let now = Utc::now();
             if now > sess.expires_at
@@ -988,6 +1341,42 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+    pub async fn list_sessions_by_user(&self, user_id: i64) -> anyhow::Result<Vec<Session>> {
+        let rows = sqlx::query("SELECT id,user_id,created_at,expires_at,last_seen_at FROM sessions WHERE user_id=? ORDER BY created_at DESC")
+            .bind(user_id).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(Session {
+                    id: r.get("id"),
+                    user_id: r.get("user_id"),
+                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
+                    expires_at: parse_time(&r.get::<String, _>("expires_at"))?,
+                    last_seen_at: parse_time(&r.get::<String, _>("last_seen_at"))?,
+                })
+            })
+            .collect()
+    }
+    pub async fn count_sessions_by_user(&self, user_id: i64) -> anyhow::Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id=?")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn delete_expired_sessions(&self) -> anyhow::Result<u64> {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        Ok(
+            sqlx::query("DELETE FROM sessions WHERE expires_at <= ? OR last_seen_at <= ?")
+                .bind(&now)
+                .bind(
+                    (Utc::now() - chrono::Duration::hours(12))
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
     /// GetUserBySession: join users.banned 检查，封禁则删除并返回错误（对齐 Go sqlErrBanned）
     pub async fn get_user_by_session(&self, id: &str) -> anyhow::Result<Option<User>> {
@@ -1216,11 +1605,32 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_thread_listing_uses_complete_order_index() -> anyhow::Result<()> {
+        let s = Store::open(":memory:").await?;
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT id FROM threads WHERE board_id=? ORDER BY is_pinned DESC, last_reply_at DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(1_i64)
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&s.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(plan
+            .iter()
+            .any(|line| line.contains("idx_threads_board_order")));
+        assert!(!plan.iter().any(|line| line.contains("TEMP B-TREE")));
+        Ok(())
+    }
+
     #[test]
     fn test_parse_time_dual_format() {
         // Go time.RFC3339Nano 写入示例: 2026-08-26T08:17:36.853853123Z
         let nano = "2026-08-26T08:17:36.853853123Z";
-        let dt_nano = parse_time(nano);
+        let dt_nano = parse_time(nano).expect("valid test timestamp");
         assert_eq!(
             dt_nano.to_rfc3339_opts(SecondsFormat::Nanos, true),
             "2026-08-26T08:17:36.853853123Z"
@@ -1228,7 +1638,7 @@ mod tests {
 
         // Go time.RFC3339Nano 带 offset
         let nano_offset = "2026-08-26T16:17:36.123456789+08:00";
-        let dt_nano_off = parse_time(nano_offset);
+        let dt_nano_off = parse_time(nano_offset).expect("valid test timestamp");
         // 验证解析后 UTC 时间正确（+08:00 -> Z 差 8h）
         assert_eq!(
             dt_nano_off.to_rfc3339_opts(SecondsFormat::Nanos, true),
@@ -1237,7 +1647,7 @@ mod tests {
 
         // Go time.RFC3339 写入示例: 2026-08-26T08:17:36Z (seedDefaults 使用)
         let rfc = "2026-08-26T08:17:36Z";
-        let dt_rfc = parse_time(rfc);
+        let dt_rfc = parse_time(rfc).expect("valid test timestamp");
         assert_eq!(
             dt_rfc.to_rfc3339_opts(SecondsFormat::Secs, true),
             "2026-08-26T08:17:36Z"
@@ -1245,7 +1655,7 @@ mod tests {
 
         // Go time.RFC3339 带 offset
         let rfc_offset = "2026-08-26T16:17:36+08:00";
-        let dt_rfc_off = parse_time(rfc_offset);
+        let dt_rfc_off = parse_time(rfc_offset).expect("valid test timestamp");
         assert_eq!(
             dt_rfc_off.to_rfc3339_opts(SecondsFormat::Secs, true),
             "2026-08-26T08:17:36Z"
@@ -1253,12 +1663,12 @@ mod tests {
 
         // 额外: RFC3339Nano 秒级精度但带 nanos=0 也应解析
         let nano_zero = "2026-08-26T08:17:36.000000000Z";
-        let dt_nano_zero = parse_time(nano_zero);
+        let dt_nano_zero = parse_time(nano_zero).expect("valid test timestamp");
         assert_eq!(dt_nano_zero.timestamp(), dt_rfc.timestamp());
 
         // 遗留格式兼容: "2006-01-02 15:04:05"
         let legacy = "2026-08-26 08:17:36";
-        let dt_legacy = parse_time(legacy);
+        let dt_legacy = parse_time(legacy).expect("valid test timestamp");
         assert_eq!(
             dt_legacy.to_rfc3339_opts(SecondsFormat::Secs, true),
             "2026-08-26T08:17:36Z"
@@ -1268,10 +1678,17 @@ mod tests {
         let go_nano_written = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let go_rfc_written = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         // 不 panic 且往返时间差 <1s
-        let p1 = parse_time(&go_nano_written);
-        let p2 = parse_time(&go_rfc_written);
+        let p1 = parse_time(&go_nano_written).expect("valid test timestamp");
+        let p2 = parse_time(&go_rfc_written).expect("valid test timestamp");
         assert!((p1.timestamp() - chrono::Utc::now().timestamp()).abs() < 2);
         assert!((p2.timestamp() - chrono::Utc::now().timestamp()).abs() < 2);
+    }
+
+    #[test]
+    fn test_parse_time_rejects_invalid_input() {
+        let err =
+            parse_time("not-a-timestamp").expect_err("invalid timestamp must return an error");
+        assert!(err.to_string().contains("invalid timestamp"));
     }
 
     #[tokio::test]

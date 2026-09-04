@@ -9,15 +9,22 @@ async fn migrations_are_versioned_and_idempotent() -> anyhow::Result<()> {
     let versions: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
         .fetch_one(&store.pool)
         .await?;
-    assert_eq!(versions.0, 8);
+    assert_eq!(versions.0, 10);
     let applied: Vec<(i64,)> =
         sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version")
             .fetch_all(&store.pool)
             .await?;
     assert_eq!(
         applied.iter().map(|v| v.0).collect::<Vec<_>>(),
-        (1..=8).collect::<Vec<_>>()
+        (1..=10).collect::<Vec<_>>()
     );
+    for (key, expected) in [
+        ("reports_enabled", "1"),
+        ("registration_pow_enabled", "1"),
+        ("registration_invite_enabled", "1"),
+    ] {
+        assert_eq!(store.get_config(key).await?.as_deref(), Some(expected));
+    }
 
     // A second open must not rerun destructive SQL or create duplicate markers.
     let path = std::env::temp_dir().join(format!("veil-forum-migrate-{}.db", std::process::id()));
@@ -36,7 +43,7 @@ async fn migrations_are_versioned_and_idempotent() -> anyhow::Result<()> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
         .fetch_one(&second.pool)
         .await?;
-    assert_eq!(count.0, 8);
+    assert_eq!(count.0, 10);
     drop(second);
     let _ = std::fs::remove_file(&path);
     Ok(())

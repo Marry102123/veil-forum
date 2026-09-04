@@ -20,6 +20,7 @@ use tokio::sync::Semaphore;
 pub struct AppState {
     pub store: crate::store::Store,
     pub pow: crate::pow::Manager,
+    pub captcha: crate::captcha::Manager,
     pub password_gate: Arc<Semaphore>,
     pub limits: crate::rate_limit::Limits,
 }
@@ -29,7 +30,7 @@ struct PowQuery {
     scope: String,
 }
 
-const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'self'";
+const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'";
 const MAX_FORM_BYTES: usize = 64 * 1024;
 
 fn csrf_key() -> &'static [u8; 32] {
@@ -118,13 +119,25 @@ fn registration_error_response(error: anyhow::Error) -> Response {
             (StatusCode::BAD_REQUEST, "invite invalid or already used").into_response(),
         );
     }
-    apply_sec(
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registration temporarily unavailable",
-        )
-            .into_response(),
+    internal_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "registration",
+        error,
+        "registration temporarily unavailable",
     )
+}
+
+/// Convert an internal failure into a stable public response. The underlying
+/// error is useful to operators, but must not be sent to clients because it
+/// can contain SQL statements, paths, or other implementation details.
+fn internal_error_response<E: std::fmt::Display>(
+    status: StatusCode,
+    operation: &str,
+    error: E,
+    public_message: &'static str,
+) -> Response {
+    eprintln!("internal error during {operation}: {error}");
+    apply_sec((status, public_message).into_response())
 }
 
 #[cfg(test)]
@@ -195,6 +208,24 @@ mod security_tests {
             .status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn internal_errors_do_not_expose_details() {
+        let response = internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "test operation",
+            anyhow::anyhow!("database path=/private/data.sqlite: permission denied"),
+            "operation temporarily unavailable",
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body, "operation temporarily unavailable");
+        assert!(!body.contains("private/data.sqlite"));
+        assert!(!body.contains("permission denied"));
     }
 }
 
@@ -317,7 +348,7 @@ async fn sidebar_data(
                     v.push(crate::store::Thread{
                         id: r.get("id"), board_id: r.get("board_id"), title: r.get("title"),
                         author_id: r.get("author_id"), is_pinned: r.get::<i64,_>("is_pinned")==1, is_locked: r.get::<i64,_>("is_locked")==1,
-                        reply_count: r.get("reply_count"), last_reply_at: crate::store::parse_time(&last), created_at: crate::store::parse_time(&created),
+                        reply_count: r.get("reply_count"), last_reply_at: crate::store::parse_time(&last).unwrap_or_else(|_| chrono::Utc::now()), created_at: crate::store::parse_time(&created).unwrap_or_else(|_| chrono::Utc::now()),
                         author_name: "".to_string(), board_slug: "".to_string(),
                     });
                 }
@@ -497,6 +528,69 @@ fn verify_pow_form(
     }
     Ok((chal, salt, diff, exp, hmac, nonce))
 }
+fn verify_captcha_form(
+    form: &HashMap<String, String>,
+    scope: crate::pow::Scope,
+    captcha: &crate::captcha::Manager,
+) -> Result<(), String> {
+    let id = form.get("captcha_id").map(String::as_str).unwrap_or("");
+    let expires_at = form
+        .get("captcha_expires_at")
+        .and_then(|v| v.parse::<i64>().ok())
+        .ok_or("missing captcha expiry")?;
+    let token = form.get("captcha_token").map(String::as_str).unwrap_or("");
+    let answer = form.get("captcha_answer").map(String::as_str).unwrap_or("");
+    captcha
+        .verify(scope, id, expires_at, token, answer)
+        .map_err(|_| "captcha verification failed".to_string())
+}
+
+async fn challenge_enabled(
+    store: &crate::store::Store,
+    scope: crate::pow::Scope,
+    kind: &str,
+) -> bool {
+    let key = match (kind, scope) {
+        ("pow", crate::pow::Scope::Register) => "registration_pow_enabled",
+        ("pow", crate::pow::Scope::Login) => "login_pow_enabled",
+        ("pow", crate::pow::Scope::Post) => "post_pow_enabled",
+        ("captcha", crate::pow::Scope::Register) => "registration_captcha_enabled",
+        ("captcha", crate::pow::Scope::Login) => "login_captcha_enabled",
+        ("captcha", crate::pow::Scope::Post) => "post_captcha_enabled",
+        _ => return false,
+    };
+    store
+        .get_config(key)
+        .await
+        .unwrap_or(None)
+        .map(|v| v == "1")
+        .unwrap_or(kind == "pow")
+}
+
+async fn captcha_difficulty(store: &crate::store::Store) -> crate::captcha::Difficulty {
+    crate::captcha::Difficulty::from_config(
+        store.get_config("captcha_difficulty").await.unwrap_or(None),
+    )
+}
+
+fn captcha_html(challenge: &crate::captcha::Challenge, locale: &str) -> String {
+    let label = crate::i18n::ui(
+        locale,
+        "Image verification",
+        "图片验证码",
+        "Проверка изображения",
+    );
+    let hint = crate::i18n::ui(
+        locale,
+        "Enter the characters shown",
+        "输入图片中的字符",
+        "Введите символы с изображения",
+    );
+    format!(
+        r#"<div class="captcha-challenge"><label>{label}</label><img src="data:image/png;base64,{}" alt="{label}"><input type="hidden" name="captcha_id" value="{}"><input type="hidden" name="captcha_expires_at" value="{}"><input type="hidden" name="captcha_token" value="{}"><input name="captcha_answer" required autocomplete="off" autocapitalize="characters" maxlength="16" placeholder="{hint}" aria-label="{label}"></div>"#,
+        challenge.image_base64, challenge.id, challenge.expires_at, challenge.token
+    )
+}
 fn pow_fallback_html(ch: &crate::pow::Challenge, locale: &str) -> String {
     let ui = |en, zh, ru| crate::i18n::ui(locale, en, zh, ru);
     let py = format!(
@@ -572,11 +666,13 @@ pub fn routes(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/b/:slug/new", post(new_thread))
         .route("/t/:id/reply", post(reply))
-        .route("/admin", get(admin))
+        .route("/admin", get(admin_hub))
+        .route("/admin/settings", get(admin_settings))
         .route("/admin/config/site", post(admin_site))
         .route("/admin/config/announcement", post(admin_announcement))
         .route("/admin/config/pow", post(admin_pow))
         .route("/admin/config/registration", post(admin_regmode))
+        .route("/admin/config/policies", post(admin_policies))
         .route("/admin/config/locale", post(admin_locale))
         .route("/admin/board/create", post(board_create))
         .route("/admin/board/:id/update", post(board_update))
@@ -590,6 +686,23 @@ pub fn routes(state: AppState) -> Router {
         .route("/admin/thread/:id/delete", post(thread_delete))
         .route("/admin/post/:id/delete", post(post_delete))
         .route("/admin/change-password", post(change_password))
+        .route("/governance", get(governance))
+        .route("/governance/reports", get(governance))
+        .route("/governance/audit", get(governance))
+        .route("/governance/users", get(governance))
+        .route("/governance/trash", get(governance))
+        .route("/governance/sessions", get(governance))
+        .route("/governance/report/:id/resolve", post(resolve_report))
+        .route("/governance/report/:id/dismiss", post(dismiss_report))
+        .route("/governance/user/:id/role", post(change_role))
+        .route("/governance/thread/:id/restore", post(restore_thread))
+        .route("/governance/post/:id/restore", post(restore_post))
+        .route(
+            "/governance/user/:id/sessions/revoke",
+            post(revoke_user_sessions),
+        )
+        .route("/report/thread/:id", post(report_thread))
+        .route("/report/post/:id", post(report_post))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
         .layer(middleware::from_fn(theme_query_cookie))
         .with_state(state)
@@ -886,8 +999,20 @@ async fn board(
     context.insert("can_post", &user.is_some());
     context.insert("csrf_field", &csrf_field(&headers));
     if user.is_some() {
-        let ch = s.pow.generate(crate::pow::Scope::Post).await;
-        context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+        let need_pow = challenge_enabled(&s.store, crate::pow::Scope::Post, "pow").await;
+        let need_captcha = challenge_enabled(&s.store, crate::pow::Scope::Post, "captcha").await;
+        context.insert("need_pow", &need_pow);
+        context.insert("need_captcha", &need_captcha);
+        if need_pow {
+            let ch = s.pow.generate(crate::pow::Scope::Post).await;
+            context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+        }
+        if need_captcha {
+            let ch = s
+                .captcha
+                .generate(crate::pow::Scope::Post, captcha_difficulty(&s.store).await);
+            context.insert("captcha_html", &captcha_html(&ch, &locale));
+        }
     }
     for (key, value) in [
         ("boards_label", ui("Boards", "版块", "Разделы")),
@@ -997,6 +1122,15 @@ async fn thread(
         .unwrap_or((Vec::new(), 0));
     let total_pages = ((total + page_size - 1) / page_size).max(1);
     let is_admin = user.as_ref().is_some_and(|u| u.is_admin);
+    let can_moderate = match user.as_ref() {
+        Some(u) if u.is_admin => true,
+        Some(u) => s
+            .store
+            .can_moderate_board(th.board_id, u.id)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
     let pow_min = s
         .store
         .get_config("pow_post_minutes")
@@ -1023,6 +1157,15 @@ async fn thread(
     context.insert("posts", &rendered_posts);
     context.insert("can_reply", &user.is_some());
     context.insert("is_admin", &is_admin);
+    context.insert("can_moderate", &can_moderate);
+    let reports_enabled = s
+        .store
+        .get_config("reports_enabled")
+        .await
+        .unwrap_or(None)
+        .map(|v| v == "1")
+        .unwrap_or(true);
+    context.insert("can_report", &(user.is_some() && reports_enabled));
     context.insert(
         "allow_anonymous",
         &board.as_ref().is_some_and(|b| b.allow_anonymous),
@@ -1031,8 +1174,20 @@ async fn thread(
     context.insert("total_pages", &total_pages);
     context.insert("csrf_field", &csrf_field(&headers));
     if user.is_some() && !th.is_locked {
-        let ch = s.pow.generate(crate::pow::Scope::Post).await;
-        context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+        let need_pow = challenge_enabled(&s.store, crate::pow::Scope::Post, "pow").await;
+        let need_captcha = challenge_enabled(&s.store, crate::pow::Scope::Post, "captcha").await;
+        context.insert("need_pow", &need_pow);
+        context.insert("need_captcha", &need_captcha);
+        if need_pow {
+            let ch = s.pow.generate(crate::pow::Scope::Post).await;
+            context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+        }
+        if need_captcha {
+            let ch = s
+                .captcha
+                .generate(crate::pow::Scope::Post, captcha_difficulty(&s.store).await);
+            context.insert("captcha_html", &captcha_html(&ch, &locale));
+        }
         let reply_post = match q.reply_to.filter(|post_id| *post_id > 0) {
             Some(post_id) => s
                 .store
@@ -1072,6 +1227,8 @@ async fn thread(
         ("replying_label", ui("Replying to", "回复", "Ответ на")),
         ("reply_label", ui("Reply", "回帖", "Ответить")),
         ("delete_label", ui("Delete", "删除", "Удалить")),
+        ("report_label", ui("Report", "举报", "Пожаловаться")),
+        ("report_reason_label", ui("Reason", "原因", "Причина")),
         (
             "empty_label",
             ui("No replies yet", "暂无回帖", "Ответов пока нет"),
@@ -1268,7 +1425,19 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "invite".to_string());
-    let need_invite = reg_mode == "invite";
+    if reg_mode == "closed" {
+        return apply_sec((StatusCode::FORBIDDEN, "registration closed").into_response());
+    }
+    let invite_enabled = s
+        .store
+        .get_config("registration_invite_enabled")
+        .await
+        .unwrap_or(None)
+        .map(|v| v == "1")
+        .unwrap_or(reg_mode == "invite");
+    let pow_enabled = challenge_enabled(&s.store, crate::pow::Scope::Register, "pow").await;
+    let captcha_enabled = challenge_enabled(&s.store, crate::pow::Scope::Register, "captcha").await;
+    let need_invite = invite_enabled;
     let pow_min = s
         .store
         .get_config("pow_register_minutes")
@@ -1280,10 +1449,23 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
     let mut context = Context::new();
-    let ch = s.pow.generate(crate::pow::Scope::Register).await;
+    let pow_fallback = if pow_enabled {
+        pow_fallback_html(&s.pow.generate(crate::pow::Scope::Register).await, &locale)
+    } else {
+        String::new()
+    };
     context.insert("csrf_field", &csrf_field(&headers));
-    context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+    context.insert("pow_fallback", &pow_fallback);
     context.insert("need_invite", &need_invite);
+    context.insert("need_pow", &pow_enabled);
+    context.insert("need_captcha", &captcha_enabled);
+    if captcha_enabled {
+        let ch = s.captcha.generate(
+            crate::pow::Scope::Register,
+            captcha_difficulty(&s.store).await,
+        );
+        context.insert("captcha_html", &captcha_html(&ch, &locale));
+    }
     context.insert(
         "registration_mode",
         &ui("Registration mode", "注册模式", "Режим регистрации"),
@@ -1379,29 +1561,49 @@ async fn register_post(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    // verify pow
-    let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Register) {
+    let pow_enabled = challenge_enabled(&s.store, crate::pow::Scope::Register, "pow").await;
+    // verify PoW only when registration PoW is enabled
+    let pow_fields = match if pow_enabled {
+        verify_pow_form(&form, crate::pow::Scope::Register)
+    } else {
+        Err("disabled".to_string())
+    } {
         Ok(v) => v,
-        Err(e) => {
+        Err(e) if pow_enabled => {
             let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
             return apply_sec(resp);
         }
+        Err(_) => (
+            String::new(),
+            String::new(),
+            0,
+            0,
+            String::new(),
+            String::new(),
+        ),
     };
-    if let Err(e) = s
-        .pow
-        .verify(
-            crate::pow::Scope::Register,
-            &pow_fields.0,
-            &pow_fields.1,
-            pow_fields.2,
-            pow_fields.3,
-            &pow_fields.4,
-            &pow_fields.5,
-        )
-        .await
+    if pow_enabled {
+        if let Err(e) = s
+            .pow
+            .verify(
+                crate::pow::Scope::Register,
+                &pow_fields.0,
+                &pow_fields.1,
+                pow_fields.2,
+                pow_fields.3,
+                &pow_fields.4,
+                &pow_fields.5,
+            )
+            .await
+        {
+            let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
+            return apply_sec(resp);
+        }
+    }
+    if challenge_enabled(&s.store, crate::pow::Scope::Register, "captcha").await
+        && verify_captcha_form(&form, crate::pow::Scope::Register, &s.captcha).is_err()
     {
-        let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
-        return apply_sec(resp);
+        return apply_sec((StatusCode::FORBIDDEN, "CAPTCHA verification failed").into_response());
     }
     let reg_mode = s
         .store
@@ -1436,7 +1638,14 @@ async fn register_post(
         let resp = (StatusCode::BAD_REQUEST, "password length").into_response();
         return apply_sec(resp);
     }
-    if reg_mode == "invite" && invite.is_empty() {
+    let invite_enabled = s
+        .store
+        .get_config("registration_invite_enabled")
+        .await
+        .unwrap_or(None)
+        .map(|v| v == "1")
+        .unwrap_or(reg_mode == "invite");
+    if invite_enabled && invite.is_empty() {
         let resp = (StatusCode::BAD_REQUEST, "invite required").into_response();
         return apply_sec(resp);
     }
@@ -1456,12 +1665,15 @@ async fn register_post(
     let hash = match hash_result {
         Ok(h) => h,
         Err(e) => {
-            let resp =
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("hash err {}", e)).into_response();
-            return apply_sec(resp);
+            return internal_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "password hashing",
+                e,
+                "registration temporarily unavailable",
+            );
         }
     };
-    let uid = match if reg_mode == "invite" {
+    let uid = match if invite_enabled {
         s.store
             .register_with_invite(&username, &hash, &invite)
             .await
@@ -1502,9 +1714,21 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
     let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let mut context = Context::new();
-    let ch = s.pow.generate(crate::pow::Scope::Login).await;
+    let need_pow = challenge_enabled(&s.store, crate::pow::Scope::Login, "pow").await;
+    let need_captcha = challenge_enabled(&s.store, crate::pow::Scope::Login, "captcha").await;
     context.insert("csrf_field", &csrf_field(&headers));
-    context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+    context.insert("need_pow", &need_pow);
+    context.insert("need_captcha", &need_captcha);
+    if need_pow {
+        let ch = s.pow.generate(crate::pow::Scope::Login).await;
+        context.insert("pow_fallback", &pow_fallback_html(&ch, &locale));
+    }
+    if need_captcha {
+        let ch = s
+            .captcha
+            .generate(crate::pow::Scope::Login, captcha_difficulty(&s.store).await);
+        context.insert("captcha_html", &captcha_html(&ch, &locale));
+    }
     for (key, value) in [
         (
             "username_label",
@@ -1584,26 +1808,35 @@ async fn login_post(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Login) {
-        Ok(v) => v,
-        Err(e) => {
-            return apply_sec((StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response())
-        }
-    };
-    if let Err(e) = s
-        .pow
-        .verify(
-            crate::pow::Scope::Login,
-            &pow_fields.0,
-            &pow_fields.1,
-            pow_fields.2,
-            pow_fields.3,
-            &pow_fields.4,
-            &pow_fields.5,
-        )
-        .await
+    if challenge_enabled(&s.store, crate::pow::Scope::Login, "captcha").await
+        && verify_captcha_form(&form, crate::pow::Scope::Login, &s.captcha).is_err()
     {
-        return apply_sec((StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response());
+        return apply_sec((StatusCode::FORBIDDEN, "CAPTCHA verification failed").into_response());
+    }
+    if challenge_enabled(&s.store, crate::pow::Scope::Login, "pow").await {
+        let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Login) {
+            Ok(v) => v,
+            Err(e) => {
+                return apply_sec(
+                    (StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response(),
+                )
+            }
+        };
+        if let Err(e) = s
+            .pow
+            .verify(
+                crate::pow::Scope::Login,
+                &pow_fields.0,
+                &pow_fields.1,
+                pow_fields.2,
+                pow_fields.3,
+                &pow_fields.4,
+                &pow_fields.5,
+            )
+            .await
+        {
+            return apply_sec((StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response());
+        }
     }
     let username = form
         .get("username")
@@ -1727,28 +1960,35 @@ async fn new_thread(
             return apply_sec(resp);
         }
     };
-    let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Post) {
-        Ok(v) => v,
-        Err(e) => {
+    if challenge_enabled(&s.store, crate::pow::Scope::Post, "captcha").await
+        && verify_captcha_form(&form, crate::pow::Scope::Post, &s.captcha).is_err()
+    {
+        return apply_sec((StatusCode::FORBIDDEN, "CAPTCHA verification failed").into_response());
+    }
+    if challenge_enabled(&s.store, crate::pow::Scope::Post, "pow").await {
+        let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Post) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
+                return apply_sec(resp);
+            }
+        };
+        if let Err(e) = s
+            .pow
+            .verify(
+                crate::pow::Scope::Post,
+                &pow_fields.0,
+                &pow_fields.1,
+                pow_fields.2,
+                pow_fields.3,
+                &pow_fields.4,
+                &pow_fields.5,
+            )
+            .await
+        {
             let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
             return apply_sec(resp);
         }
-    };
-    if let Err(e) = s
-        .pow
-        .verify(
-            crate::pow::Scope::Post,
-            &pow_fields.0,
-            &pow_fields.1,
-            pow_fields.2,
-            pow_fields.3,
-            &pow_fields.4,
-            &pow_fields.5,
-        )
-        .await
-    {
-        let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
-        return apply_sec(resp);
     }
     let title = form
         .get("title")
@@ -1781,10 +2021,12 @@ async fn new_thread(
             let resp = Redirect::to(&format!("/t/{}", tid)).into_response();
             apply_sec(resp)
         }
-        Err(e) => {
-            let resp = (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response();
-            apply_sec(resp)
-        }
+        Err(e) => internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "thread creation",
+            e,
+            "thread temporarily unavailable",
+        ),
     }
 }
 
@@ -1826,28 +2068,35 @@ async fn reply(
         return apply_sec(resp);
     }
     let board = s.store.get_board_by_id(th.board_id).await.unwrap_or(None);
-    let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Post) {
-        Ok(v) => v,
-        Err(e) => {
+    if challenge_enabled(&s.store, crate::pow::Scope::Post, "captcha").await
+        && verify_captcha_form(&form, crate::pow::Scope::Post, &s.captcha).is_err()
+    {
+        return apply_sec((StatusCode::FORBIDDEN, "CAPTCHA verification failed").into_response());
+    }
+    if challenge_enabled(&s.store, crate::pow::Scope::Post, "pow").await {
+        let pow_fields = match verify_pow_form(&form, crate::pow::Scope::Post) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
+                return apply_sec(resp);
+            }
+        };
+        if let Err(e) = s
+            .pow
+            .verify(
+                crate::pow::Scope::Post,
+                &pow_fields.0,
+                &pow_fields.1,
+                pow_fields.2,
+                pow_fields.3,
+                &pow_fields.4,
+                &pow_fields.5,
+            )
+            .await
+        {
             let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
             return apply_sec(resp);
         }
-    };
-    if let Err(e) = s
-        .pow
-        .verify(
-            crate::pow::Scope::Post,
-            &pow_fields.0,
-            &pow_fields.1,
-            pow_fields.2,
-            pow_fields.3,
-            &pow_fields.4,
-            &pow_fields.5,
-        )
-        .await
-    {
-        let resp = (StatusCode::FORBIDDEN, format!("PoW failed: {}", e)).into_response();
-        return apply_sec(resp);
     }
     let content = form
         .get("content")
@@ -1897,10 +2146,12 @@ async fn reply(
             let resp = Redirect::to(&format!("/t/{}", th.id)).into_response();
             apply_sec(resp)
         }
-        Err(e) => {
-            let resp = (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response();
-            apply_sec(resp)
-        }
+        Err(e) => internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reply creation",
+            e,
+            "reply temporarily unavailable",
+        ),
     }
 }
 
@@ -1912,6 +2163,59 @@ async fn require_admin_state(state: &AppState, headers: &HeaderMap) -> Option<cr
     } else {
         None
     }
+}
+#[derive(Clone, Copy)]
+enum Capability {
+    Governance,
+    RoleManagement,
+}
+
+async fn require_capability(
+    state: &AppState,
+    headers: &HeaderMap,
+    capability: Capability,
+) -> Option<crate::store::User> {
+    let user = current_user(state, headers).await?;
+    let owner = state
+        .store
+        .user_has_role(user.id, crate::store::Role::Owner)
+        .await
+        .unwrap_or(false);
+    let admin = user.is_admin
+        || state
+            .store
+            .user_has_role(user.id, crate::store::Role::Admin)
+            .await
+            .unwrap_or(false);
+    match capability {
+        Capability::Governance
+            if owner
+                || admin
+                || state
+                    .store
+                    .user_has_role(user.id, crate::store::Role::Moderator)
+                    .await
+                    .unwrap_or(false) =>
+        {
+            Some(user)
+        }
+        Capability::RoleManagement if owner => Some(user),
+        _ => None,
+    }
+}
+async fn require_board_moderator(
+    state: &AppState,
+    headers: &HeaderMap,
+    board_id: i64,
+) -> Option<crate::store::User> {
+    let user = current_user(state, headers).await?;
+    state
+        .store
+        .can_moderate_board(board_id, user.id)
+        .await
+        .ok()
+        .filter(|allowed| *allowed)
+        .map(|_| user)
 }
 async fn audit_admin(
     state: &AppState,
@@ -1927,7 +2231,478 @@ async fn audit_admin(
         .audit(actor, action, target_type, target_id, success)
         .await;
 }
-async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user = match require_capability(&s, &headers, Capability::Governance).await {
+        Some(user) => user,
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
+    };
+    let locale = site_locale(&s.store).await;
+    let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
+    let reports = s.store.list_reports(Some("open"), 100).await.unwrap_or_default().into_iter().map(|r| serde_json::json!({"id":r.id,"target_type":r.target_type,"target_id":r.target_id,"reason":r.reason,"status":r.status})).collect::<Vec<_>>();
+    let audit_logs = s.store.list_audit_logs(100, None).await.unwrap_or_default().into_iter().map(|entry| serde_json::json!({"id":entry.id,"action":entry.action,"target":format!("{} #{}", entry.target_type.unwrap_or_default(), entry.target_id.map(|v| v.to_string()).unwrap_or_default()),"success":entry.success,"created_at":entry.created_at.format("%Y-%m-%d %H:%M").to_string()})).collect::<Vec<_>>();
+    let can_manage_roles = require_capability(&s, &headers, Capability::RoleManagement)
+        .await
+        .is_some();
+    let users = if can_manage_roles {
+        s.store
+            .list_users(100)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| {
+                let store = s.store.clone();
+                async move {
+                    let roles = store
+                        .list_user_roles(u.id)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| format!("{:?}", r).to_lowercase())
+                        .collect::<Vec<_>>();
+                    serde_json::json!({"id":u.id,"username":u.username,"roles":roles})
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut rendered_users = Vec::new();
+    for future in users {
+        rendered_users.push(future.await);
+    }
+    let deleted_threads = s
+        .store
+        .list_deleted_threads(100)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|thread| serde_json::json!({"id":thread.id,"title":thread.title,"board_id":thread.board_id}))
+        .collect::<Vec<_>>();
+    let deleted_posts = s
+        .store
+        .list_deleted_posts(100)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|post| serde_json::json!({"id":post.id,"thread_id":post.thread_id,"board_id":post.board_id,"content":post.content_md.chars().take(120).collect::<String>()}))
+        .collect::<Vec<_>>();
+    let mut session_users = Vec::new();
+    if can_manage_roles {
+        for user in s.store.list_users(100).await.unwrap_or_default() {
+            let count = s.store.count_sessions_by_user(user.id).await.unwrap_or(0);
+            session_users.push(
+                serde_json::json!({"id":user.id,"username":user.username,"session_count":count}),
+            );
+        }
+    }
+    let mut context = Context::new();
+    context.insert("csrf_field", &csrf_field(&headers));
+    context.insert("reports", &reports);
+    context.insert("audit_logs", &audit_logs);
+    context.insert("users", &rendered_users);
+    context.insert("can_manage_roles", &can_manage_roles);
+    context.insert("deleted_threads", &deleted_threads);
+    context.insert("deleted_posts", &deleted_posts);
+    context.insert("session_users", &session_users);
+    for (key, value) in [
+        (
+            "moderation_kicker",
+            ui("Moderation", "内容治理", "Модерация"),
+        ),
+        (
+            "governance_sections_label",
+            ui("Governance sections", "治理栏目", "Разделы модерации"),
+        ),
+        ("governance_label", ui("Governance", "治理", "Модерация")),
+        (
+            "governance_help",
+            ui(
+                "Reports, permissions, and audit history.",
+                "举报、授权与审计历史。",
+                "Жалобы, права и аудит.",
+            ),
+        ),
+        (
+            "system_settings_label",
+            ui("System settings", "论坛设置", "Настройки форума"),
+        ),
+        (
+            "system_settings_help",
+            ui(
+                "Low-frequency site configuration and structure.",
+                "低频的站点配置与版块结构。",
+                "Редкие настройки сайта и структура разделов.",
+            ),
+        ),
+        ("reports_label", ui("Reports", "举报", "Жалобы")),
+        ("target_label", ui("Target", "对象", "Цель")),
+        ("report_reason_label", ui("Reason", "原因", "Причина")),
+        ("status_label", ui("Status", "状态", "Статус")),
+        ("actions_label", ui("Actions", "操作", "Действия")),
+        (
+            "note_label",
+            ui("Resolution note", "处理备注", "Примечание"),
+        ),
+        ("resolve_label", ui("Resolve", "处理", "Решить")),
+        ("dismiss_label", ui("Dismiss", "忽略", "Отклонить")),
+        (
+            "no_reports_label",
+            ui("No open reports", "没有待处理举报", "Нет открытых жалоб"),
+        ),
+        (
+            "user_roles_label",
+            ui("User roles", "用户授权", "Роли пользователей"),
+        ),
+        ("roles_label", ui("Roles", "角色", "Роли")),
+        ("grant_label", ui("Grant", "授予", "Выдать")),
+        ("revoke_label", ui("Revoke", "撤销", "Отозвать")),
+        ("save_label", ui("Save", "保存", "Сохранить")),
+        ("user_label", ui("User", "用户", "Пользователь")),
+        ("audit_label", ui("Audit log", "审计日志", "Журнал аудита")),
+        ("action_label", ui("Action", "动作", "Действие")),
+        ("time_label", ui("Time", "时间", "Время")),
+        (
+            "no_audit_label",
+            ui("No audit entries", "没有审计记录", "Нет записей аудита"),
+        ),
+        ("trash_label", ui("Trash", "回收站", "Корзина")),
+        ("restore_label", ui("Restore", "恢复", "Восстановить")),
+        ("sessions_label", ui("Sessions", "会话", "Сессии")),
+        (
+            "session_count_label",
+            ui("Active sessions", "活跃会话", "Активные сессии"),
+        ),
+        (
+            "revoke_all_label",
+            ui("Revoke all", "注销全部", "Отозвать все"),
+        ),
+        ("threads_label", ui("Threads", "主题", "Темы")),
+        ("posts_label", ui("Posts", "帖子", "Сообщения")),
+        ("none_label", ui("None", "暂无", "Нет")),
+    ] {
+        context.insert(key, &value);
+    }
+    let content = crate::templates::render_page("governance", &context)
+        .expect("embedded governance template must render");
+    let (boards, pow, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let full = layout_html(
+        &ui("Governance", "治理", "Модерация"),
+        &get_site_name(&s.store).await,
+        Some(&user),
+        &boards,
+        &pow,
+        st,
+        sp,
+        su,
+        &recent,
+        &announcement,
+        &content,
+        false,
+        None,
+        get_theme(&headers),
+        &locale,
+        &headers,
+    );
+    apply_sec(Html(full).into_response())
+}
+async fn submit_report(
+    state: AppState,
+    headers: HeaderMap,
+    target_type: &'static str,
+    id: i64,
+    redirect_to: String,
+    form: HashMap<String, String>,
+) -> Response {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    let user = match current_user(&state, &headers).await {
+        Some(u) => u,
+        None => return apply_sec(Redirect::to("/login").into_response()),
+    };
+    let reports_enabled = state
+        .store
+        .get_config("reports_enabled")
+        .await
+        .unwrap_or(None)
+        .map(|v| v == "1")
+        .unwrap_or(true);
+    if !reports_enabled {
+        return apply_sec((StatusCode::FORBIDDEN, "reporting disabled").into_response());
+    }
+    let target_exists = match target_type {
+        "thread" => state.store.get_thread(id).await.ok().flatten().is_some(),
+        "post" => state.store.get_post(id).await.ok().flatten().is_some(),
+        _ => false,
+    };
+    if !target_exists {
+        return apply_sec((StatusCode::NOT_FOUND, "report target not found").into_response());
+    }
+    let reason = form.get("reason").map(|v| v.trim()).unwrap_or("");
+    if reason.is_empty() || reason.chars().count() > 500 {
+        return apply_sec((StatusCode::BAD_REQUEST, "report reason required").into_response());
+    }
+    let ok = state
+        .store
+        .create_report(Some(user.id), target_type, id, reason)
+        .await
+        .is_ok();
+    audit_admin(
+        &state,
+        &headers,
+        "report.create",
+        Some(target_type),
+        Some(id),
+        ok,
+    )
+    .await;
+    apply_sec(Redirect::to(&redirect_to).into_response())
+}
+async fn report_thread(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    submit_report(s, headers, "thread", id, format!("/t/{id}"), form).await
+}
+async fn report_post(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let thread_id = s
+        .store
+        .get_post(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|post| post.thread_id)
+        .unwrap_or(id);
+    submit_report(
+        s,
+        headers,
+        "post",
+        id,
+        format!("/t/{thread_id}#p{id}"),
+        form,
+    )
+    .await
+}
+async fn resolve_report(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    resolve_report_action(s, headers, id, "resolved", form).await
+}
+async fn dismiss_report(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    resolve_report_action(s, headers, id, "dismissed", form).await
+}
+async fn resolve_report_action(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    status: &'static str,
+    form: HashMap<String, String>,
+) -> Response {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    let user = match require_capability(&state, &headers, Capability::Governance).await {
+        Some(u) => u,
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
+    };
+    let note = form.get("note").map(String::as_str);
+    let ok = state
+        .store
+        .resolve_report(id, user.id, status, note)
+        .await
+        .is_ok();
+    audit_admin(
+        &state,
+        &headers,
+        &format!("report.{status}"),
+        Some("report"),
+        Some(id),
+        ok,
+    )
+    .await;
+    apply_sec(Redirect::to("/governance/reports").into_response())
+}
+async fn change_role(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    let actor = match require_capability(&s, &headers, Capability::RoleManagement).await {
+        Some(u) => u,
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
+    };
+    if id == actor.id
+        || s.store
+            .user_has_role(id, crate::store::Role::Owner)
+            .await
+            .unwrap_or(false)
+    {
+        return apply_sec((StatusCode::FORBIDDEN, "owner role protected").into_response());
+    }
+    let role = match form.get("role").map(String::as_str) {
+        Some("admin") => crate::store::Role::Admin,
+        Some("moderator") => crate::store::Role::Moderator,
+        _ => return apply_sec((StatusCode::BAD_REQUEST, "invalid role").into_response()),
+    };
+    let ok = match form.get("operation").map(String::as_str) {
+        Some("grant") => s.store.grant_role(id, role, Some(actor.id)).await.is_ok(),
+        Some("revoke") => s.store.revoke_role(id, role).await.is_ok(),
+        _ => false,
+    };
+    audit_admin(&s, &headers, "role.change", Some("user"), Some(id), ok).await;
+    apply_sec(Redirect::to("/governance/users").into_response())
+}
+async fn restore_thread(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    let actor = match require_capability(&s, &headers, Capability::RoleManagement).await {
+        Some(user) => user,
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
+    };
+    let ok = s.store.restore_thread(id).await.unwrap_or(false);
+    audit_admin(&s, &headers, "thread.restore", Some("thread"), Some(id), ok).await;
+    let _ = actor;
+    apply_sec(Redirect::to("/governance/trash").into_response())
+}
+async fn restore_post(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    let actor = match require_capability(&s, &headers, Capability::RoleManagement).await {
+        Some(user) => user,
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
+    };
+    let ok = s.store.restore_post(id).await.unwrap_or(false);
+    audit_admin(&s, &headers, "post.restore", Some("post"), Some(id), ok).await;
+    let _ = actor;
+    apply_sec(Redirect::to("/governance/trash").into_response())
+}
+async fn revoke_user_sessions(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    if require_capability(&s, &headers, Capability::RoleManagement)
+        .await
+        .is_none()
+    {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let ok = s.store.delete_sessions_by_user(id).await.is_ok();
+    audit_admin(
+        &s,
+        &headers,
+        "sessions.revoke_all",
+        Some("user"),
+        Some(id),
+        ok,
+    )
+    .await;
+    apply_sec(Redirect::to("/governance/sessions").into_response())
+}
+async fn admin_hub(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user = match require_admin_state(&s, &headers).await {
+        Some(user) => user,
+        None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
+    };
+    let locale = site_locale(&s.store).await;
+    let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
+    let mut context = Context::new();
+    context.insert(
+        "admin_label",
+        &ui("Administration", "后台", "Администрирование"),
+    );
+    context.insert(
+        "admin_help",
+        &ui(
+            "Choose a workspace.",
+            "选择要进入的工作区。",
+            "Выберите рабочее пространство.",
+        ),
+    );
+    context.insert(
+        "governance_label",
+        &ui("Governance", "治理后台", "Модерация"),
+    );
+    context.insert(
+        "governance_help",
+        &ui(
+            "Reports, content actions, roles, sessions, and audit history.",
+            "举报、内容处置、角色、会话与审计历史。",
+            "Жалобы, действия с контентом, роли, сессии и аудит.",
+        ),
+    );
+    context.insert(
+        "system_settings_label",
+        &ui("Forum settings", "论坛设置", "Настройки форума"),
+    );
+    context.insert(
+        "system_settings_help",
+        &ui(
+            "Site configuration, board structure, registration, invitations, and account settings.",
+            "站点配置、版块结构、注册、邀请码与账户设置。",
+            "Конфигурация сайта, разделы, регистрация, приглашения и настройки аккаунта.",
+        ),
+    );
+    let content = crate::templates::render_page("admin", &context)
+        .expect("embedded admin hub template must render");
+    let (boards, pow, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let full = layout_html(
+        &ui("Administration", "后台", "Администрирование"),
+        &get_site_name(&s.store).await,
+        Some(&user),
+        &boards,
+        &pow,
+        st,
+        sp,
+        su,
+        &recent,
+        &announcement,
+        &content,
+        false,
+        None,
+        get_theme(&headers),
+        &locale,
+        &headers,
+    );
+    apply_sec(Html(full).into_response())
+}
+
+async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user = match require_admin_state(&s, &headers).await {
         Some(u) => u,
         None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
@@ -1943,6 +2718,46 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
     let mut context = Context::new();
     context.insert("csrf_field", &csrf_field(&headers));
     context.insert("username", &user.username);
+    context.insert(
+        "governance_label",
+        &ui("Governance", "治理后台", "Модерация"),
+    );
+    context.insert(
+        "governance_help",
+        &ui(
+            "Daily reports, moderation, recovery, roles, sessions, and audit history.",
+            "日常举报、内容处置、回收、角色、会话和审计记录。",
+            "Ежедневные жалобы, модерация, восстановление, роли, сессии и аудит.",
+        ),
+    );
+    context.insert(
+        "admin_help",
+        &ui(
+            "Low-frequency forum configuration and structure.",
+            "低频的论坛配置与版块结构。",
+            "Редкая настройка форума и структура разделов.",
+        ),
+    );
+    context.insert(
+        "system_settings_label",
+        &ui("Forum settings", "论坛设置", "Настройки форума"),
+    );
+    context.insert(
+        "legacy_user_management_label",
+        &ui(
+            "Legacy user controls",
+            "兼容用户控制",
+            "Устаревшее управление пользователями",
+        ),
+    );
+    context.insert(
+        "legacy_user_management_help",
+        &ui(
+            "For compatibility. Use Governance for roles, sessions, reports, recovery, and audit.",
+            "为兼容保留。角色、会话、举报、回收和审计请使用治理后台。",
+            "Для совместимости. Роли, сессии, жалобы, восстановление и аудит находятся в модерации.",
+        ),
+    );
     context.insert(
         "site_name_value",
         configs
@@ -1986,12 +2801,57 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
             .unwrap_or("0.02"),
     );
     context.insert(
+        "reports_enabled",
+        &(configs
+            .get("reports_enabled")
+            .map(String::as_str)
+            .unwrap_or("1")
+            == "1"),
+    );
+    context.insert(
+        "registration_pow_enabled",
+        &(configs
+            .get("registration_pow_enabled")
+            .map(String::as_str)
+            .unwrap_or("1")
+            == "1"),
+    );
+    context.insert(
+        "registration_invite_enabled",
+        &(configs
+            .get("registration_invite_enabled")
+            .map(String::as_str)
+            .unwrap_or("1")
+            == "1"),
+    );
+    for key in [
+        "registration_captcha_enabled",
+        "login_pow_enabled",
+        "login_captcha_enabled",
+        "post_pow_enabled",
+        "post_captcha_enabled",
+    ] {
+        context.insert(
+            key,
+            &(configs
+                .get(key)
+                .map(String::as_str)
+                .unwrap_or(if key.contains("pow") { "1" } else { "0" })
+                == "1"),
+        );
+    }
+    context.insert(
         "registration_mode",
         configs
             .get("registration_mode")
             .map(String::as_str)
             .unwrap_or("invite"),
     );
+    let difficulty = configs
+        .get("captcha_difficulty")
+        .map(String::as_str)
+        .unwrap_or("low");
+    context.insert("captcha_difficulty", &difficulty);
     let rendered_invites: Vec<_> = invites
         .iter()
         .map(|invite| serde_json::json!({"code": invite.code, "used_by": invite.used_by}))
@@ -2005,6 +2865,66 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
     let render_boards:Vec<_>=boards.iter().map(|b|serde_json::json!({"id":b.id,"slug":b.slug,"name":b.name,"description":b.description,"allow_anonymous":b.allow_anonymous,"guest_readable":b.guest_readable,"allow_anonymous_label":ui(if b.allow_anonymous{"Yes"}else{"No"},if b.allow_anonymous{"是"}else{"否"},if b.allow_anonymous{"Да"}else{"Нет"}),"guest_readable_label":ui(if b.guest_readable{"Yes"}else{"No"},if b.guest_readable{"是"}else{"否"},if b.guest_readable{"Да"}else{"Нет"})})).collect();
     context.insert("boards", &render_boards);
     for (key, value) in [
+        (
+            "configuration_kicker",
+            ui("Configuration", "配置", "Конфигурация"),
+        ),
+        (
+            "settings_sections_label",
+            ui("Settings sections", "设置栏目", "Разделы настроек"),
+        ),
+        (
+            "verification_policy_label",
+            ui("Verification policy", "验证策略", "Политика проверки"),
+        ),
+        (
+            "reports_enabled_label",
+            ui("Enable reports", "启用举报", "Включить жалобы"),
+        ),
+        ("register_label", ui("Registration", "注册", "Регистрация")),
+        ("login_label", ui("Login", "登录", "Вход")),
+        (
+            "posting_label",
+            ui("Posting and replies", "发帖和回帖", "Публикации и ответы"),
+        ),
+        (
+            "image_captcha_label",
+            ui("Image CAPTCHA", "图片验证码", "Графическая CAPTCHA"),
+        ),
+        (
+            "combined_verification_help",
+            ui(
+                "When multiple checks are enabled for an entry point, all must pass. CAPTCHAs are generated locally, expire after five minutes, and may be used once.",
+                "同一入口启用多项验证时，必须全部通过。验证码为本地生成，五分钟有效且仅可使用一次。",
+                "Если для точки входа включено несколько проверок, должны пройти все. CAPTCHA создаётся локально, действует пять минут и используется один раз.",
+            ),
+        ),
+        (
+            "save_policy_label",
+            ui("Save policy", "保存策略", "Сохранить политику"),
+        ),
+        (
+            "captcha_difficulty_label",
+            ui("CAPTCHA difficulty", "验证码难度", "Сложность CAPTCHA"),
+        ),
+        ("captcha_difficulty_low", ui("Low", "低", "Низкая")),
+        (
+            "captcha_difficulty_medium",
+            ui("Medium", "中", "Средняя"),
+        ),
+        ("captcha_difficulty_high", ui("High", "高", "Высокая")),
+        (
+            "captcha_difficulty_help",
+            ui(
+                "Higher levels add more characters and visual interference.",
+                "难度越高，字符越多、干扰越强。",
+                "Высокий уровень добавляет символы и помехи.",
+            ),
+        ),
+        (
+            "administrator_label",
+            ui("Administrator", "管理员", "Администратор"),
+        ),
         (
             "admin_label",
             ui("Administration", "管理后台", "Администрирование"),
@@ -2146,7 +3066,7 @@ async fn admin(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespon
     ] {
         context.insert(key, &value);
     }
-    let content = crate::templates::render_page("admin", &context)
+    let content = crate::templates::render_page("admin_settings", &context)
         .expect("embedded admin template must render");
     let full = layout_html(
         &ui("Administration", "管理后台", "Администрирование"),
@@ -2192,7 +3112,7 @@ async fn admin_site(
     }
     let ok = s.store.set_config("site_name", &name).await.is_ok();
     audit_admin(&s, &headers, "config.site", Some("config"), None, ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn admin_announcement(
@@ -2229,7 +3149,7 @@ async fn admin_announcement(
         ok,
     )
     .await;
-    apply_sec(Redirect::to("/admin").into_response())
+    apply_sec(Redirect::to("/admin/settings").into_response())
 }
 async fn admin_pow(
     State(s): State<AppState>,
@@ -2264,9 +3184,46 @@ async fn admin_pow(
         ok &= s.store.set_config(k, &val).await.is_ok();
     }
     audit_admin(&s, &headers, "config.pow", Some("config"), None, ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
+async fn admin_policies(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !require_form_security(&headers, &form) || require_admin_state(&s, &headers).await.is_none()
+    {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let ok = s
+        .store
+        .set_registration_policies(
+            form.contains_key("reports_enabled"),
+            form.contains_key("registration_pow_enabled"),
+            form.contains_key("registration_invite_enabled"),
+            form.contains_key("registration_captcha_enabled"),
+            form.contains_key("login_pow_enabled"),
+            form.contains_key("login_captcha_enabled"),
+            form.contains_key("post_pow_enabled"),
+            form.contains_key("post_captcha_enabled"),
+        )
+        .await
+        .is_ok();
+    let difficulty = match form.get("captcha_difficulty").map(String::as_str) {
+        Some("medium") => "medium",
+        Some("high") => "high",
+        _ => "low",
+    };
+    let ok = ok
+        && s.store
+            .set_config("captcha_difficulty", difficulty)
+            .await
+            .is_ok();
+    audit_admin(&s, &headers, "config.policies", Some("config"), None, ok).await;
+    apply_sec(Redirect::to("/admin/settings").into_response())
+}
+
 async fn admin_regmode(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2296,7 +3253,7 @@ async fn admin_regmode(
         ok,
     )
     .await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn admin_locale(
@@ -2317,7 +3274,7 @@ async fn admin_locale(
     let ok = crate::i18n::I18n::supported().contains(&locale)
         && s.store.set_config("default_locale", locale).await.is_ok();
     audit_admin(&s, &headers, "config.locale", Some("config"), None, ok).await;
-    apply_sec(Redirect::to("/admin").into_response())
+    apply_sec(Redirect::to("/admin/settings").into_response())
 }
 async fn board_create(
     State(s): State<AppState>,
@@ -2360,11 +3317,15 @@ async fn board_create(
         .create_board(&slug, &name, &desc, allow_anon, guest_readable)
         .await
     {
-        let resp = (StatusCode::BAD_REQUEST, format!("{}", e)).into_response();
-        return apply_sec(resp);
+        return internal_error_response(
+            StatusCode::BAD_REQUEST,
+            "board creation",
+            e,
+            "unable to create board",
+        );
     }
     audit_admin(&s, &headers, "board.create", Some("board"), None, true).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn board_update(
@@ -2413,7 +3374,7 @@ async fn board_update(
         .await
         .is_ok();
     audit_admin(&s, &headers, "board.update", Some("board"), Some(id), ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn board_delete(
@@ -2431,7 +3392,7 @@ async fn board_delete(
     }
     let ok = s.store.delete_board(id).await.is_ok();
     audit_admin(&s, &headers, "board.delete", Some("board"), Some(id), ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn invite_create(
@@ -2452,7 +3413,7 @@ async fn invite_create(
     let code = random_code(12);
     let ok = s.store.create_invite(&code, user.id).await.is_ok();
     audit_admin(&s, &headers, "invite.create", Some("invite"), None, ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn invite_delete(
@@ -2470,7 +3431,7 @@ async fn invite_delete(
     }
     let ok = s.store.delete_invite(&code).await.is_ok();
     audit_admin(&s, &headers, "invite.delete", Some("invite"), None, ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn ban(
@@ -2489,7 +3450,7 @@ async fn ban(
     let ok = s.store.set_user_banned(id, true).await.is_ok()
         && s.store.delete_sessions_by_user(id).await.is_ok();
     audit_admin(&s, &headers, "user.ban", Some("user"), Some(id), ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn unban(
@@ -2507,7 +3468,7 @@ async fn unban(
     }
     let ok = s.store.set_user_banned(id, false).await.is_ok();
     audit_admin(&s, &headers, "user.unban", Some("user"), Some(id), ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 async fn pin(
@@ -2519,11 +3480,18 @@ async fn pin(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    if require_admin_state(&s, &headers).await.is_none() {
+    let thread = s.store.get_thread(id).await.unwrap_or(None);
+    let allowed = match thread.as_ref() {
+        Some(thread) => require_board_moderator(&s, &headers, thread.board_id)
+            .await
+            .is_some(),
+        None => false,
+    };
+    if !allowed {
         let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
         return apply_sec(resp);
     }
-    if let Some(th) = s.store.get_thread(id).await.unwrap_or(None) {
+    if let Some(th) = thread {
         let ok = s.store.set_thread_pinned(id, !th.is_pinned).await.is_ok();
         audit_admin(&s, &headers, "thread.pin", Some("thread"), Some(id), ok).await;
     }
@@ -2539,11 +3507,18 @@ async fn lock(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    if require_admin_state(&s, &headers).await.is_none() {
+    let thread = s.store.get_thread(id).await.unwrap_or(None);
+    let allowed = match thread.as_ref() {
+        Some(thread) => require_board_moderator(&s, &headers, thread.board_id)
+            .await
+            .is_some(),
+        None => false,
+    };
+    if !allowed {
         let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
         return apply_sec(resp);
     }
-    if let Some(th) = s.store.get_thread(id).await.unwrap_or(None) {
+    if let Some(th) = thread {
         let ok = s.store.set_thread_locked(id, !th.is_locked).await.is_ok();
         audit_admin(&s, &headers, "thread.lock", Some("thread"), Some(id), ok).await;
     }
@@ -2559,12 +3534,37 @@ async fn thread_delete(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    if require_admin_state(&s, &headers).await.is_none() {
+    let user = match current_user(&s, &headers).await {
+        Some(user) => user,
+        None => {
+            return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+        }
+    };
+    let thread = match s.store.get_thread(id).await.unwrap_or(None) {
+        Some(thread) => thread,
+        None => return apply_sec((StatusCode::NOT_FOUND, "thread not found").into_response()),
+    };
+    if require_board_moderator(&s, &headers, thread.board_id)
+        .await
+        .is_none()
+    {
         let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
         return apply_sec(resp);
     }
-    let ok = s.store.delete_thread(id).await.is_ok();
-    audit_admin(&s, &headers, "thread.delete", Some("thread"), Some(id), ok).await;
+    let ok = s
+        .store
+        .soft_delete_thread(id, Some(user.id))
+        .await
+        .unwrap_or(false);
+    audit_admin(
+        &s,
+        &headers,
+        "thread.soft_delete",
+        Some("thread"),
+        Some(id),
+        ok,
+    )
+    .await;
     let resp = Redirect::to("/").into_response();
     apply_sec(resp)
 }
@@ -2577,13 +3577,30 @@ async fn post_delete(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    if require_admin_state(&s, &headers).await.is_none() {
+    let user = match current_user(&s, &headers).await {
+        Some(user) => user,
+        None => {
+            return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+        }
+    };
+    let post = match s.store.get_post(id).await.unwrap_or(None) {
+        Some(post) => post,
+        None => return apply_sec((StatusCode::NOT_FOUND, "post not found").into_response()),
+    };
+    if require_board_moderator(&s, &headers, post.board_id)
+        .await
+        .is_none()
+    {
         let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
         return apply_sec(resp);
     }
-    let ok = s.store.delete_post(id).await.is_ok();
-    audit_admin(&s, &headers, "post.delete", Some("post"), Some(id), ok).await;
-    let resp = Redirect::to("/admin").into_response();
+    let ok = s
+        .store
+        .soft_delete_post(id, Some(user.id))
+        .await
+        .unwrap_or(false);
+    audit_admin(&s, &headers, "post.soft_delete", Some("post"), Some(id), ok).await;
+    let resp = Redirect::to(&format!("/t/{}", post.thread_id)).into_response();
     apply_sec(resp)
 }
 async fn change_password(
@@ -2630,8 +3647,12 @@ async fn change_password(
     let hash = match hash_result {
         Ok(h) => h,
         Err(e) => {
-            let resp = (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response();
-            return apply_sec(resp);
+            return internal_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "password update",
+                e,
+                "password update temporarily unavailable",
+            );
         }
     };
     let ok = s.store.update_password(user.id, &hash).await.is_ok();
@@ -2644,7 +3665,7 @@ async fn change_password(
         ok,
     )
     .await;
-    let resp = Redirect::to("/admin").into_response();
+    let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }
 fn random_code(n: usize) -> String {
