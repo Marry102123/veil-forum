@@ -25,7 +25,7 @@ captcha = "1.0.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
-governor = "0.6"
+governor = "0.10"
 tera = "1.19"
 tower = { version = "0.4", features = ["limit", "util"] }
 tower-http = { version = "0.5", features = ["trace", "fs", "limit"] }
