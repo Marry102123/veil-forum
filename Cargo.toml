@@ -18,7 +18,7 @@ sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio
 comrak = { version = "0.22", features = [] }
 ammonia = "4"
 argon2 = "0.5"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 rand = "0.8"
 captcha = "1.0.0"
