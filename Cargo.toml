@@ -14,7 +14,7 @@ external-go-interop = []
 [dependencies]
 axum = { version = "0.7", features = ["macros","form"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
 comrak = { version = "0.22", features = [] }
 ammonia = "4"
 argon2 = "0.5"
