@@ -57,7 +57,7 @@ jobs:
         if: matrix.target != 'powerpc64le-unknown-linux-gnu'
         with:
           version: 0.14.0
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2
         if: matrix.target != 'powerpc64le-unknown-linux-gnu'
         with:
           tool: cargo-zigbuild
