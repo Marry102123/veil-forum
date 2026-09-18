@@ -1,10 +1,10 @@
-use comrak::{markdown_to_html, ComrakOptions};
+use comrak::{markdown_to_html, Options};
 use regex::Regex;
 
 pub fn render(md: &str) -> String {
     let re_img = Regex::new(r"(?s)!\[[^\]]*\]\([^)]*\)").unwrap();
     let clean = re_img.replace_all(md, "");
-    let mut opts = ComrakOptions::default();
+    let mut opts = Options::default();
     opts.extension.table = true;
     opts.extension.strikethrough = true;
     let html = markdown_to_html(&clean, &opts);

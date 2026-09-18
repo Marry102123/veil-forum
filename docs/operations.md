@@ -14,7 +14,7 @@ sudo -u postgres createdb -O veil-forum veil_forum
 ```
 
 The service user and the database role must share a name, because the default
-connection string `postgres:///veil_forum?host=/var/run/postgresql` relies on
+connection string `postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum` relies on
 peer authentication.
 
 Recommended hardening in `postgresql.conf`:
@@ -38,8 +38,8 @@ superuser is needed at runtime.
 Use the included maintenance script while the service is running:
 
 ```bash
-sudo scripts/db-maintenance.sh check  postgres:///veil_forum?host=/var/run/postgresql
-sudo scripts/db-maintenance.sh backup postgres:///veil_forum?host=/var/run/postgresql \
+sudo scripts/db-maintenance.sh check  postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum
+sudo scripts/db-maintenance.sh backup postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum \
                                     /srv/veil-forum-backups
 ```
 
@@ -130,36 +130,31 @@ Operational notes:
 
 ## Upgrading from the SQLite backend
 
-Releases before `0.1.0-alpha.18` stored data in a SQLite file. Those
-installations must be imported once:
+Releases up to `0.1.0-alpha.17` stored data in a SQLite file. `0.1.0-alpha.18`
+shipped `veil-forum-import` for that one migration and the importer has since
+been removed, so an installation that is still on SQLite has to import once with
+the alpha.18 archive:
 
 ```bash
 # 1. Stop the old service and keep the file untouched.
 sudo systemctl stop veil-forum
 sudo -u postgres createdb -O veil-forum veil_forum
 
-# 2. Copy the SQLite file somewhere readable and import it.
-sudo -u veil-forum /usr/local/bin/veil-forum-import \
+# 2. Import with the alpha.18 binary (still in the v0.1.0-alpha.18 release).
+sudo -u veil-forum ./veil-forum-import \
   --sqlite /var/lib/veil-forum/forum.db \
-  --database-url postgres:///veil_forum?host=/var/run/postgresql
+  --database-url postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum
 
-# 3. Install the new release and start it.
+# 3. Install the current release and start it.
 sudo systemctl start veil-forum
 ```
 
-The importer opens the SQLite file read-only, copies every table with its
-original identifiers in foreign-key order, converts all historical timestamp
-formats to `TIMESTAMPTZ`, restores owner roles for administrator accounts,
-advances the identity sequences, and prints a per-table row-count reconciliation
-that must match. It refuses to write into a database that already holds forum
-data unless `--force` is passed, which deletes the existing rows first.
-`--dry-run` reports what would be copied without writing anything.
-Session rows are skipped by default; add `--include-sessions` to carry active
-logins across.
-
-Keep the SQLite file until the new deployment has been verified, then archive it
-somewhere encrypted or delete it: it contains password hashes and deleted
-content.
+The importer opened the SQLite file read-only, copied every table with its
+original identifiers in foreign-key order, converted all historical timestamp
+formats to `TIMESTAMPTZ`, restored owner roles for administrator accounts,
+advanced the identity sequences, and printed a per-table row-count
+reconciliation that had to match. The whole import ran in one transaction, so a
+malformed legacy row rolled back rather than leaving a half-filled database.
 
 ## Governance roles and recovery
 

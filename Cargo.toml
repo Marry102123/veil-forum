@@ -8,37 +8,27 @@ description = "Experimental privacy-oriented forum for Tor and I2P deployments"
 repository = "https://github.com/Marry102123/veil-forum"
 readme = "README.md"
 
-[features]
-# The one-shot SQLite importer is the only target that links the SQLite driver.
-# The server binary and library talk to PostgreSQL exclusively.
-sqlite-import = ["sqlx/sqlite"]
-
-[[bin]]
-name = "veil-forum-import"
-path = "src/importer.rs"
-required-features = ["sqlite-import"]
-
 [dependencies]
-axum = { version = "0.7", features = ["macros","form"] }
+axum = { version = "0.8", features = ["macros", "form"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
-comrak = { version = "0.22", default-features = false }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
+comrak = { version = "0.55", default-features = false }
 ammonia = "4"
-argon2 = "0.5"
-hmac = "0.12"
-sha2 = "0.10"
-rand = "0.8"
+argon2 = "0.6"
+hmac = "0.13"
+sha2 = "0.11"
+rand = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
 governor = "0.10"
-tera = "1.19"
+tera = "2"
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.7", features = ["trace", "fs", "limit"] }
 serde_json = "1"
 regex = "1"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 
 rust-i18n = "4"
 anyhow = "1"

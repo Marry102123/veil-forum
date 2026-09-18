@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+**Breaking for operators:** the PostgreSQL connection string must now carry a
+user and a non-empty host. The Unix-socket form changed from
+`postgres:///veil_forum?host=/var/run/postgresql` to
+`postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum`. The systemd unit,
+the OpenRC script, the maintenance and backup scripts, the defaults and the docs
+all use the new form. Password hashes are unaffected: the PHC string that argon2
+writes is unchanged, so existing accounts keep working.
+
+- Remove the one-shot SQLite importer (`veil-forum-import`) and the
+  `sqlite-import` feature; the migration is done and the SQLite driver no longer
+  belongs in the build. An installation still on SQLite should import once with
+  the `veil-forum-import` binary from the `v0.1.0-alpha.18` release and then
+  install a later one.
+- Upgrade the dependency tree: axum 0.8, sqlx 0.9, tera 2, comrak 0.55, argon2
+  0.6, rand 0.10, hmac 0.13, sha2 0.11, base64 0.23, plus semver-compatible
+  updates throughout.
+  - Routes use axum 0.8's `{parameter}` syntax.
+  - Tera 2 resolves includes while parsing, so the embedded templates are
+    registered in one batch, and the removed `urlencode` filter is gone: board
+    slugs are validated server-side against the URL-safe set instead of being
+    escaped at render time.
+  - sqlx 0.9 rejects dynamically built SQL strings, so the two statements that
+    assemble a compile-time constant now say so explicitly with
+    `AssertSqlSafe`.
+
 ## 0.1.0-alpha.18
 
 **Breaking:** the storage backend is PostgreSQL only. SQLite support and the

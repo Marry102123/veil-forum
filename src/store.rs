@@ -317,7 +317,7 @@ impl Store {
     /// values.
     ///
     /// `database_url` is a libpq-style URL such as
-    /// `postgres:///veil_forum?host=/var/run/postgresql`. The socket form with
+    /// `postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum`. The socket form with
     /// peer authentication is recommended: the database never listens on the
     /// network and no password is stored in configuration or the environment.
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
@@ -1028,7 +1028,11 @@ impl Store {
         // matches everything. Backslash is PostgreSQL's default LIKE escape.
         let pattern = format!("%{}%", escape_like_pattern(q));
         let total =
-            sqlx::query_scalar::<_, i64>(&format!("{SEARCH_MATCHES} SELECT COUNT(*) FROM matches"))
+            // The statement is a compile-time constant plus bind parameters, so it is
+        // safe to hand to sqlx as-is.
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "{SEARCH_MATCHES} SELECT COUNT(*) FROM matches"
+        )))
                 .bind(include_private_boards)
                 .bind(&pattern)
                 .fetch_one(&self.pool)
@@ -1051,7 +1055,8 @@ impl Store {
                  ORDER BY GREATEST(similarity(th.title,$3), similarity(p.content_md,$3)) DESC, p.id DESC \
                  LIMIT $4 OFFSET $5"
             );
-            sqlx::query(&sql)
+            // Same here: `SEARCH_MATCHES` is a constant and every value is bound.
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(include_private_boards)
                 .bind(&pattern)
                 .bind(q)
@@ -1377,9 +1382,9 @@ impl Store {
 
     // ---- sessions (merged from r03) ----
     pub async fn create_session(&self, user_id: i64) -> anyhow::Result<String> {
-        use rand::RngCore;
+        use rand::Rng;
         let mut b = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut b);
+        rand::rng().fill_bytes(&mut b);
         let id = hex::encode(b);
         let now = Utc::now();
         let exp = now + chrono::Duration::hours(30 * 24);
@@ -1656,9 +1661,9 @@ impl Store {
 
     /// Start the window between the password step and the second factor.
     pub async fn create_pending_login(&self, user_id: i64) -> anyhow::Result<String> {
-        use rand::RngCore;
+        use rand::Rng;
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let id = hex::encode(bytes);
         let now = Utc::now();
         let expires = now + chrono::Duration::seconds(PENDING_LOGIN_TTL_SECONDS);
@@ -1778,8 +1783,8 @@ mod tests {
             ("postgres://u:***@h/db", "postgres://u:***@h/db"),
             // No credential at all is left alone, including lookalike keys.
             (
-                "postgres:///veil_forum?host=/var/run/postgresql",
-                "postgres:///veil_forum?host=/var/run/postgresql",
+                "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum",
+                "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum",
             ),
             ("host=h mypassword=x user=u", "host=h mypassword=x user=u"),
         ] {
