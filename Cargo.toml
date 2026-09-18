@@ -1,6 +1,6 @@
 [package]
 name = "veil-forum"
-version = "0.1.0-alpha.17"
+version = "0.1.0-alpha.18"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
@@ -9,19 +9,25 @@ repository = "https://github.com/Marry102123/veil-forum"
 readme = "README.md"
 
 [features]
-external-go-interop = []
+# The one-shot SQLite importer is the only target that links the SQLite driver.
+# The server binary and library talk to PostgreSQL exclusively.
+sqlite-import = ["sqlx/sqlite"]
+
+[[bin]]
+name = "veil-forum-import"
+path = "src/importer.rs"
+required-features = ["sqlite-import"]
 
 [dependencies]
 axum = { version = "0.7", features = ["macros","form"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
-comrak = { version = "0.22", features = [] }
+sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
+comrak = { version = "0.22", default-features = false }
 ammonia = "4"
 argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
-captcha = "1.0.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
@@ -36,3 +42,4 @@ base64 = "0.22"
 
 rust-i18n = "4"
 anyhow = "1"
+captcha = "1.0.0"

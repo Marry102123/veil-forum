@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="{{ locale }}" data-theme="{{ theme }}">
+<html lang="{{ locale }}" data-theme="{{ theme }}" data-palette="{{ palette }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -24,12 +24,9 @@
 </aside>
 <main>{{ content | safe }}</main>
 <aside class="side">
-<div class="card announcement-card"><b>{{ announcement_label }}</b><div class="announcement-body">{{ announcement_body | safe }}</div></div>
-<div class="card display-card"><b>{{ display_label }}</b><button id="theme-toggle" type="button" aria-label="{{ display_label }}" style="display:none">☼</button><span class="noscript-themes"><a class="theme-choice" href="/theme?to=light" aria-label="{{ light_label }}">☼ {{ light_label }}</a><a class="theme-choice" href="/theme?to=dark" aria-label="{{ dark_label }}">☾ {{ dark_label }}</a></span></div>
-<div class="card"><b>{{ stats_label }}</b><div class="muted" style="margin-top:6px;font-size:11.5px;line-height:1.6">PoW {{ pow_minutes }} min<br>{{ threads_label }} {{ stats_threads }} · {{ replies_label }} {{ stats_posts }}<br>{{ users_label }} {{ stats_users }}</div></div>
-<div class="card"><b>{{ recent_label }}</b><div style="margin-top:4px">{% include "partials/recent.html" %}</div></div>
+{% for panel in sidebar_panels %}{% if panel == "announcement" and sidebar_announcement_enabled %}<div class="card announcement-card"><b>{{ announcement_label }}</b><div class="announcement-body">{{ announcement_body | safe }}</div></div>{% elif panel == "display" and sidebar_display_enabled %}<div class="card display-card"><b>{{ display_label }}</b><button id="theme-toggle" type="button" aria-label="{{ display_label }}" style="display:none">☼</button><span class="noscript-themes"><a class="theme-choice" href="/theme?to=light" aria-label="{{ light_label }}">☼ {{ light_label }}</a><a class="theme-choice" href="/theme?to=dark" aria-label="{{ dark_label }}">☾ {{ dark_label }}</a></span></div>{% elif panel == "stats" and sidebar_stats_enabled %}<div class="card"><b>{{ stats_label }}</b><div class="muted" style="margin-top:6px;font-size:11.5px;line-height:1.6">PoW {{ pow_minutes }} min<br>{{ threads_label }} {{ stats_threads }} · {{ replies_label }} {{ stats_posts }}<br>{{ users_label }} {{ stats_users }}</div></div>{% elif panel == "recent" and sidebar_recent_enabled %}<div class="card"><b>{{ recent_label }}</b><div style="margin-top:4px">{% include "partials/recent.html" %}</div></div>{% elif panel == "links" and friend_links | length > 0 %}<div class="card"><b>{{ friend_links_label }}</b><ul class="friend-links">{% for link in friend_links %}<li><a href="{{ link.url }}" rel="nofollow noopener noreferrer">{{ link.name }}</a></li>{% endfor %}</ul></div>{% elif panel == "ads" and sidebar_ads_enabled %}<div class="card"><b>{{ ads_label }}</b><div class="sidebar-ads">{{ ads_body | safe }}</div></div>{% endif %}{% endfor %}
 </aside>
 </div>
-<footer><span>{{ footer_text }}</span><span class="foot-right">{{ loopback_label }} · <a href="https://github.com/Marry102123/veil-forum">Source</a></span></footer>
+<footer><span>{{ footer_text }}</span><span class="foot-right">{{ loopback_label }} · <a href="https://github.com/Marry102123/veil-forum">Source: veil-forum</a></span></footer>
 </body>
 </html>

@@ -85,10 +85,11 @@ fn render_long_article(input: &str) -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let db = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "./data/forum.db".into());
-    let store = Store::open(&db).await?;
+    let database_url = std::env::args().nth(1).unwrap_or_else(|| {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres:///veil_forum?host=/var/run/postgresql".to_string())
+    });
+    let store = Store::connect(&database_url).await?;
     let board = store
         .get_board_by_slug("general")
         .await?
@@ -96,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let author_names = ["alice", "researcher", "bob"];
 
     for (idx, (title, author_name, body)) in ARTICLES.iter().enumerate() {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM threads WHERE title = ?")
+        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM threads WHERE title = $1")
             .bind(*title)
             .fetch_one(&store.pool)
             .await?;

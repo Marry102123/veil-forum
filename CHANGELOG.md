@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.0-alpha.18
+
+**Breaking:** the storage backend is PostgreSQL only. SQLite support and the
+shared-database interop with the earlier Go implementation are removed, so an
+existing installation must be imported once with `veil-forum-import`.
+
+- Replace SQLite with PostgreSQL: a single embedded baseline schema, native
+  `BOOLEAN` flags, `TIMESTAMPTZ` columns, `BIGINT` identity keys, `RETURNING id`
+  instead of `last_insert_rowid()`, and `ON CONFLICT` upserts.
+- Move migrations to `sqlx::migrate!`: applied under a PostgreSQL advisory lock,
+  transactional, and checksum-verified. The `migrations/` directory is embedded
+  in the binary, so a release no longer has to ship it alongside.
+- Replace FTS5 search with `pg_trgm`: `ILIKE` matching over GIN trigram indexes
+  on `threads.title` and `posts.content_md`, ranked with `similarity()`. Wildcard
+  characters in a query are escaped and now match literally. The result set is
+  unchanged; the order is relevance-based rather than `rank`-based.
+- Collapse the per-search `COUNT(*)` and page query into one round trip with
+  `COUNT(*) OVER ()`.
+- Replace `--data <path>` with `--database-url <dsn>` (also read from
+  `DATABASE_URL`), defaulting to `postgres:///veil_forum?host=/var/run/postgresql`
+  so the database uses a local Unix socket and peer authentication. Passwords in
+  a connection string are redacted from every error message and log line.
+- Add `veil-forum-import`, a one-shot SQLite to PostgreSQL importer that copies
+  every table with its original identifiers, converts all historical timestamp
+  formats, restores owner roles for administrators, advances identity sequences,
+  and prints a per-table row-count reconciliation. `--dry-run` reports without
+  writing; a database that already contains forum data requires `--force`.
+- Connection handling now retries the initial connection for five seconds, so a
+  service that starts alongside PostgreSQL still comes up, and the pool size is
+  16 rather than 1.
+- `/healthz` reports the real database state again: `SELECT 1` returns `int4` in
+  PostgreSQL, so the previous `int8` decode reported the database unavailable.
+- Fix a non-terminating loop in the connection-string redaction helper for URLs
+  carrying `password=` as a query parameter.
+- Deployment: the systemd unit requires `postgresql.service`, drops the data
+  directory, and connects over socket; `scripts/db-maintenance.sh` and
+  `scripts/backup.sh` use `pg_dump --format=custom` with `pg_restore --list`
+  verification; the CI suite runs against a PostgreSQL service container.- Fix seven leftover integer bindings against boolean columns introduced by the
+  port, which affected banning, thread pinning and locking, board updates, and
+  the audit log writer.
+
+
 ## 0.1.0-alpha.17
 
 - Let administrators configure the forum footer from System settings, with a localised privacy default when blank. The required Source link to veil-forum remains fixed and cannot be removed.

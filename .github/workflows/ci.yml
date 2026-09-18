@@ -7,6 +7,22 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # Tests and the startup smoke test talk to a real PostgreSQL server.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: veil_forum_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/veil_forum_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
@@ -15,7 +31,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo test --all-targets
+      - name: Run tests against PostgreSQL
+        run: cargo test --all-targets
+      - name: Build and test the SQLite importer
+        run: cargo test --features sqlite-import --bin veil-forum-import
       - run: cargo clippy --all-targets
       - run: cargo build --release
       - name: Run shell script smoke tests
@@ -69,12 +88,19 @@ jobs:
           if [ "${{ matrix.target }}" = "powerpc64le-unknown-linux-gnu" ]; then
             CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
               cargo build --release --target ${{ matrix.target }}
+            CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
+              cargo build --release --target ${{ matrix.target }} \
+              --features sqlite-import --bin veil-forum-import
           else
             cargo zigbuild --release --target ${{ matrix.target }}
+            # The one-shot SQLite importer is the only target that links SQLite.
+            cargo zigbuild --release --target ${{ matrix.target }} \
+              --features sqlite-import --bin veil-forum-import
           fi
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
           cp target/${{ matrix.target }}/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
+          cp target/${{ matrix.target }}/release/veil-forum-import package/veil-forum-${GITHUB_REF_NAME}/
           cp -r static locales migrations deploy docs LICENSE README.md CHANGELOG.md SECURITY.md package/veil-forum-${GITHUB_REF_NAME}/
           tar -czf veil-forum-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz -C package veil-forum-${GITHUB_REF_NAME}
       - name: Verify release archive and ELF target
@@ -95,6 +121,7 @@ jobs:
           esac
           readelf -h "$binary" | grep -F "$expected"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/veil-forum"
+          tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/veil-forum-import"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/deploy/veil-forum.service"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/static/style.css"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

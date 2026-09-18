@@ -1,8 +1,10 @@
 //! Integration tests for moderation persistence and visibility semantics.
+use sqlx::PgPool;
 use veil_forum::store::{Role, Store};
 
-async fn fixture() -> anyhow::Result<(Store, i64, i64, i64)> {
-    let store = Store::open(":memory:").await?;
+async fn fixture(pool: PgPool) -> anyhow::Result<(Store, i64, i64, i64)> {
+    let store = Store { pool };
+    store.seed_defaults().await?;
     let alice = store.create_user("alice", "hash", false).await?;
     let bob = store.create_user("bob", "hash", false).await?;
     let board = store
@@ -11,9 +13,9 @@ async fn fixture() -> anyhow::Result<(Store, i64, i64, i64)> {
     Ok((store, board, alice, bob))
 }
 
-#[tokio::test]
-async fn roles_are_idempotent_and_reversible() -> anyhow::Result<()> {
-    let (store, board, alice, bob) = fixture().await?;
+#[sqlx::test]
+async fn roles_are_idempotent_and_reversible(pool: PgPool) -> anyhow::Result<()> {
+    let (store, board, alice, bob) = fixture(pool).await?;
     assert!(!store.user_has_role(alice, Role::Moderator).await?);
     store.grant_role(alice, Role::Moderator, Some(bob)).await?;
     store.grant_role(alice, Role::Moderator, Some(bob)).await?;
@@ -27,9 +29,9 @@ async fn roles_are_idempotent_and_reversible() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn board_moderator_scope_does_not_grant_other_boards() -> anyhow::Result<()> {
-    let (store, board, alice, bob) = fixture().await?;
+#[sqlx::test]
+async fn board_moderator_scope_does_not_grant_other_boards(pool: PgPool) -> anyhow::Result<()> {
+    let (store, board, alice, bob) = fixture(pool).await?;
     let other = store
         .create_board("other", "Other", "test", true, true)
         .await?;
@@ -45,9 +47,9 @@ async fn board_moderator_scope_does_not_grant_other_boards() -> anyhow::Result<(
     Ok(())
 }
 
-#[tokio::test]
-async fn reports_validate_targets_filter_and_resolve_once() -> anyhow::Result<()> {
-    let (store, _board, alice, bob) = fixture().await?;
+#[sqlx::test]
+async fn reports_validate_targets_filter_and_resolve_once(pool: PgPool) -> anyhow::Result<()> {
+    let (store, _board, alice, bob) = fixture(pool).await?;
     let id = store.create_report(Some(alice), "post", 42, "spam").await?;
     store.create_report(None, "thread", 7, "abuse").await?;
     assert!(store
@@ -73,9 +75,9 @@ async fn reports_validate_targets_filter_and_resolve_once() -> anyhow::Result<()
     Ok(())
 }
 
-#[tokio::test]
-async fn soft_delete_hides_data_but_restore_recovers_it() -> anyhow::Result<()> {
-    let (store, board, alice, _bob) = fixture().await?;
+#[sqlx::test]
+async fn soft_delete_hides_data_but_restore_recovers_it(pool: PgPool) -> anyhow::Result<()> {
+    let (store, board, alice, _bob) = fixture(pool).await?;
     let thread = store
         .create_thread(board, alice, "hello", "body", "<p>body</p>", false)
         .await?;

@@ -4,18 +4,20 @@ all-features = true
 
 [advisories]
 version = 2
-ignore = [
-  "RUSTSEC-2023-0071",
-  "RUSTSEC-2024-0320",
-  "RUSTSEC-2025-0141",
-  "RUSTSEC-2025-0081",
-  "RUSTSEC-2025-0075",
-  "RUSTSEC-2025-0080",
-  "RUSTSEC-2025-0079",
-  "RUSTSEC-2025-0074",
-  "RUSTSEC-2025-0104",
-  "RUSTSEC-2025-0098",
-]
+# No advisories are ignored here: with `all-features = true` cargo-deny resolves
+# the graph of the features this crate actually enables, and nothing flagged is
+# reachable from it. The previous list was retired piece by piece:
+#   * yaml-rust and bincode: removed by turning Comrak's default features off, so
+#     its unused CLI and syntax-highlighting stack is not built;
+#   * the seven `unic-*` entries: never present in the lockfile at all, so they
+#     were over-ignored rather than needed;
+#   * rsa (RUSTSEC-2023-0071) is still *declared* by the unused `sqlx-mysql`
+#     entry in Cargo.lock. It is not built, because sqlx is used with
+#     `default-features = false` and only the `postgres` feature, which is why
+#     cargo-deny is clean here. `cargo audit` scans the lockfile instead of the
+#     feature graph and so still needs `--ignore RUSTSEC-2023-0071`; the
+#     limitation is recorded in CHANGELOG.md.
+ignore = []
 
 [licenses]
 version = 2
