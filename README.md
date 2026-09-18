@@ -14,6 +14,9 @@ experimental deployment, not as a guarantee of anonymity or production security.
 - **Safe content:** sanitized Markdown, no remote images, and restrictive CSP.
 - **Accounts:** open, invite-only, or closed registration, Argon2id passwords,
   expiring sessions, CSRF and Origin checks.
+- **Two-step verification:** optional TOTP (RFC 6238) per account, with inline
+  SVG enrolment QR codes, one-time recovery codes, single-use codes, and
+  administrator policy switches for staff-only or site-wide enforcement.
 - **Abuse controls:** independently configurable PoW and self-hosted image
   CAPTCHA for registration, login, and posting.
 - **Administration:** board and invite management, configurable site/footer

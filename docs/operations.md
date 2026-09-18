@@ -93,7 +93,42 @@ Migrations are embedded in the binary and applied during startup under a
 PostgreSQL advisory lock, so two instances starting at once cannot interleave
 schema changes. Each migration runs in a transaction, which means PostgreSQL
 rolls it back completely if the process is interrupted. Do not run tests against
-the production database.## Upgrading from the SQLite backend
+the production database.
+
+## Two-step verification (TOTP)
+
+Members can enable a second factor from `/account`: the page shows a QR code
+(inline SVG, so no script and no external request) and the base32 secret for
+manual entry. Enrolment only becomes active after the member proves they can
+read a code from it.
+
+Administrators configure the feature in **System settings**:
+
+- **Offer TOTP to members** turns the whole feature on or off.
+- **Require it from** is `nobody (optional)`, `staff only`, or `everyone`. A
+  required policy never blocks signing in: a member without a second factor is
+  simply shown a page pointing at their account page until they enrol.
+
+Recovery codes are issued once at enrolment and can be reissued from the
+account page after confirming the password. They are stored as SHA-256 hashes
+and each one works once. There is no email address, so recovery codes and an
+owner-side reset are the only ways to recover an account.
+
+Operational notes:
+
+- The **server clock** decides whether a code is accepted, with one 30 second
+  step of tolerance. Keep the host synchronised; drift beyond that rejects valid
+  codes.
+- Users need a roughly correct clock on their own device too.
+- A code is accepted only once. Signing in twice inside the same 30 second
+  window is refused with "that code was already used"; the next code works.
+- TOTP secrets are stored as bearer credentials, like every mainstream forum.
+  A database dump is enough to generate codes, so keep backups encrypted and
+  remove the factor from accounts you no longer trust.
+- Disabling the feature site-wide leaves existing secrets in place but stops
+  asking for codes; they are used again if you turn it back on.
+
+## Upgrading from the SQLite backend
 
 Releases before `0.1.0-alpha.18` stored data in a SQLite file. Those
 installations must be imported once:

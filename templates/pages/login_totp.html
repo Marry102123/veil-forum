@@ -1,0 +1,10 @@
+<h2>{{ totp_login_title }}</h2>
+{{ error_html | safe }}
+<p class="muted">{{ totp_login_intro }}</p>
+<form method="POST" action="/login/totp" style="max-width:420px">
+{{ csrf_field | safe }}
+<input type="hidden" name="pending_id" value="{{ pending_id }}">
+<input name="code" placeholder="{{ totp_code_label }}" aria-label="{{ totp_code_label }}" required autocomplete="one-time-code" autocapitalize="off" spellcheck="false" style="width:100%;margin:5px 0">
+<button class="btn-primary" style="width:100%;margin-top:6px">{{ totp_submit_label }}</button>
+</form>
+<p style="font-size:12.5px"><a href="/login">{{ totp_back_label }}</a></p>

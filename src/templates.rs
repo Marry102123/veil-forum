@@ -60,6 +60,16 @@ fn templates() -> &'static Tera {
         )
         .expect("embedded login template must be valid");
         tera.add_raw_template(
+            "pages/login_totp.html",
+            include_str!("../templates/pages/login_totp.html"),
+        )
+        .expect("embedded second step template must be valid");
+        tera.add_raw_template(
+            "pages/account.html",
+            include_str!("../templates/pages/account.html"),
+        )
+        .expect("embedded account page template must be valid");
+        tera.add_raw_template(
             "pages/admin.html",
             include_str!("../templates/pages/admin.html"),
         )
