@@ -5,8 +5,8 @@
 use captcha::filters::{Dots, Noise};
 use captcha::Captcha;
 use chrono::Utc;
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
 use sha2::Sha256;
 use std::{
     collections::HashMap,
@@ -99,7 +99,7 @@ impl Default for Manager {
 impl Manager {
     pub fn new() -> Self {
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         Self {
             key,
             challenges: Arc::new(Mutex::new(HashMap::new())),
@@ -109,7 +109,7 @@ impl Manager {
     pub fn generate(&self, scope: crate::pow::Scope, difficulty: Difficulty) -> Challenge {
         let (answer, image_base64) = render_challenge(difficulty);
         let mut raw_id = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut raw_id);
+        rand::rng().fill_bytes(&mut raw_id);
         let id = hex::encode(raw_id);
         let expires_at = Utc::now().timestamp() + TTL_SECONDS;
         let scope = scope.as_str().to_string();

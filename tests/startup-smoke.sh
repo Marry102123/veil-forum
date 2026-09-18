@@ -4,7 +4,7 @@
 # Requires psql/createdb and a reachable server. The scratch database is created
 # and dropped by this script, so it never touches a real installation.
 #
-#   DATABASE_URL=postgres:///veil_forum_test?host=/var/run/postgresql tests/startup-smoke.sh
+#   DATABASE_URL=postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test tests/startup-smoke.sh
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -12,10 +12,10 @@ if [ ! -x "$ROOT/target/release/veil-forum" ]; then
   cargo build --release --manifest-path "$ROOT/Cargo.toml"
 fi
 
-DATABASE_URL="${DATABASE_URL:-postgres:///veil_forum_test?host=/var/run/postgresql}"
+DATABASE_URL="${DATABASE_URL:-postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test}"
 # Split the URL into the part before the query string and the query string
 # itself, then swap only the database name for a scratch one. Splitting this way
-# avoids rewriting the socket directory in `?host=/var/run/postgresql`.
+# leaves the socket host (url-encoded in the authority) untouched.
 case "$DATABASE_URL" in
   *\?*) URL_BASE=${DATABASE_URL%%\?*}; URL_QUERY="?${DATABASE_URL#*\?}" ;;
   *) URL_BASE=$DATABASE_URL; URL_QUERY="" ;;

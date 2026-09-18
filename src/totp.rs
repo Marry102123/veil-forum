@@ -18,7 +18,7 @@
 //!     verified at login time.
 
 use anyhow::Context;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use totp_rs::{Algorithm, Builder, Secret, Totp};
 
@@ -67,7 +67,7 @@ fn build(secret_base32: &str, account: &str, issuer: &str) -> anyhow::Result<Tot
 /// A fresh base32 shared secret for enrolment.
 pub fn generate_secret() -> String {
     let mut bytes = [0u8; SECRET_BYTES];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     Secret::new(bytes.to_vec().into_boxed_slice()).to_base32()
 }
 
@@ -133,7 +133,7 @@ pub fn generate_recovery_codes() -> Vec<String> {
     (0..RECOVERY_CODE_COUNT)
         .map(|_| {
             let mut bytes = [0u8; RECOVERY_CODE_BYTES];
-            rand::thread_rng().fill_bytes(&mut bytes);
+            rand::rng().fill_bytes(&mut bytes);
             let encoded = hex::encode(bytes);
             encoded
                 .as_bytes()

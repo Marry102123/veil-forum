@@ -4,7 +4,7 @@ use veil_forum::{auth, handler, pow, rate_limit, store};
 /// Default connection string. The Unix socket form with peer authentication is
 /// deliberate: PostgreSQL stays off the network and no password is stored in
 /// configuration, the environment, or the unit file.
-const DEFAULT_DATABASE_URL: &str = "postgres:///veil_forum?host=/var/run/postgresql";
+const DEFAULT_DATABASE_URL: &str = "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             other => anyhow::bail!(
                 "unknown argument {other:?}; usage: veil-forum [--addr HOST:PORT] \
-                 [--database-url postgres:///veil_forum?host=/var/run/postgresql]"
+                 [--database-url postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum]"
             ),
         }
     }

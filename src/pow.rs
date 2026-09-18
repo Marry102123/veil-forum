@@ -1,6 +1,6 @@
 use chrono::Utc;
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,7 @@ pub fn minutes_to_difficulty(m: f64) -> u32 {
 impl Manager {
     pub fn new(store: crate::store::Store) -> Self {
         let mut k = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut k);
+        rand::rng().fill_bytes(&mut k);
         Self {
             hmac_key: k,
             used: Arc::new(Mutex::new(HashMap::new())),
@@ -88,9 +88,9 @@ impl Manager {
     pub async fn generate(&self, scope: Scope) -> Challenge {
         let diff = self.get_difficulty(&scope).await;
         let mut rb = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut rb);
+        rand::rng().fill_bytes(&mut rb);
         let mut sb = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut sb);
+        rand::rng().fill_bytes(&mut sb);
         let ch = hex::encode(rb);
         let salt = hex::encode(sb);
         let exp = Utc::now().timestamp() + 300;

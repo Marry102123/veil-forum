@@ -6,7 +6,7 @@
 #   db-maintenance.sh backup [DATABASE_URL] [BACKUP_DIR]
 #
 # Defaults:
-#   DATABASE_URL=$DATABASE_URL or postgres:///veil_forum?host=/var/run/postgresql
+#   DATABASE_URL=$DATABASE_URL or postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum
 #   BACKUP_DIR=/srv/veil-forum-backups
 #
 # Requires pg_dump and pg_restore. `pg_amcheck` is used for the check when it is
@@ -31,7 +31,7 @@ command -v pg_restore >/dev/null 2>&1 || {
 }
 
 MODE="${1:-}"
-DATABASE_URL="${2:-${DATABASE_URL:-postgres:///veil_forum?host=/var/run/postgresql}}"
+DATABASE_URL="${2:-${DATABASE_URL:-postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum}}"
 BACKUP_DIR="${3:-/srv/veil-forum-backups}"
 RETAIN="${VEIL_BACKUP_RETAIN:-30}"
 case "$RETAIN" in

@@ -4,7 +4,7 @@
 //! It exercises randomized Unicode, punctuation, and malformed PoW values and
 //! asserts that parser and search boundaries return safely without panicking.
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use sqlx::PgPool;
 use veil_forum::{markdown, pow, store::Store};
 
@@ -23,9 +23,9 @@ fn hostile_inputs() -> Vec<String> {
         "中".repeat(2_048),
     ];
     for _ in 0..256 {
-        let len = rng.gen_range(0..512);
+        let len = rng.random_range(0..512);
         let value = (0..len)
-            .map(|_| alphabet[rng.gen_range(0..alphabet.len())])
+            .map(|_| alphabet[rng.random_range(0..alphabet.len())])
             .collect();
         inputs.push(value);
     }

@@ -84,7 +84,7 @@ Set a unique 12-128 character administrator password only for the first start:
 VEIL_ADMIN_PASSWORD='replace-with-a-long-random-password' \
   ./target/release/veil-forum \
   --addr 127.0.0.1:8001 \
-  --database-url 'postgres:///veil_forum?host=/var/run/postgresql'
+  --database-url 'postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum'
 ```
 
 `--database-url` defaults to that local socket URL and can also be supplied

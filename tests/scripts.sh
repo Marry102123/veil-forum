@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 BACKUPS="$TMP/backups"
-URL='postgres:///veil_forum?host=/var/run/postgresql'
+URL='postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum'
 
 # Minimal pg_dump/pg_restore/psql stand-ins: exercise the scripts without a live
 # server. They model the exact statements db-maintenance.sh issues.

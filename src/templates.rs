@@ -7,90 +7,77 @@ fn templates() -> &'static Tera {
     static TEMPLATES: OnceLock<Tera> = OnceLock::new();
     TEMPLATES.get_or_init(|| {
         let mut tera = Tera::default();
-        tera.add_raw_template("layout.html", include_str!("../templates/layout.html"))
-            .expect("embedded layout template must be valid");
-        tera.add_raw_template(
-            "partials/pow_fallback.html",
-            include_str!("../templates/partials/pow_fallback.html"),
-        )
-        .expect("embedded PoW fallback template must be valid");
-        tera.add_raw_template(
-            "partials/account.html",
-            include_str!("../templates/partials/account.html"),
-        )
-        .expect("embedded account template must be valid");
-        tera.add_raw_template(
-            "partials/boards.html",
-            include_str!("../templates/partials/boards.html"),
-        )
-        .expect("embedded boards template must be valid");
-        tera.add_raw_template(
-            "partials/recent.html",
-            include_str!("../templates/partials/recent.html"),
-        )
-        .expect("embedded recent template must be valid");
-        tera.add_raw_template(
-            "pages/home.html",
-            include_str!("../templates/pages/home.html"),
-        )
-        .expect("embedded home template must be valid");
-        tera.add_raw_template(
-            "pages/board.html",
-            include_str!("../templates/pages/board.html"),
-        )
-        .expect("embedded board template must be valid");
-        tera.add_raw_template(
-            "pages/thread.html",
-            include_str!("../templates/pages/thread.html"),
-        )
-        .expect("embedded thread template must be valid");
-        tera.add_raw_template(
-            "pages/search.html",
-            include_str!("../templates/pages/search.html"),
-        )
-        .expect("embedded search template must be valid");
-        tera.add_raw_template(
-            "pages/register.html",
-            include_str!("../templates/pages/register.html"),
-        )
-        .expect("embedded register template must be valid");
-        tera.add_raw_template(
-            "pages/login.html",
-            include_str!("../templates/pages/login.html"),
-        )
-        .expect("embedded login template must be valid");
-        tera.add_raw_template(
-            "pages/login_totp.html",
-            include_str!("../templates/pages/login_totp.html"),
-        )
-        .expect("embedded second step template must be valid");
-        tera.add_raw_template(
-            "pages/account.html",
-            include_str!("../templates/pages/account.html"),
-        )
-        .expect("embedded account page template must be valid");
-        tera.add_raw_template(
-            "pages/admin.html",
-            include_str!("../templates/pages/admin.html"),
-        )
-        .expect("embedded admin template must be valid");
-        tera.add_raw_template(
-            "pages/admin_settings.html",
-            include_str!("../templates/pages/admin_settings.html"),
-        )
-        .expect("embedded admin settings template must be valid");
-        tera.add_raw_template(
-            "pages/governance.html",
-            include_str!("../templates/pages/governance.html"),
-        )
-        .expect("embedded governance template must be valid");
-        // Keep the pagination include optional for older deployments, while
-        // embedding it when present so page templates are self-contained.
-        tera.add_raw_template(
-            "pages/_pagination.html",
-            include_str!("../templates/pages/_pagination.html"),
-        )
-        .expect("embedded pagination template must be valid");
+        // Register every template in one call: Tera 2 resolves includes while
+        // parsing, so a partial must be present in the same batch as its parent.
+        let embedded: Vec<(&str, &str)> = vec![
+            ("layout.html", include_str!("../templates/layout.html")),
+            (
+                "partials/pow_fallback.html",
+                include_str!("../templates/partials/pow_fallback.html"),
+            ),
+            (
+                "partials/account.html",
+                include_str!("../templates/partials/account.html"),
+            ),
+            (
+                "partials/boards.html",
+                include_str!("../templates/partials/boards.html"),
+            ),
+            (
+                "partials/recent.html",
+                include_str!("../templates/partials/recent.html"),
+            ),
+            (
+                "pages/home.html",
+                include_str!("../templates/pages/home.html"),
+            ),
+            (
+                "pages/board.html",
+                include_str!("../templates/pages/board.html"),
+            ),
+            (
+                "pages/thread.html",
+                include_str!("../templates/pages/thread.html"),
+            ),
+            (
+                "pages/search.html",
+                include_str!("../templates/pages/search.html"),
+            ),
+            (
+                "pages/register.html",
+                include_str!("../templates/pages/register.html"),
+            ),
+            (
+                "pages/login.html",
+                include_str!("../templates/pages/login.html"),
+            ),
+            (
+                "pages/login_totp.html",
+                include_str!("../templates/pages/login_totp.html"),
+            ),
+            (
+                "pages/account.html",
+                include_str!("../templates/pages/account.html"),
+            ),
+            (
+                "pages/admin.html",
+                include_str!("../templates/pages/admin.html"),
+            ),
+            (
+                "pages/admin_settings.html",
+                include_str!("../templates/pages/admin_settings.html"),
+            ),
+            (
+                "pages/governance.html",
+                include_str!("../templates/pages/governance.html"),
+            ),
+            (
+                "pages/_pagination.html",
+                include_str!("../templates/pages/_pagination.html"),
+            ),
+        ];
+        tera.add_raw_templates(embedded)
+            .expect("embedded templates must be valid");
         tera
     })
 }

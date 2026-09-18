@@ -9,8 +9,8 @@ use axum::{
     Router,
 };
 use axum_extra::extract::cookie::Cookie;
-use hmac::Mac;
-use rand::RngCore;
+use hmac::{KeyInit, Mac};
+use rand::Rng;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,7 +64,7 @@ fn csrf_key() -> &'static [u8; 32] {
     static KEY: OnceLock<[u8; 32]> = OnceLock::new();
     KEY.get_or_init(|| {
         let mut k = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut k);
+        rand::rng().fill_bytes(&mut k);
         k
     })
 }
@@ -84,7 +84,7 @@ pub(crate) fn session_id(headers: &HeaderMap) -> Option<String> {
 fn csrf_token(headers: &HeaderMap) -> String {
     let session = session_id(headers).unwrap_or_else(|| "anonymous".to_string());
     let mut nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let nonce_hex = hex::encode(nonce);
     let mut mac =
         hmac::Hmac::<sha2::Sha256>::new_from_slice(csrf_key()).expect("fixed-size HMAC key");
@@ -879,9 +879,9 @@ pub fn routes(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/pow/challenge", get(pow_challenge))
         .route("/theme", get(theme_toggle))
-        .route("/static/*path", get(handle_static))
-        .route("/b/:slug", get(board))
-        .route("/t/:id", get(thread))
+        .route("/static/{*path}", get(handle_static))
+        .route("/b/{slug}", get(board))
+        .route("/t/{id}", get(thread))
         .route("/search", get(search))
         .route("/register", get(register_get).post(register_post))
         .route("/login", get(login_get).post(login_post))
@@ -905,8 +905,8 @@ pub fn routes(state: AppState) -> Router {
             get(account::login_totp_get).post(account::login_totp_post),
         )
         .route("/admin/config/totp", post(account::admin_config_totp))
-        .route("/b/:slug/new", post(new_thread))
-        .route("/t/:id/reply", post(reply))
+        .route("/b/{slug}/new", post(new_thread))
+        .route("/t/{id}/reply", post(reply))
         .route("/admin", get(admin_hub))
         .route("/admin/settings", get(admin_settings))
         .route("/admin/config/site", post(admin_site))
@@ -921,16 +921,16 @@ pub fn routes(state: AppState) -> Router {
         .route("/admin/config/policies", post(admin_policies))
         .route("/admin/config/locale", post(admin_locale))
         .route("/admin/board/create", post(board_create))
-        .route("/admin/board/:id/update", post(board_update))
-        .route("/admin/board/:id/delete", post(board_delete))
+        .route("/admin/board/{id}/update", post(board_update))
+        .route("/admin/board/{id}/delete", post(board_delete))
         .route("/admin/invite/create", post(invite_create))
-        .route("/admin/invite/:code/delete", post(invite_delete))
-        .route("/admin/user/:id/ban", post(ban))
-        .route("/admin/user/:id/unban", post(unban))
-        .route("/admin/thread/:id/pin", post(pin))
-        .route("/admin/thread/:id/lock", post(lock))
-        .route("/admin/thread/:id/delete", post(thread_delete))
-        .route("/admin/post/:id/delete", post(post_delete))
+        .route("/admin/invite/{code}/delete", post(invite_delete))
+        .route("/admin/user/{id}/ban", post(ban))
+        .route("/admin/user/{id}/unban", post(unban))
+        .route("/admin/thread/{id}/pin", post(pin))
+        .route("/admin/thread/{id}/lock", post(lock))
+        .route("/admin/thread/{id}/delete", post(thread_delete))
+        .route("/admin/post/{id}/delete", post(post_delete))
         .route("/admin/change-password", post(change_password))
         .route("/governance", get(governance))
         .route("/governance/reports", get(governance))
@@ -938,17 +938,17 @@ pub fn routes(state: AppState) -> Router {
         .route("/governance/users", get(governance))
         .route("/governance/trash", get(governance))
         .route("/governance/sessions", get(governance))
-        .route("/governance/report/:id/resolve", post(resolve_report))
-        .route("/governance/report/:id/dismiss", post(dismiss_report))
-        .route("/governance/user/:id/role", post(change_role))
-        .route("/governance/thread/:id/restore", post(restore_thread))
-        .route("/governance/post/:id/restore", post(restore_post))
+        .route("/governance/report/{id}/resolve", post(resolve_report))
+        .route("/governance/report/{id}/dismiss", post(dismiss_report))
+        .route("/governance/user/{id}/role", post(change_role))
+        .route("/governance/thread/{id}/restore", post(restore_thread))
+        .route("/governance/post/{id}/restore", post(restore_post))
         .route(
-            "/governance/user/:id/sessions/revoke",
+            "/governance/user/{id}/sessions/revoke",
             post(revoke_user_sessions),
         )
-        .route("/report/thread/:id", post(report_thread))
-        .route("/report/post/:id", post(report_post))
+        .route("/report/thread/{id}", post(report_thread))
+        .route("/report/post/{id}", post(report_post))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
         .layer(axum_middleware::from_fn(
             crate::handler::middleware::theme_query_cookie,
@@ -3271,7 +3271,7 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
     for panel in ["announcement", "display", "stats", "recent", "ads"] {
         let key = format!("sidebar_{panel}_enabled");
         context.insert(
-            &key,
+            key.clone(),
             &(configs.get(&key).map(String::as_str).unwrap_or("1") == "1"),
         );
     }
@@ -4020,6 +4020,21 @@ async fn board_create(
         let resp = (StatusCode::BAD_REQUEST, "slug and name required").into_response();
         return apply_sec(resp);
     }
+    // A slug is used verbatim in `/b/<slug>` links, so the server enforces the
+    // URL-safe set instead of trusting the form's `pattern` attribute.
+    if slug.len() < 2
+        || slug.len() > 20
+        || !slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        let resp = (
+            StatusCode::BAD_REQUEST,
+            "slug must be 2-20 characters of a-z, 0-9, _ or -",
+        )
+            .into_response();
+        return apply_sec(resp);
+    }
     if let Err(e) = s
         .store
         .create_board(&slug, &name, &desc, allow_anon, guest_readable)
@@ -4416,8 +4431,8 @@ async fn change_password(
 fn random_code(n: usize) -> String {
     const LETTERS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rb = vec![0u8; n];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut rb);
+    use rand::Rng;
+    rand::rng().fill_bytes(&mut rb);
     let mut out = Vec::with_capacity(n);
     for v in rb {
         out.push(LETTERS[(v as usize) % LETTERS.len()]);

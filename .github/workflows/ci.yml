@@ -33,8 +33,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Run tests against PostgreSQL
         run: cargo test --all-targets
-      - name: Build and test the SQLite importer
-        run: cargo test --features sqlite-import --bin veil-forum-import
       - run: cargo clippy --all-targets
       - run: cargo build --release
       - name: Run shell script smoke tests
@@ -76,7 +74,7 @@ jobs:
         if: matrix.target != 'powerpc64le-unknown-linux-gnu'
         with:
           version: 0.14.0
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
         if: matrix.target != 'powerpc64le-unknown-linux-gnu'
         with:
           tool: cargo-zigbuild
@@ -89,18 +87,13 @@ jobs:
             CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
               cargo build --release --target ${{ matrix.target }}
             CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
-              cargo build --release --target ${{ matrix.target }} \
-              --features sqlite-import --bin veil-forum-import
+              cargo build --release --target ${{ matrix.target }}
           else
             cargo zigbuild --release --target ${{ matrix.target }}
-            # The one-shot SQLite importer is the only target that links SQLite.
-            cargo zigbuild --release --target ${{ matrix.target }} \
-              --features sqlite-import --bin veil-forum-import
           fi
       - run: |
           mkdir -p package/veil-forum-${GITHUB_REF_NAME}
           cp target/${{ matrix.target }}/release/veil-forum package/veil-forum-${GITHUB_REF_NAME}/
-          cp target/${{ matrix.target }}/release/veil-forum-import package/veil-forum-${GITHUB_REF_NAME}/
           cp -r static locales migrations deploy docs LICENSE README.md CHANGELOG.md SECURITY.md package/veil-forum-${GITHUB_REF_NAME}/
           tar -czf veil-forum-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz -C package veil-forum-${GITHUB_REF_NAME}
       - name: Verify release archive and ELF target
@@ -121,7 +114,6 @@ jobs:
           esac
           readelf -h "$binary" | grep -F "$expected"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/veil-forum"
-          tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/veil-forum-import"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/deploy/veil-forum.service"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/static/style.css"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

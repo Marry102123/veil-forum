@@ -3,7 +3,7 @@
 name="veil-forum"
 description="veil-forum experimental Tor/I2P forum"
 command="/usr/local/bin/veil-forum"
-command_args="--addr 127.0.0.1:8001 --database-url postgres:///veil_forum?host=/var/run/postgresql"
+command_args="--addr 127.0.0.1:8001 --database-url postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum"
 command_user="veil-forum:veil-forum"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"

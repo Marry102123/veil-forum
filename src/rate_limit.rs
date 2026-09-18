@@ -1,6 +1,6 @@
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
 use sha2::Sha256;
 use std::{num::NonZeroU32, sync::Arc};
 
@@ -19,7 +19,7 @@ pub struct Limits {
 impl Limits {
     pub fn new() -> Self {
         let mut key = [0; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         Self {
             // Login and registration already require PoW. These global limits
             // bound concurrent abuse without creating client fingerprints.

@@ -86,8 +86,9 @@ fn render_long_article(input: &str) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let database_url = std::env::args().nth(1).unwrap_or_else(|| {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres:///veil_forum?host=/var/run/postgresql".to_string())
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum".to_string()
+        })
     });
     let store = Store::connect(&database_url).await?;
     let board = store
