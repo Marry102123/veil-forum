@@ -37,10 +37,58 @@ existing installation must be imported once with `veil-forum-import`.
 - Deployment: the systemd unit requires `postgresql.service`, drops the data
   directory, and connects over socket; `scripts/db-maintenance.sh` and
   `scripts/backup.sh` use `pg_dump --format=custom` with `pg_restore --list`
-  verification; the CI suite runs against a PostgreSQL service container.- Fix seven leftover integer bindings against boolean columns introduced by the
-  port, which affected banning, thread pinning and locking, board updates, and
-  the audit log writer.
+  verification; the CI suite runs against a PostgreSQL service container.
 
+- Add an optional TOTP second factor (RFC 6238) with an account page: change
+  password, enrol or disable a second factor, reissue recovery codes, and review
+  or revoke other sessions. Enrolment is confirmed with a code before it becomes
+  active, the QR code is inline SVG so the no-JavaScript pages need no script or
+  external image, and secrets are stored base32 like every mainstream forum.
+- The password step no longer creates a session when a second factor is active:
+  a short-lived pending login is created instead, codes are single use per time
+  step, failed attempts are capped at five, and every outcome is audited.
+- Add one-time recovery codes (ten, SHA-256 hashed, shown once) and make session
+  revocation part of account management.
+- Add administrator settings for the feature and its policy (`nobody`, `staff
+  only`, or `everyone`). A required policy never blocks signing in; members
+  without a factor are pointed at the account page instead.
+- Fix seven leftover integer bindings against boolean columns found while adding
+  the feature, which affected banning, thread pinning and locking, board updates,
+  and the audit log writer.
+
+- Security review follow-ups, each with a regression test:
+
+  - The second-factor enforcement gate and the request handlers now read the
+    session cookie with the same parser. A crafted `Cookie: session_id= <id>`
+    used to look like a guest to the gate and like a member to the handler,
+    which bypassed a required second factor.
+  - Enrolling a second factor costs the current password, and switching it on or
+    off revokes every other session. A stolen session can no longer bind a
+    secret its owner cannot read, or outlive the change.
+  - A time step is claimed with one conditional
+    `UPDATE ... WHERE totp_last_step < $1`, so a concurrent second login cannot
+    spend the same code and a late write cannot reopen a used window.
+  - A failed read of the second-factor state now fails closed on the login and
+    disable paths instead of falling through to a password-only login.
+  - `redact_database_url` covers every connection-string form sqlx accepts,
+    including the keyword/value form and passwords containing `@`; the startup
+    smoke test asserts that a password never reaches the log.
+  - The SQLite importer runs inside a single transaction. A malformed legacy row
+    rolls the whole import back instead of leaving a truncated, half-populated
+    database.
+  - The backup directory is created mode 0700 regardless of the caller's umask,
+    and `VEIL_BACKUP_RETAIN=0`, an empty value, or a non-numeric value no longer
+    deletes every archive.
+  - `--addr` is resolved before the loopback guard, so a hostname cannot bind a
+    non-loopback interface while skipping the check, and every connection
+    attempt is bounded so startup cannot outlast the service manager's timeout.
+  - A thread or reply whose board row cannot be read is refused rather than
+    served without the private-board check, and unmatched paths now carry the
+    security headers.
+  - Restore the alphanumeric CAPTCHA. The interim arithmetic challenge drew two
+    small operands, an answer space of about twenty that a script defeats within
+    its five attempts, and it needed system font libraries that the static musl
+    release targets cannot link.
 
 ## 0.1.0-alpha.17
 

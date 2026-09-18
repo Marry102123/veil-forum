@@ -1,3 +1,4 @@
+pub mod account;
 pub mod middleware;
 use axum::middleware as axum_middleware;
 use axum::{
@@ -885,6 +886,25 @@ pub fn routes(state: AppState) -> Router {
         .route("/register", get(register_get).post(register_post))
         .route("/login", get(login_get).post(login_post))
         .route("/logout", post(logout))
+        .route("/account", get(account::account_get))
+        .route("/account/password", post(account::account_password))
+        .route("/account/totp/setup", post(account::account_totp_setup))
+        .route("/account/totp/confirm", post(account::account_totp_confirm))
+        .route("/account/totp/cancel", post(account::account_totp_cancel))
+        .route("/account/totp/disable", post(account::account_totp_disable))
+        .route(
+            "/account/recovery",
+            post(account::account_recovery_regenerate),
+        )
+        .route(
+            "/account/sessions/revoke",
+            post(account::account_sessions_revoke),
+        )
+        .route(
+            "/login/totp",
+            get(account::login_totp_get).post(account::login_totp_post),
+        )
+        .route("/admin/config/totp", post(account::admin_config_totp))
         .route("/b/:slug/new", post(new_thread))
         .route("/t/:id/reply", post(reply))
         .route("/admin", get(admin_hub))
@@ -936,6 +956,10 @@ pub fn routes(state: AppState) -> Router {
         .layer(axum_middleware::from_fn_with_state(
             state.store.clone(),
             crate::handler::middleware::maintenance_gate,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.store.clone(),
+            crate::handler::middleware::totp_gate,
         ))
         .fallback(not_found)
         .with_state(state)
@@ -2129,43 +2153,42 @@ async fn login_post(
                 .into_response(),
         );
     }
-    complete_login(&s, &u, &headers).await
-}
-
-/// Create the session for a verified password step and set its cookie.
-async fn complete_login(
-    state: &AppState,
-    user: &crate::store::User,
-    headers: &HeaderMap,
-) -> Response {
-    let _ = state.store.delete_sessions_by_user(user.id).await;
-    let sid = match state.store.create_session(user.id).await {
-        Ok(sid) => sid,
-        Err(_) => {
-            return apply_sec(
-                (StatusCode::INTERNAL_SERVER_ERROR, "session creation failed").into_response(),
-            )
+    // With a second factor enabled, the password step only opens a short-lived
+    // window for it: the session is created after the code checks out.
+    if account::feature_enabled(&s.store).await {
+        // Fail closed. A storage error must never turn a second-factor login
+        // into a password-only login.
+        let state = match s.store.totp_state(u.id).await {
+            Ok(state) => state,
+            Err(_) => {
+                return apply_sec(
+                    (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable").into_response(),
+                )
+            }
+        };
+        if state.is_active() {
+            let pending_id = match s.store.create_pending_login(u.id).await {
+                Ok(id) => id,
+                Err(_) => {
+                    return apply_sec(
+                        (StatusCode::INTERNAL_SERVER_ERROR, "login state failed").into_response(),
+                    )
+                }
+            };
+            let _ = s
+                .store
+                .audit(
+                    Some(u.id),
+                    "login.password_step",
+                    Some("user"),
+                    Some(u.id),
+                    true,
+                )
+                .await;
+            return apply_sec(Redirect::to(&format!("/login/totp?p={pending_id}")).into_response());
         }
-    };
-    let mut resp = Redirect::to("/").into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        session_cookie(&sid, 12 * 3600, state.secure_session_cookie)
-            .parse()
-            .unwrap(),
-    );
-    let _ = state
-        .store
-        .audit(
-            Some(user.id),
-            "login.succeeded",
-            Some("user"),
-            Some(user.id),
-            true,
-        )
-        .await;
-    let _ = headers;
-    apply_sec(resp)
+    }
+    account::complete_login(&s, &u, &headers).await
 }
 async fn logout(
     State(s): State<AppState>,
@@ -3073,6 +3096,48 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
     let (sboards, pow_min, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
         sidebar_data(&s.store).await;
     let mut context = Context::new();
+    context.insert(
+        "totp_enabled",
+        &(configs.get("totp_enabled").map(String::as_str) != Some("0")),
+    );
+    context.insert("totp_required", &account::policy(&s.store).await);
+    context.insert(
+        "totp_section_label",
+        &ui("Two-step verification", "二步验证", "Двухшаговая проверка"),
+    );
+    context.insert(
+        "totp_feature_label",
+        &ui(
+            "Offer TOTP to members",
+            "向成员提供动态口令",
+            "Предлагать TOTP участникам",
+        ),
+    );
+    context.insert(
+        "totp_policy_label",
+        &ui("Require it from", "强制要求范围", "Требовать от"),
+    );
+    context.insert(
+        "totp_policy_none",
+        &ui(
+            "nobody (optional)",
+            "无人（可选）",
+            "никого (необязательно)",
+        ),
+    );
+    context.insert(
+        "totp_policy_staff",
+        &ui("staff only", "仅员工", "только персонал"),
+    );
+    context.insert("totp_policy_all", &ui("everyone", "全体成员", "всех"));
+    context.insert(
+        "totp_policy_help",
+        &ui(
+            "A required policy still lets members sign in; they are only asked to set up a second factor before using the rest of the forum.",
+            "选择强制后，成员仍可登录，但在完成绑定前只能访问账号页。",
+            "При обязательной политике участники могут войти, но до настройки второго фактора им доступна только страница аккаунта.",
+        ),
+    );
     context.insert("version_label", &ui("Version", "版本", "Версия"));
     context.insert("version", env!("CARGO_PKG_VERSION"));
     context.insert("csrf_field", &csrf_field(&headers));

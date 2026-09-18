@@ -1,0 +1,99 @@
+<h2>{{ account_title }}</h2>
+<p class="muted">{{ account_intro }}</p>
+{{ notice_html | safe }}
+
+<section class="card" style="margin-bottom:14px">
+<h3>{{ profile_title }}</h3>
+<dl class="account-facts">
+<dt>{{ username_label }}</dt><dd>{{ username }}</dd>
+<dt>{{ created_label }}</dt><dd>{{ created_at }}</dd>
+<dt>{{ roles_label }}</dt><dd>{{ roles }}</dd>
+</dl>
+</section>
+
+{% if totp_feature %}
+<section class="card" style="margin-bottom:14px">
+<h3>{{ totp_title }}</h3>
+<p class="muted">{{ totp_intro }}</p>
+
+{% if recovery_codes %}
+<p><strong>{{ recovery_intro }}</strong></p>
+<ul class="recovery-codes">{% for code in recovery_codes %}<li><code>{{ code }}</code></li>{% endfor %}</ul>
+{% endif %}
+
+{% if totp_active %}
+<p>{{ totp_active_note }}</p>
+<dl class="account-facts">
+<dt>{{ totp_activated_label }}</dt><dd>{{ totp_activated_at }}</dd>
+<dt>{{ recovery_remaining_label }}</dt><dd>{{ recovery_remaining }}</dd>
+</dl>
+<form method="POST" action="/account/recovery" style="max-width:420px;margin-bottom:10px">
+{{ csrf_field | safe }}
+<p class="muted">{{ recovery_regenerate_intro }}</p>
+<input name="password" type="password" placeholder="{{ old_password_label }}" aria-label="{{ old_password_label }}" required style="width:100%;margin:5px 0">
+<button class="btn" style="width:100%">{{ recovery_regenerate_label }}</button>
+</form>
+<form method="POST" action="/account/totp/disable" style="max-width:420px">
+{{ csrf_field | safe }}
+<p class="muted">{{ totp_disable_intro }}</p>
+<input name="password" type="password" placeholder="{{ old_password_label }}" aria-label="{{ old_password_label }}" required style="width:100%;margin:5px 0">
+<input name="code" placeholder="{{ totp_code_label }}" aria-label="{{ totp_code_label }}" required autocomplete="one-time-code" style="width:100%;margin:5px 0">
+<button class="btn" style="width:100%">{{ totp_disable_label }}</button>
+</form>
+
+{% elif totp_pending %}
+<p class="muted">{{ totp_scan_intro }}</p>
+<div class="totp-qr">{{ qr_svg | safe }}</div>
+<dl class="account-facts">
+<dt>{{ totp_manual_label }}</dt><dd><code>{{ pending_secret }}</code></dd>
+<dt>otpauth</dt><dd><code style="word-break:break-all">{{ otpauth_url }}</code></dd>
+</dl>
+<form method="POST" action="/account/totp/confirm" style="max-width:420px;margin-bottom:10px">
+{{ csrf_field | safe }}
+<p class="muted">{{ totp_confirm_intro }}</p>
+<input name="code" placeholder="{{ totp_code_label }}" aria-label="{{ totp_code_label }}" required autocomplete="one-time-code" inputmode="numeric" style="width:100%;margin:5px 0">
+<button class="btn-primary" style="width:100%">{{ totp_confirm_label }}</button>
+</form>
+<form method="POST" action="/account/totp/cancel" style="max-width:420px">
+{{ csrf_field | safe }}
+<button class="btn-sm">{{ totp_cancel_label }}</button>
+</form>
+
+{% else %}
+<p class="muted">{{ totp_disabled_note }}</p>
+<form method="POST" action="/account/totp/setup" style="max-width:420px">
+{{ csrf_field | safe }}
+<input name="password" type="password" placeholder="{{ old_password_label }}" aria-label="{{ old_password_label }}" required style="width:100%;margin:5px 0">
+<button class="btn-primary">{{ totp_enable_label }}</button>
+</form>
+{% endif %}
+</section>
+{% endif %}
+
+<section class="card" style="margin-bottom:14px">
+<h3>{{ password_title }}</h3>
+<form method="POST" action="/account/password" style="max-width:420px">
+{{ csrf_field | safe }}
+<input name="old_password" type="password" placeholder="{{ old_password_label }}" aria-label="{{ old_password_label }}" required autocomplete="current-password" style="width:100%;margin:5px 0">
+<input name="new_password" type="password" placeholder="{{ new_password_label }}" aria-label="{{ new_password_label }}" required minlength="6" maxlength="72" autocomplete="new-password" style="width:100%;margin:5px 0">
+<input name="repeat_password" type="password" placeholder="{{ repeat_password_label }}" aria-label="{{ repeat_password_label }}" required minlength="6" maxlength="72" autocomplete="new-password" style="width:100%;margin:5px 0">
+<button class="btn-primary" style="width:100%">{{ save_label }}</button>
+</form>
+</section>
+
+<section class="card">
+<h3>{{ sessions_title }}</h3>
+<p class="muted">{{ sessions_intro }}</p>
+<table class="session-table">
+<thead><tr><th>{{ session_created_label }}</th><th>{{ session_seen_label }}</th><th></th></tr></thead>
+<tbody>
+{% for session in sessions %}
+<tr><td>{{ session.created }}</td><td>{{ session.last_seen }}</td><td>{% if session.current %}<span class="muted">{{ session_current_label }}</span>{% endif %}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<form method="POST" action="/account/sessions/revoke" style="margin-top:10px">
+{{ csrf_field | safe }}
+<button class="btn-sm">{{ sessions_revoke_label }}</button>
+</form>
+</section>

@@ -23,8 +23,8 @@ async fn migrations_are_versioned_and_idempotent(pool: PgPool) -> anyhow::Result
             .await?;
     assert_eq!(
         applied.iter().map(|v| v.0).collect::<Vec<_>>(),
-        vec![1_i64],
-        "only the embedded baseline schema is applied"
+        vec![1_i64, 2_i64],
+        "baseline plus TOTP migration"
     );
     for (key, expected) in [
         ("reports_enabled", "1"),
@@ -48,7 +48,7 @@ async fn migrations_are_versioned_and_idempotent(pool: PgPool) -> anyhow::Result
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(&store.pool)
         .await?;
-    assert_eq!(count.0, 1, "re-running the migrator adds no rows");
+    assert_eq!(count.0, 2, "re-running the migrator adds no rows");
     Ok(())
 }
 

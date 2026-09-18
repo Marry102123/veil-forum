@@ -118,3 +118,77 @@ pub async fn theme_query_cookie(
     }
     next.run(request).await
 }
+
+/// Policy gate: when `totp_required` is `staff` or `all`, a signed-in member
+/// without an active second factor may only reach the account page, sign out,
+/// and static assets. Enrolling stays reachable, so nobody is locked out of
+/// fixing their own account.
+pub async fn totp_gate(
+    State(store): State<crate::store::Store>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Resolve the exempt paths first: they are most of the traffic (static
+    // assets) and none of them can be gated, so they cost no query.
+    let path = request.uri().path();
+    let exempt = path == "/healthz"
+        || path == "/login"
+        || path == "/login/totp"
+        || path == "/logout"
+        || path == "/theme"
+        || path == "/api/pow/challenge"
+        || path.starts_with("/static/")
+        || path.starts_with("/account");
+    if exempt {
+        return next.run(request).await;
+    }
+    let policy = store
+        .get_config_opt("totp_required")
+        .await
+        .unwrap_or_default();
+    if policy != "staff" && policy != "all" {
+        return next.run(request).await;
+    }
+    // The session cookie must be read exactly the way the handlers read it,
+    // otherwise a request can look signed out to this gate and signed in to the
+    // handler it guards.
+    let Some(user) = (match session_id(request.headers()) {
+        Some(sid) => store.get_user_by_session(&sid).await.ok().flatten(),
+        None => None,
+    }) else {
+        // Guests are handled by the individual handlers.
+        return next.run(request).await;
+    };
+    if !crate::handler::account::policy_applies(&store, &user).await {
+        return next.run(request).await;
+    }
+    if store
+        .totp_state(user.id)
+        .await
+        .map(|state| state.is_active())
+        .unwrap_or(false)
+    {
+        return next.run(request).await;
+    }
+
+    let locale = store
+        .get_config_opt("default_locale")
+        .await
+        .unwrap_or_else(|| "en".to_string());
+    let ui = |en: &str, zh: &str, ru: &str| crate::i18n::ui(&locale, en, zh, ru);
+    let title = ui(
+        "Second factor required",
+        "需要先绑定动态口令",
+        "Требуется второй фактор",
+    );
+    let body = ui(
+        "This forum requires two-step verification. Open your account page to set it up, then continue.",
+        "本站要求使用二步验证。请到账号页完成绑定后继续浏览。",
+        "На этом форуме требуется двухшаговая проверка. Настройте её на странице аккаунта и продолжите.",
+    );
+    let link = ui("Go to account", "前往账号页", "Перейти в аккаунт");
+    let html = format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><link rel="stylesheet" href="/static/style.css"></head><body><main class="maintenance-page"><section class="card"><h1>{title}</h1><p>{body}</p><p><a class="btn-link" href="/account">{link}</a></p></section></main></body></html>"#
+    );
+    apply_sec(Html(html).into_response())
+}

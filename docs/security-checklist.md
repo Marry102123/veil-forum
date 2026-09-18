@@ -20,13 +20,23 @@ Run these checks before exposing a Tor Onion Service or I2P Destination:
    leave the host.
 8. `VEIL_ADMIN_PASSWORD` is removed from the service environment after first
    initialization and never appears in process logs.
-9. `cargo test`, `cargo clippy --all-targets --all-features`, and
+9. If TOTP is offered, the operator understands that shared secrets are bearer
+   credentials: database backups must be encrypted, and the host clock must stay
+   synchronised for codes to validate.
+10. `cargo test`, `cargo clippy --all-targets --all-features`, and
    `cargo audit` pass in the build environment.
-10. `scripts/db-maintenance.sh` writes into a 0700 directory, the dump files are
+11. A second-factor policy is a redirect, not a wall: it points members without a
+   factor at their account page but never blocks signing in, and it is enforced
+   with the same session parser the handlers use (covered by
+   `crafted_session_cookie_cannot_bypass_the_policy_gate`).
+12. Enrolling or disabling a second factor costs the account password and revokes
+   the account's other sessions, so a stolen session cannot change how the
+   account authenticates.
+13. `scripts/db-maintenance.sh` writes into a 0700 directory, the dump files are
    mode 600, and the connection string used for `pg_dump`/`psql` carries no
    password unless `PGPASSWORD` or `~/.pgpass` supplies it (the process table is
    world-readable).
-11. The migration import runs with `--dry-run` first, and the target database is
+14. The migration import runs with `--dry-run` first, and the target database is
    backed up before `--force`, because `--force` replaces existing rows.
 
 The application does not protect against a global traffic observer. This

@@ -43,3 +43,8 @@ base64 = "0.22"
 rust-i18n = "4"
 anyhow = "1"
 captcha = "1.0.0"
+# TOTP second factor (RFC 6238). The `migration` feature is left off so the
+# deprecated pre-6.0 API is not available.
+totp-rs = { version = "6", default-features = false, features = ["std", "otpauth", "gen_secret"] }
+# Inline SVG QR codes only; the default features would pull in the image crate.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }

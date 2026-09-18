@@ -142,6 +142,43 @@ pub struct InviteCode {
     pub revoked_by: Option<i64>,
     pub note: String,
 }
+
+/// How long the user has between the password step and the second factor.
+pub const PENDING_LOGIN_TTL_SECONDS: i64 = 300;
+/// Failed second-factor attempts allowed per pending login.
+pub const PENDING_LOGIN_MAX_ATTEMPTS: i64 = 5;
+
+/// TOTP enrolment and activation state for one account.
+#[derive(Debug, Clone, Default)]
+pub struct TotpState {
+    /// Active shared secret (base32) when the second factor is enabled.
+    pub secret: Option<String>,
+    pub activated_at: Option<DateTime<Utc>>,
+    /// Highest time step already accepted, for replay prevention.
+    pub last_step: Option<i64>,
+    /// Enrolment awaiting confirmation by a valid code.
+    pub pending_secret: Option<String>,
+    pub pending_created_at: Option<DateTime<Utc>>,
+    pub unused_recovery_codes: i64,
+}
+
+impl TotpState {
+    /// True when the account must present a second factor at login.
+    pub fn is_active(&self) -> bool {
+        self.secret.is_some() && self.activated_at.is_some()
+    }
+}
+
+/// A password step that is waiting for its second factor.
+#[derive(Debug, Clone)]
+pub struct PendingLogin {
+    pub id: String,
+    pub user_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub attempts: i64,
+}
+
 /// Number of connection attempts at startup so the service can come up while
 /// PostgreSQL is still starting.
 const CONNECT_ATTEMPTS: u32 = 10;
@@ -318,6 +355,8 @@ impl Store {
             ("registration_invite_enabled", "1"),
             ("site_name", "secure-forum"),
             ("footer_text", ""),
+            ("totp_enabled", "1"),
+            ("totp_required", "none"),
         ];
         for (k, v) in defaults {
             sqlx::query(
@@ -1444,6 +1483,257 @@ impl Store {
             None => return Ok(None),
         };
         self.get_user_by_id(session.user_id).await
+    }
+
+    // ---- TOTP second factor -------------------------------------------------
+
+    /// Current TOTP state for a user, including how many recovery codes are
+    /// still unused.
+    pub async fn totp_state(&self, user_id: i64) -> anyhow::Result<TotpState> {
+        let row = sqlx::query(
+            "SELECT totp_secret, totp_activated_at, totp_last_step, totp_pending_secret, \
+                    totp_pending_created_at, \
+                    (SELECT COUNT(*) FROM totp_recovery_codes c \
+                      WHERE c.user_id = u.id AND c.used_at IS NULL) AS unused_codes \
+             FROM users u WHERE id=$1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            anyhow::bail!("user {user_id} not found");
+        };
+        Ok(TotpState {
+            secret: row.get("totp_secret"),
+            activated_at: row.get("totp_activated_at"),
+            last_step: row.get("totp_last_step"),
+            pending_secret: row.get("totp_pending_secret"),
+            pending_created_at: row.get("totp_pending_created_at"),
+            unused_recovery_codes: row.get("unused_codes"),
+        })
+    }
+
+    /// Store an enrolment secret that is not active until a code proves the user
+    /// can read it.
+    pub async fn set_totp_pending(&self, user_id: i64, secret: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE users SET totp_pending_secret=$1, totp_pending_created_at=$2 WHERE id=$3",
+        )
+        .bind(secret)
+        .bind(Utc::now())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Discard an unconfirmed enrolment.
+    pub async fn clear_totp_pending(&self, user_id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE users SET totp_pending_secret=NULL, totp_pending_created_at=NULL WHERE id=$1",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Promote a pending secret to the active second factor.
+    pub async fn activate_totp(&self, user_id: i64, secret: &str, step: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE users SET totp_secret=$1, totp_activated_at=$2, totp_last_step=$3, \
+                    totp_pending_secret=NULL, totp_pending_created_at=NULL WHERE id=$4",
+        )
+        .bind(secret)
+        .bind(Utc::now())
+        .bind(step)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove the second factor and all of its recovery codes.
+    pub async fn disable_totp(&self, user_id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE users SET totp_secret=NULL, totp_activated_at=NULL, totp_last_step=NULL, \
+                    totp_pending_secret=NULL, totp_pending_created_at=NULL WHERE id=$1",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM totp_recovery_codes WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Claim a time step for a code that just verified.
+    ///
+    /// The update is conditional, so two concurrent logins cannot both accept
+    /// the same code: only the caller whose write actually moved the column
+    /// forward may continue, and a late writer can never move it backwards.
+    pub async fn claim_totp_step(&self, user_id: i64, step: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE users SET totp_last_step=$1 \
+             WHERE id=$2 AND (totp_last_step IS NULL OR totp_last_step < $1)",
+        )
+        .bind(step)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Failed second-factor attempts for one account since an instant.
+    ///
+    /// The per-request cap alone bounds guessing per pending login; this bounds
+    /// it per account, so a password holder cannot keep opening new attempts at
+    /// the global authentication rate.
+    pub async fn recent_failed_totp_attempts(
+        &self,
+        user_id: i64,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(attempts), 0) FROM pending_logins \
+             WHERE user_id=$1 AND created_at > $2",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Replace every recovery code with a new set of hashes.
+    pub async fn replace_recovery_codes(
+        &self,
+        user_id: i64,
+        hashes: &[String],
+    ) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM totp_recovery_codes WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        for hash in hashes {
+            sqlx::query(
+                "INSERT INTO totp_recovery_codes(user_id,code_hash,created_at) VALUES($1,$2,$3)",
+            )
+            .bind(user_id)
+            .bind(hash)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Consume a recovery code. Single use is enforced by the `used_at IS NULL`
+    /// predicate, so two concurrent logins cannot both succeed.
+    pub async fn consume_recovery_code(
+        &self,
+        user_id: i64,
+        code_hash: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE totp_recovery_codes SET used_at=$1 \
+             WHERE user_id=$2 AND code_hash=$3 AND used_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(user_id)
+        .bind(code_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Start the window between the password step and the second factor.
+    pub async fn create_pending_login(&self, user_id: i64) -> anyhow::Result<String> {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let id = hex::encode(bytes);
+        let now = Utc::now();
+        let expires = now + chrono::Duration::seconds(PENDING_LOGIN_TTL_SECONDS);
+        // Housekeeping: drop this user's stale attempts before adding one.
+        sqlx::query("DELETE FROM pending_logins WHERE user_id=$1 AND expires_at <= $2")
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO pending_logins(id,user_id,created_at,expires_at,attempts) \
+             VALUES($1,$2,$3,$4,0)",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(now)
+        .bind(expires)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Look up a still-usable pending login. Returns `None` once it is consumed,
+    /// expired, or out of attempts.
+    pub async fn pending_login(&self, id: &str) -> anyhow::Result<Option<PendingLogin>> {
+        let row = sqlx::query(
+            "SELECT id, user_id, created_at, expires_at, attempts FROM pending_logins \
+             WHERE id=$1 AND consumed_at IS NULL AND expires_at > $2 AND attempts < $3",
+        )
+        .bind(id)
+        .bind(Utc::now())
+        .bind(PENDING_LOGIN_MAX_ATTEMPTS)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| PendingLogin {
+            id: r.get("id"),
+            user_id: r.get("user_id"),
+            created_at: r.get("created_at"),
+            expires_at: r.get("expires_at"),
+            attempts: r.get("attempts"),
+        }))
+    }
+
+    /// Count a failed second-factor attempt and return the new total.
+    pub async fn fail_pending_login(&self, id: &str) -> anyhow::Result<i64> {
+        let attempts: Option<(i64,)> = sqlx::query_as(
+            "UPDATE pending_logins SET attempts=attempts+1 WHERE id=$1 RETURNING attempts",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(attempts.map(|(value,)| value).unwrap_or(0))
+    }
+
+    /// Finish a pending login exactly once.
+    pub async fn consume_pending_login(&self, id: &str, user_id: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE pending_logins SET consumed_at=$1 \
+             WHERE id=$2 AND user_id=$3 AND consumed_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Remove expired pending logins.
+    pub async fn delete_expired_pending_logins(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM pending_logins WHERE expires_at <= $1")
+            .bind(Utc::now())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 
