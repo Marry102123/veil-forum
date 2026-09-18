@@ -22,7 +22,7 @@ required-features = ["sqlite-import"]
 axum = { version = "0.7", features = ["macros","form"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
-comrak = { version = "0.22", default-features = false }
+comrak = { version = "0.55", default-features = false }
 ammonia = "4"
 argon2 = "0.5"
 hmac = "0.12"
