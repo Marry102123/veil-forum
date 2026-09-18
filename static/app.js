@@ -35,7 +35,22 @@
       if(el.classList.contains('flash-ok')) setTimeout(()=>{if(el.parentNode){el.style.opacity='0';setTimeout(()=>el.remove(),300)}},6000);
     });
   }
-  const ready=()=>{initCounters(); initFlash();};
+  function initRoleSearch(){
+    const input=document.getElementById('role-user-search');
+    const body=document.getElementById('role-user-results');
+    const empty=document.getElementById('role-user-empty');
+    if(!input||!body||!empty) return;
+    const update=()=>{
+      const query=input.value.trim().toLowerCase(); let visible=0;
+      body.querySelectorAll('tr[data-role-user]').forEach(row=>{
+        const show=!query||row.dataset.roleUser.toLowerCase().includes(query);
+        row.hidden=!show; if(show) visible++;
+      });
+      empty.hidden=visible!==0;
+    };
+    input.addEventListener('input',update);
+  }
+  const ready=()=>{initCounters(); initFlash(); initRoleSearch();};
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', ready);
   else ready();
 })();

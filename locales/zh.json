@@ -17,7 +17,7 @@
   "post.reply_pow": "回帖",
   "pow.login_title": "PoW 反滥用检查",
   "pow.register_title": "PoW 反滥用检查",
-  "pow.post_title": "PoW 反滥用检查",
+  "pow.post_title": "PoW",
   "pow.reply_title": "PoW 反滥用检查",
   "pow.description": "浏览器将执行一项简短的 PoW 计算，用于防止自动化滥用和垃圾内容。通常只需几秒钟。",
   "pow.computing": "正在执行 PoW 反滥用计算……",

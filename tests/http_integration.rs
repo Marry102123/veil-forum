@@ -8,45 +8,44 @@ use axum::{
     body::to_bytes,
     http::{header, Request, StatusCode},
 };
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use veil_forum::{captcha, handler, pow, store::Store};
 
-async fn app_with_store() -> anyhow::Result<(axum::Router, Store)> {
-    // Keep trigger bodies intact. Store::open's compatibility migration path
-    // splits legacy SQL on semicolons, which is unsuitable for this schema.
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await?;
-    for migration in [
-        include_str!("../migrations/001_init.sql"),
-        include_str!("../migrations/002_i18n.sql"),
-        include_str!("../migrations/003_parent.sql"),
-        include_str!("../migrations/004_security.sql"),
-        include_str!("../migrations/005_default_english.sql"),
-        include_str!("../migrations/006_default_board_english.sql"),
-        include_str!("../migrations/007_search_trigram.sql"),
-        include_str!("../migrations/009_thread_listing_order.sql"),
-        include_str!("../migrations/010_moderation_data_layer.sql"),
-    ] {
-        sqlx::raw_sql(migration).execute(&pool).await?;
-    }
-    let store = Store { pool };
+/// Build the router against a `sqlx::test` database. Migrations are applied by
+/// the harness; first-run defaults and a general board are seeded here so the
+/// rendered pages match a real first start.
+async fn app_with_store(pool: &PgPool) -> anyhow::Result<(axum::Router, Store)> {
+    let store = Store { pool: pool.clone() };
+    store.seed_defaults().await?;
     let state = handler::AppState {
         pow: pow::Manager::new(store.clone()),
         captcha: captcha::Manager::new(),
         limits: veil_forum::rate_limit::Limits::new(),
+        secure_session_cookie: false,
         store: store.clone(),
         password_gate: Arc::new(Semaphore::new(8)),
     };
     Ok((handler::routes(state), store))
 }
 
-async fn app() -> anyhow::Result<axum::Router> {
-    Ok(app_with_store().await?.0)
+/// Return the database to a freshly seeded state so repeated scenarios in one
+/// test do not observe each other's rows.
+async fn reset_store(store: &Store) -> anyhow::Result<()> {
+    sqlx::raw_sql(
+        "TRUNCATE users, boards, configs, invite_codes, threads, posts, sessions, \
+         audit_logs, user_roles, board_moderators, reports RESTART IDENTITY CASCADE",
+    )
+    .execute(&store.pool)
+    .await?;
+    store.seed_defaults().await?;
+    Ok(())
+}
+
+async fn app(pool: &PgPool) -> anyhow::Result<axum::Router> {
+    Ok(app_with_store(pool).await?.0)
 }
 
 async fn get(app: axum::Router, uri: &str) -> anyhow::Result<axum::response::Response> {
@@ -63,6 +62,8 @@ async fn post_form(
 ) -> anyhow::Result<axum::response::Response> {
     let mut request = Request::post(uri)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::HOST, "forum.test")
+        .header(header::ORIGIN, "http://forum.test")
         .body(axum::body::Body::from(form.to_owned()))?;
     if let Some(cookie) = cookie {
         request
@@ -87,21 +88,24 @@ async fn csrf_token(app: axum::Router, uri: &str, cookie: Option<&str>) -> anyho
     Ok(html[start..end].to_owned())
 }
 
-#[tokio::test]
-async fn healthz_reports_ready_and_security_headers() -> anyhow::Result<()> {
-    let response = get(app().await?, "/healthz").await?;
+#[sqlx::test]
+async fn healthz_reports_ready_and_security_headers(pool: PgPool) -> anyhow::Result<()> {
+    let response = get(app(&pool).await?, "/healthz").await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'");
     assert_eq!(response.headers()["x-frame-options"], "DENY");
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "same-origin");
     assert_eq!(to_bytes(response.into_body(), usize::MAX).await?, "ok");
     Ok(())
 }
 
-#[tokio::test]
-async fn pow_endpoint_validates_scope_and_returns_challenge_contract() -> anyhow::Result<()> {
-    let application = app().await?;
+#[sqlx::test]
+async fn pow_endpoint_validates_scope_and_returns_challenge_contract(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let application = app(&pool).await?;
     let response = get(application.clone(), "/api/pow/challenge?scope=login").await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
@@ -129,9 +133,9 @@ async fn pow_endpoint_validates_scope_and_returns_challenge_contract() -> anyhow
     Ok(())
 }
 
-#[tokio::test]
-async fn login_pow_fallback_is_present_in_server_rendered_html() -> anyhow::Result<()> {
-    let application = app().await?;
+#[sqlx::test]
+async fn login_pow_fallback_is_present_in_server_rendered_html(pool: PgPool) -> anyhow::Result<()> {
+    let application = app(&pool).await?;
     let response = get(application, "/login").await?;
     let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
     assert!(html.contains(r#"class="pow-fallback""#));
@@ -147,9 +151,11 @@ async fn login_pow_fallback_is_present_in_server_rendered_html() -> anyhow::Resu
     Ok(())
 }
 
-#[tokio::test]
-async fn theme_query_is_rendered_without_javascript_and_toggle_is_safe() -> anyhow::Result<()> {
-    let application = app().await?;
+#[sqlx::test]
+async fn theme_query_is_rendered_without_javascript_and_toggle_is_safe(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let application = app(&pool).await?;
     let response = get(application.clone(), "/?theme=light").await?;
     assert_eq!(response.status(), StatusCode::OK);
     let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
@@ -168,9 +174,52 @@ async fn theme_query_is_rendered_without_javascript_and_toggle_is_safe() -> anyh
     Ok(())
 }
 
-#[tokio::test]
-async fn static_assets_are_served_and_traversal_is_not() -> anyhow::Result<()> {
-    let application = app().await?;
+#[sqlx::test]
+async fn maintenance_mode_blocks_public_pages_but_keeps_login_and_admin_accessible(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (application, store) = app_with_store(&pool).await?;
+    store.set_config("maintenance_enabled", "1").await?;
+    store
+        .set_config("maintenance_title", "Planned maintenance")
+        .await?;
+    store
+        .set_config("maintenance_message", "Database upgrade in progress")
+        .await?;
+    store.set_config("maintenance_eta", "tomorrow").await?;
+
+    let response = get(application.clone(), "/").await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+    assert!(html.contains("Planned maintenance"));
+    assert!(html.contains("Database upgrade in progress"));
+    assert!(html.contains("tomorrow"));
+    assert!(!html.contains("General discussion"));
+
+    assert_eq!(
+        get(application.clone(), "/login").await?.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(application, "/admin").await?.status(),
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn configured_palette_is_rendered_on_public_pages(pool: PgPool) -> anyhow::Result<()> {
+    let (application, store) = app_with_store(&pool).await?;
+    store.set_config("theme_palette", "terminal").await?;
+    let response = get(application, "/").await?;
+    let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+    assert!(html.contains(r#"data-palette="terminal""#));
+    Ok(())
+}
+
+#[sqlx::test]
+async fn static_assets_are_served_and_traversal_is_not(pool: PgPool) -> anyhow::Result<()> {
+    let application = app(&pool).await?;
     let response = get(application.clone(), "/static/style.css").await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -196,12 +245,13 @@ async fn static_assets_are_served_and_traversal_is_not() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[sqlx::test]
 async fn registration_policy_switches_control_rendered_fields_and_server_pow_gate(
+    pool: PgPool,
 ) -> anyhow::Result<()> {
     for pow_enabled in [false, true] {
         for invite_enabled in [false, true] {
-            let (application, store) = app_with_store().await?;
+            let (application, store) = app_with_store(&pool).await?;
             store
                 .set_config(
                     "registration_pow_enabled",
@@ -224,7 +274,7 @@ async fn registration_policy_switches_control_rendered_fields_and_server_pow_gat
 
             let csrf = csrf_token(application.clone(), "/register", None).await?;
             let response = post_form(
-                application,
+                application.clone(),
                 "/register",
                 None,
                 &format!("csrf_token={csrf}&username=bad&password=short"),
@@ -241,7 +291,7 @@ async fn registration_policy_switches_control_rendered_fields_and_server_pow_gat
             );
 
             if !pow_enabled {
-                let (application, store) = app_with_store().await?;
+                reset_store(&store).await?;
                 store
                     .set_config(
                         "registration_invite_enabled",
@@ -271,7 +321,7 @@ async fn registration_policy_switches_control_rendered_fields_and_server_pow_gat
         }
     }
 
-    let (application, store) = app_with_store().await?;
+    let (application, store) = app_with_store(&pool).await?;
     store.set_config("registration_mode", "closed").await?;
     let response = get(application.clone(), "/register").await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -287,9 +337,11 @@ async fn registration_policy_switches_control_rendered_fields_and_server_pow_gat
     Ok(())
 }
 
-#[tokio::test]
-async fn report_policy_hides_entry_and_rejects_direct_submission() -> anyhow::Result<()> {
-    let (application, store) = app_with_store().await?;
+#[sqlx::test]
+async fn report_policy_hides_entry_and_rejects_direct_submission(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (application, store) = app_with_store(&pool).await?;
     let user_id = store.create_user("reporter", "hash", false).await?;
     let session_id = store.create_session(user_id).await?;
     let board_id = store

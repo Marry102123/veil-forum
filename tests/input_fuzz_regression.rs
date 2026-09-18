@@ -5,6 +5,7 @@
 //! asserts that parser and search boundaries return safely without panicking.
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use sqlx::PgPool;
 use veil_forum::{markdown, pow, store::Store};
 
 fn hostile_inputs() -> Vec<String> {
@@ -31,9 +32,10 @@ fn hostile_inputs() -> Vec<String> {
     inputs
 }
 
-#[tokio::test]
-async fn randomized_markdown_search_and_pow_inputs_fail_safely() -> anyhow::Result<()> {
-    let store = Store::open(":memory:").await?;
+#[sqlx::test]
+async fn randomized_markdown_search_and_pow_inputs_fail_safely(pool: PgPool) -> anyhow::Result<()> {
+    let store = Store { pool };
+    store.seed_defaults().await?;
     let manager = pow::Manager::new(store.clone());
 
     for input in hostile_inputs() {
@@ -41,9 +43,10 @@ async fn randomized_markdown_search_and_pow_inputs_fail_safely() -> anyhow::Resu
         assert!(!html.contains("<script"));
         assert!(!html.contains("https://example.test/x"));
 
-        // Search input is passed through both the FTS quoting and short-query
-        // LIKE fallback paths. Either no result or a normal result is valid.
-        let _ = store.search_posts(&input, 0, 100_000).await?;
+        // Search input goes through the escaped LIKE pattern and the trigram
+        // ranking path. Either no result or a normal result is valid, but it
+        // must never fail or panic.
+        let _ = store.search_posts(&input, 0, 100_000, true).await?;
 
         // Arbitrary malformed client PoW data must be a normal rejection, not a
         // panic or an accepted proof. A one-second-old expiry also avoids any

@@ -1,6 +1,7 @@
 [Unit]
 Description=veil-forum experimental Tor/I2P forum
-After=network.target
+After=network.target postgresql.service
+Requires=postgresql.service
 StartLimitIntervalSec=5min
 StartLimitBurst=5
 
@@ -9,7 +10,9 @@ Type=simple
 User=veil-forum
 Group=veil-forum
 WorkingDirectory=/var/lib/veil-forum
-ExecStart=/usr/local/bin/veil-forum --addr 127.0.0.1:8001 --data /var/lib/veil-forum/forum.db
+# The database is reached over the local Unix socket with peer authentication,
+# so the role name matches this user and no password is stored here.
+ExecStart=/usr/local/bin/veil-forum --addr 127.0.0.1:8001 --database-url postgres:///veil_forum?host=/var/run/postgresql
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=60s
@@ -27,7 +30,6 @@ ProtectKernelTunables=true
 # older systemd versions; the remaining restrictions are intentionally kept.
 ProtectProc=invisible
 ProcSubset=pid
-ReadWritePaths=/var/lib/veil-forum
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 MemoryDenyWriteExecute=true

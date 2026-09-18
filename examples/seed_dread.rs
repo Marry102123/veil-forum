@@ -1,11 +1,15 @@
 use veil_forum::{auth, markdown, store::Store};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let db = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "./data/forum.db".into());
-    let store = Store::open(&db).await?;
-    println!("seed on {}", db);
+    let database_url = std::env::args().nth(1).unwrap_or_else(|| {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres:///veil_forum?host=/var/run/postgresql".to_string())
+    });
+    let store = Store::connect(&database_url).await?;
+    println!(
+        "seed on {}",
+        veil_forum::store::redact_database_url(&database_url)
+    );
 
     // ensure users
     let users = vec![
@@ -233,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
             let hours_ago = (next_rand() % 72) as i64;
             let bump_time = chrono::Utc::now() - chrono::Duration::hours(hours_ago);
             let bump_str = bump_time.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            sqlx::query("UPDATE threads SET last_reply_at=?, reply_count=(SELECT COUNT(*)-1 FROM posts WHERE thread_id=?) WHERE id=?")
+            sqlx::query("UPDATE threads SET last_reply_at=$1, reply_count=(SELECT COUNT(*)-1 FROM posts WHERE thread_id=$2) WHERE id=$3")
                 .bind(&bump_str).bind(tid).bind(tid).execute(&store.pool).await?;
             println!(
                 "thread {} in /{} with {} replies, bump {}h ago",

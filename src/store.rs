@@ -1,10 +1,10 @@
-use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::{sqlite::SqliteConnectOptions, Row, Sqlite, SqlitePool, Transaction};
-use std::str::FromStr;
+use chrono::{DateTime, Utc};
+use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::{PgPool, Row};
 
 #[derive(Clone)]
 pub struct Store {
-    pub pool: SqlitePool,
+    pub pool: PgPool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +60,9 @@ pub struct Session {
     pub user_id: i64,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub last_seen_at: DateTime<Utc>,
+    /// Nullable in the schema and in imported legacy rows: a session without a
+    /// last-seen timestamp is treated as expired rather than assumed fresh.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +83,8 @@ pub enum Role {
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    /// Stable name as stored in the database.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
             Self::Admin => "admin",
@@ -125,45 +128,6 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
-/// 统一 RFC3339/RFC3339Nano 双格式解析
-/// 先试 RFC3339Nano 再回落 RFC3339，兼容 Go `time.RFC3339Nano` / `time.RFC3339` 写入的两种格式
-pub fn parse_time(s: &str) -> anyhow::Result<DateTime<Utc>> {
-    let s = s.trim();
-    // 1) RFC3339Nano: chrono::DateTime::parse_from_rfc3339 已支持纳秒（fractional 秒可选），等价 Go time.RFC3339Nano
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    // 2) 兜底兼容带纳秒的 Z 格式（与 parse_from_rfc3339 互补，覆盖 "%Y-%m-%dT%H:%M:%S%.fZ"）
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return Ok(dt.and_utc());
-    }
-    // 3) 回落 RFC3339: 显式尝试不带纳秒的 RFC3339 变体（Go time.RFC3339），处理 Z 后缀的朴素时间
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ") {
-        return Ok(dt.and_utc());
-    }
-    // 4) 兼容遗留 SQLite 文本格式（无 T、无时区）—— 含纳秒变体
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        return Ok(dt.and_utc());
-    }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.and_utc());
-    }
-    // 5) 空格 + Z 变体（极少数遗留）
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.fZ") {
-        return Ok(dt.and_utc());
-    }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%SZ") {
-        return Ok(dt.and_utc());
-    }
-    Err(anyhow::anyhow!("invalid timestamp: {s:?}"))
-}
-
-// 保留旧名兼容，内部统一委托 parse_time
-#[allow(dead_code)]
-fn parse_dt(s: &str) -> anyhow::Result<DateTime<Utc>> {
-    parse_time(s)
-}
-
 #[derive(Debug, Clone)]
 pub struct InviteCode {
     pub code: String,
@@ -171,137 +135,173 @@ pub struct InviteCode {
     pub used_by: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub used_at: Option<DateTime<Utc>>,
+    pub max_uses: i64,
+    pub use_count: i64,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<i64>,
+    pub note: String,
+}
+/// Number of connection attempts at startup so the service can come up while
+/// PostgreSQL is still starting.
+const CONNECT_ATTEMPTS: u32 = 10;
+const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+/// Per-attempt ceiling so startup cannot hang on an unreachable host.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Remove any password from a database URL before it reaches logs or errors.
+///
+/// Three forms reach this function: the URL form
+/// (`postgres://user:secret@host/db`), a password as a query parameter
+/// (`...?password=secret`), and the libpq keyword/value form that sqlx also
+/// accepts (`host=127.0.0.1 password=secret user=u`).
+pub fn redact_database_url(url: &str) -> String {
+    let mut out = url.to_string();
+
+    // URL form. The authority runs to the first `/` after `scheme://`, and a
+    // password may itself contain '@', so the last '@' before the path is the
+    // separator.
+    if let Some(scheme_slash) = out.find("://") {
+        let authority_start = scheme_slash + 3;
+        let authority_end = out[authority_start..]
+            .find('/')
+            .map(|offset| authority_start + offset)
+            .unwrap_or(out.len());
+        if let Some(at) = out[authority_start..authority_end].rfind('@') {
+            let userinfo_end = authority_start + at;
+            if let Some(colon) = out[authority_start..userinfo_end].find(':') {
+                out.replace_range(authority_start + colon + 1..userinfo_end, "***");
+            }
+        }
+    }
+
+    // Password named as a parameter: separated by '?', '&', whitespace (libpq
+    // keyword form), or the start of the string. The search always resumes past
+    // the value that was just handled, so it cannot loop.
+    let mut search_from = 0;
+    while let Some(relative) = out[search_from..].find("password=") {
+        let key_start = search_from + relative;
+        let boundary =
+            key_start == 0 || matches!(out.as_bytes()[key_start - 1], b'?' | b'&' | b' ' | b'\t');
+        let value_start = key_start + "password=".len();
+        let value_first = out[value_start..].chars().next();
+        let value_end = match value_first {
+            Some(quote @ ('\'' | '"')) => {
+                let quoted = value_start + quote.len_utf8();
+                out[quoted..]
+                    .find(quote)
+                    .map(|offset| quoted + offset + quote.len_utf8())
+                    .unwrap_or(out.len())
+            }
+            _ => {
+                value_start
+                    + out[value_start..]
+                        .find(['&', '#', ' ', '\t', '\n'])
+                        .unwrap_or(out.len() - value_start)
+            }
+        };
+        if boundary {
+            out.replace_range(value_start..value_end, "***");
+        }
+        search_from = value_start + 3;
+    }
+    out
+}
+
+/// Above this many matches, search results are ordered newest-first instead of
+/// by similarity: ranking a very common term scores every matching row, while
+/// the ordered path stops as soon as the page is full.
+const SEARCH_RANK_LIMIT: i64 = 2000;
+
+/// Common table expression that yields one row per matching post id.
+///
+/// Each branch of the `UNION` touches a single table so that the planner can use
+/// `idx_posts_content_trgm` or `idx_threads_title_trgm`; combining both
+/// conditions in one `OR` across two tables rules out both indexes.
+const SEARCH_MATCHES: &str = "WITH matches AS ( \
+     SELECT p.id AS post_id FROM posts p \
+       JOIN threads th ON th.id=p.thread_id \
+       JOIN boards b ON b.id=th.board_id \
+      WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND ($1 OR b.guest_readable) \
+        AND p.content_md ILIKE $2 ESCAPE '\\' \
+     UNION \
+     SELECT p.id FROM posts p \
+       JOIN threads th ON th.id=p.thread_id \
+       JOIN boards b ON b.id=th.board_id \
+      WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND ($1 OR b.guest_readable) \
+        AND th.title ILIKE $2 ESCAPE '\\' \
+ )";
+
+/// Escape LIKE/ILIKE wildcards so search input matches literally. The query is
+/// always paired with `ESCAPE '\'` in SQL.
+fn escape_like_pattern(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
+    let mut last_error = None;
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        // Bound each attempt explicitly: a blackholed host would otherwise hold
+        // startup for the operating system's TCP timeout, which is longer than
+        // the service manager's start timeout.
+        let connect = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            PgPoolOptions::new()
+                .max_connections(16)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(database_url),
+        )
+        .await;
+        match connect {
+            Ok(Ok(pool)) => return Ok(pool),
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(_) => last_error = Some(format!("connect timed out after {CONNECT_TIMEOUT:?}")),
+        }
+        if attempt < CONNECT_ATTEMPTS {
+            tokio::time::sleep(CONNECT_BACKOFF).await;
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not connect to PostgreSQL at {} after {CONNECT_ATTEMPTS} attempts: {}",
+        redact_database_url(database_url),
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 impl Store {
-    pub async fn open(path: &str) -> anyhow::Result<Self> {
-        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path))?
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    sqlx::query("PRAGMA foreign_keys=ON")
-                        .execute(&mut *conn)
-                        .await?;
-                    sqlx::query("PRAGMA busy_timeout=5000")
-                        .execute(conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect_with(options)
-            .await?;
-        #[cfg(unix)]
-        if !path.starts_with(":memory:") {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let s = Self { pool };
-        s.migrate().await?;
-        s.seed_defaults().await?;
-        Ok(s)
+    /// Connect to PostgreSQL, apply embedded migrations, and seed first-run
+    /// values.
+    ///
+    /// `database_url` is a libpq-style URL such as
+    /// `postgres:///veil_forum?host=/var/run/postgresql`. The socket form with
+    /// peer authentication is recommended: the database never listens on the
+    /// network and no password is stored in configuration or the environment.
+    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let pool = connect_pool(database_url).await?;
+        let store = Self { pool };
+        store.migrate().await?;
+        store.seed_defaults().await?;
+        Ok(store)
     }
+
+    /// Apply the embedded `migrations/*.sql`. sqlx holds a database advisory
+    /// lock for the run, so two instances starting at once cannot interleave
+    /// schema changes, and every migration is applied in a transaction.
     async fn migrate(&self) -> anyhow::Result<()> {
-        // The marker table makes startup migrations observable and prevents a later
-        // migration from being skipped after a process is interrupted.
-        sqlx::query("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-            .execute(&self.pool).await?;
-        self.apply_raw_migration(1, include_str!("../migrations/001_init.sql"))
-            .await?;
-        for (version, sql) in [
-            (2, include_str!("../migrations/002_i18n.sql")),
-            (3, include_str!("../migrations/003_parent.sql")),
-            (4, include_str!("../migrations/004_security.sql")),
-            (5, include_str!("../migrations/005_default_english.sql")),
-            (
-                6,
-                include_str!("../migrations/006_default_board_english.sql"),
-            ),
-        ] {
-            self.apply_sql_migration(version, sql).await?;
-        }
-        // 007 contains semicolons inside trigger bodies, so execute it as one batch.
-        self.apply_raw_migration(7, include_str!("../migrations/007_search_trigram.sql"))
-            .await?;
-        self.apply_sql_migration(
-            8,
-            "INSERT OR IGNORE INTO configs(key,value) VALUES('pow_login_minutes','0.02');",
-        )
-        .await?;
-        self.apply_sql_migration(
-            9,
-            include_str!("../migrations/009_thread_listing_order.sql"),
-        )
-        .await?;
-        self.apply_sql_migration(
-            10,
-            include_str!("../migrations/010_moderation_data_layer.sql"),
-        )
-        .await?;
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
     }
 
-    async fn apply_sql_migration(&self, version: i64, sql: &str) -> anyhow::Result<()> {
-        if self.migration_applied(version).await? {
-            return Ok(());
-        }
-        let mut tx = self.pool.begin().await?;
-        for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            if let Err(e) = sqlx::query(stmt).execute(&mut *tx).await {
-                let msg = e.to_string().to_lowercase();
-                if !(msg.contains("duplicate column")
-                    || msg.contains("already exists")
-                    || msg.contains("duplicate"))
-                {
-                    return Err(anyhow::anyhow!(
-                        "migration {version} failed: {e}; statement={stmt:?}"
-                    ));
-                }
-            }
-        }
-        self.record_migration(&mut tx, version).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn apply_raw_migration(&self, version: i64, sql: &str) -> anyhow::Result<()> {
-        if self.migration_applied(version).await? {
-            return Ok(());
-        }
-        let mut tx = self.pool.begin().await?;
-        sqlx::raw_sql(sql).execute(&mut *tx).await?;
-        self.record_migration(&mut tx, version).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn migration_applied(&self, version: i64) -> anyhow::Result<bool> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?)",
-        )
-        .bind(version)
-        .fetch_one(&self.pool)
-        .await?
-            != 0)
-    }
-
-    async fn record_migration(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        version: i64,
-    ) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)")
-            .bind(version)
-            .bind(Utc::now().to_rfc3339())
-            .execute(&mut **tx)
-            .await?;
-        Ok(())
-    }
-    async fn seed_defaults(&self) -> anyhow::Result<()> {
+    /// Insert first-run defaults (site config, default board). Idempotent, so
+    /// it is safe to call on every start and from tests.
+    pub async fn seed_defaults(&self) -> anyhow::Result<()> {
         let defaults = [
             ("pow_register_minutes", "0.02"),
             ("pow_login_minutes", "0.02"),
@@ -320,13 +320,15 @@ impl Store {
             ("footer_text", ""),
         ];
         for (k, v) in defaults {
-            sqlx::query("INSERT OR IGNORE INTO configs(key,value) VALUES(?,?)")
-                .bind(k)
-                .bind(v)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "INSERT INTO configs(key,value) VALUES($1,$2) ON CONFLICT (key) DO NOTHING",
+            )
+            .bind(k)
+            .bind(v)
+            .execute(&self.pool)
+            .await?;
         }
-        sqlx::query("INSERT OR IGNORE INTO configs(key,value) VALUES(?,?)")
+        sqlx::query("INSERT INTO configs(key,value) VALUES($1,$2) ON CONFLICT (key) DO NOTHING")
             .bind("default_locale")
             .bind("en")
             .execute(&self.pool)
@@ -335,8 +337,8 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         if cnt.0 == 0 {
-            sqlx::query("INSERT INTO boards(slug,name,description,allow_anonymous,guest_readable,created_at) VALUES(?,?,?,?,?,?)")
-                .bind("general").bind("General").bind("General discussion").bind(1).bind(1).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true))
+            sqlx::query("INSERT INTO boards(slug,name,description,allow_anonymous,guest_readable,created_at) VALUES($1,$2,$3,$4,$5,$6)")
+                .bind("general").bind("General").bind("General discussion").bind(true).bind(true).bind(Utc::now())
                 .execute(&self.pool).await?;
         }
         Ok(())
@@ -348,7 +350,7 @@ impl Store {
     /// 旧签名 `Option<String>` 会吞掉 DB 错误（`.ok().flatten()`），现改为 `Result<Option>`
     /// 以与 Go 一致可区分错误与缺失。
     pub async fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM configs WHERE key=?")
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM configs WHERE key=$1")
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
@@ -359,7 +361,7 @@ impl Store {
         self.get_config(key).await.unwrap_or(None)
     }
     pub async fn set_config(&self, key: &str, val: &str) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO configs(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key).bind(val).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO configs(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key).bind(val).execute(&self.pool).await?;
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -385,7 +387,7 @@ impl Store {
             ("post_pow_enabled", post_pow_enabled),
             ("post_captcha_enabled", post_captcha_enabled),
         ] {
-            sqlx::query("INSERT INTO configs(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            sqlx::query("INSERT INTO configs(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 .bind(key)
                 .bind(if enabled { "1" } else { "0" })
                 .execute(&mut *tx)
@@ -414,81 +416,80 @@ impl Store {
         hash: &str,
         is_admin: bool,
     ) -> anyhow::Result<i64> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let res = sqlx::query(
-            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,?,?)",
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES($1,$2,$3,$4) RETURNING id",
         )
         .bind(username)
         .bind(hash)
-        .bind(if is_admin { 1 } else { 0 })
-        .bind(&now)
-        .execute(&self.pool)
+        .bind(is_admin)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
         .await?;
-        Ok(res.last_insert_rowid())
+        Ok(id)
     }
     pub async fn get_user_by_username(&self, username: &str) -> anyhow::Result<Option<User>> {
-        let row = sqlx::query("SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users WHERE username=?")
+        let row = sqlx::query("SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users WHERE username=$1")
             .bind(username).fetch_optional(&self.pool).await?;
         row.map(|r| -> anyhow::Result<User> {
-            let created: String = r.get("created_at");
+            let created: DateTime<Utc> = r.get("created_at");
             Ok(User {
                 id: r.get("id"),
                 username: r.get("username"),
                 password_hash: r.get("password_hash"),
-                is_admin: r.get::<i64, _>("is_admin") == 1,
-                is_banned: r.get::<i64, _>("is_banned") == 1,
-                created_at: parse_time(&created)?,
+                is_admin: r.get::<bool, _>("is_admin"),
+                is_banned: r.get::<bool, _>("is_banned"),
+                created_at: created,
             })
         })
         .transpose()
     }
     pub async fn get_user_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
         let row = sqlx::query(
-            "SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users WHERE id=?",
+            "SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users WHERE id=$1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| -> anyhow::Result<User> {
-            let created: String = r.get("created_at");
+            let created: DateTime<Utc> = r.get("created_at");
             Ok(User {
                 id: r.get("id"),
                 username: r.get("username"),
                 password_hash: r.get("password_hash"),
-                is_admin: r.get::<i64, _>("is_admin") == 1,
-                is_banned: r.get::<i64, _>("is_banned") == 1,
-                created_at: parse_time(&created)?,
+                is_admin: r.get::<bool, _>("is_admin"),
+                is_banned: r.get::<bool, _>("is_banned"),
+                created_at: created,
             })
         })
         .transpose()
     }
     pub async fn list_users(&self, limit: i64) -> anyhow::Result<Vec<User>> {
-        let rows = sqlx::query("SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users ORDER BY id DESC LIMIT ?")
+        let rows = sqlx::query("SELECT id,username,password_hash,is_admin,is_banned,created_at FROM users ORDER BY id DESC LIMIT $1")
             .bind(limit).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| -> anyhow::Result<User> {
-                let created: String = r.get("created_at");
+                let created: DateTime<Utc> = r.get("created_at");
                 Ok(User {
                     id: r.get("id"),
                     username: r.get("username"),
                     password_hash: r.get("password_hash"),
-                    is_admin: r.get::<i64, _>("is_admin") == 1,
-                    is_banned: r.get::<i64, _>("is_banned") == 1,
-                    created_at: parse_time(&created)?,
+                    is_admin: r.get::<bool, _>("is_admin"),
+                    is_banned: r.get::<bool, _>("is_banned"),
+                    created_at: created,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()
     }
     pub async fn set_user_banned(&self, id: i64, banned: bool) -> anyhow::Result<()> {
-        sqlx::query("UPDATE users SET is_banned=? WHERE id=?")
-            .bind(if banned { 1 } else { 0 })
+        sqlx::query("UPDATE users SET is_banned=$1 WHERE id=$2")
+            .bind(banned)
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn update_password(&self, id: i64, hash: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE users SET password_hash=? WHERE id=?")
+        sqlx::query("UPDATE users SET password_hash=$1 WHERE id=$2")
             .bind(hash)
             .bind(id)
             .execute(&self.pool)
@@ -503,10 +504,10 @@ impl Store {
         target_id: Option<i64>,
         success: bool,
     ) -> anyhow::Result<()> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        sqlx::query("INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,success,created_at) VALUES(?,?,?,?,?,?)")
+        let now = Utc::now();
+        sqlx::query("INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,success,created_at) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(actor_user_id).bind(action).bind(target_type).bind(target_id)
-            .bind(if success { 1 } else { 0 }).bind(now)
+            .bind(success).bind(now)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -519,10 +520,10 @@ impl Store {
         success: bool,
         metadata: Option<&str>,
     ) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,success,metadata,created_at) VALUES(?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,success,metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(actor_user_id).bind(action).bind(target_type).bind(target_id)
-            .bind(if success { 1 } else { 0 }).bind(metadata)
-            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true))
+            .bind(success).bind(metadata)
+            .bind(Utc::now())
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -531,7 +532,7 @@ impl Store {
         limit: i64,
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<AuditLog>> {
-        let rows = sqlx::query("SELECT id,actor_user_id,action,target_type,target_id,success,metadata,created_at FROM audit_logs WHERE (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?")
+        let rows = sqlx::query("SELECT id,actor_user_id,action,target_type,target_id,success,metadata,created_at FROM audit_logs WHERE ($1 IS NULL OR id < $2) ORDER BY id DESC LIMIT $3")
             .bind(before_id).bind(before_id).bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| {
@@ -541,9 +542,9 @@ impl Store {
                     action: r.get("action"),
                     target_type: r.get("target_type"),
                     target_id: r.get("target_id"),
-                    success: r.get::<i64, _>("success") != 0,
+                    success: r.get::<bool, _>("success"),
                     metadata: r.get("metadata"),
-                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
+                    created_at: r.get("created_at"),
                 })
             })
             .collect()
@@ -555,13 +556,13 @@ impl Store {
         role: Role,
         granted_by_user_id: Option<i64>,
     ) -> anyhow::Result<()> {
-        sqlx::query("INSERT OR IGNORE INTO user_roles(user_id,role_name,granted_by_user_id,created_at) VALUES(?,?,?,?)")
+        sqlx::query("INSERT INTO user_roles(user_id,role_name,granted_by_user_id,created_at) VALUES($1,$2,$3,$4) ON CONFLICT (user_id, role_name) DO NOTHING")
             .bind(user_id).bind(role.as_str()).bind(granted_by_user_id)
-            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).execute(&self.pool).await?;
+            .bind(Utc::now()).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn revoke_role(&self, user_id: i64, role: Role) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM user_roles WHERE user_id=? AND role_name=?")
+        sqlx::query("DELETE FROM user_roles WHERE user_id=$1 AND role_name=$2")
             .bind(user_id)
             .bind(role.as_str())
             .execute(&self.pool)
@@ -570,7 +571,7 @@ impl Store {
     }
     pub async fn list_user_roles(&self, user_id: i64) -> anyhow::Result<Vec<Role>> {
         sqlx::query_scalar::<_, String>(
-            "SELECT role_name FROM user_roles WHERE user_id=? ORDER BY role_name",
+            "SELECT role_name FROM user_roles WHERE user_id=$1 ORDER BY role_name",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -580,14 +581,13 @@ impl Store {
         .collect()
     }
     pub async fn user_has_role(&self, user_id: i64, role: Role) -> anyhow::Result<bool> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=? AND role_name=?)",
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1 AND role_name=$2)",
         )
         .bind(user_id)
         .bind(role.as_str())
         .fetch_one(&self.pool)
-        .await?
-            != 0)
+        .await?)
     }
     pub async fn add_board_moderator(
         &self,
@@ -595,12 +595,12 @@ impl Store {
         user_id: i64,
         granted_by_user_id: Option<i64>,
     ) -> anyhow::Result<()> {
-        sqlx::query("INSERT OR IGNORE INTO board_moderators(board_id,user_id,granted_by_user_id,created_at) VALUES(?,?,?,?)")
-            .bind(board_id).bind(user_id).bind(granted_by_user_id).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO board_moderators(board_id,user_id,granted_by_user_id,created_at) VALUES($1,$2,$3,$4) ON CONFLICT (board_id, user_id) DO NOTHING")
+            .bind(board_id).bind(user_id).bind(granted_by_user_id).bind(Utc::now()).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn remove_board_moderator(&self, board_id: i64, user_id: i64) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM board_moderators WHERE board_id=? AND user_id=?")
+        sqlx::query("DELETE FROM board_moderators WHERE board_id=$1 AND user_id=$2")
             .bind(board_id)
             .bind(user_id)
             .execute(&self.pool)
@@ -608,14 +608,13 @@ impl Store {
         Ok(())
     }
     pub async fn is_board_moderator(&self, board_id: i64, user_id: i64) -> anyhow::Result<bool> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM board_moderators WHERE board_id=? AND user_id=?)",
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM board_moderators WHERE board_id=$1 AND user_id=$2)",
         )
         .bind(board_id)
         .bind(user_id)
         .fetch_one(&self.pool)
-        .await?
-            != 0)
+        .await?)
     }
     pub async fn can_moderate_board(&self, board_id: i64, user_id: i64) -> anyhow::Result<bool> {
         if self.user_has_role(user_id, Role::Owner).await?
@@ -636,15 +635,15 @@ impl Store {
         if !matches!(target_type, "post" | "thread" | "user") {
             anyhow::bail!("invalid report target type");
         }
-        Ok(sqlx::query("INSERT INTO reports(reporter_user_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?)")
-            .bind(reporter_user_id).bind(target_type).bind(target_id).bind(reason).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).execute(&self.pool).await?.last_insert_rowid())
+        Ok(sqlx::query_scalar::<_, i64>("INSERT INTO reports(reporter_user_id,target_type,target_id,reason,created_at) VALUES($1,$2,$3,$4,$5) RETURNING id")
+            .bind(reporter_user_id).bind(target_type).bind(target_id).bind(reason).bind(Utc::now()).fetch_one(&self.pool).await?)
     }
     pub async fn list_reports(
         &self,
         status: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<Report>> {
-        let rows = sqlx::query("SELECT id,reporter_user_id,target_type,target_id,reason,status,resolved_by_user_id,resolution_note,created_at,resolved_at FROM reports WHERE (? IS NULL OR status=?) ORDER BY id DESC LIMIT ?")
+        let rows = sqlx::query("SELECT id,reporter_user_id,target_type,target_id,reason,status,resolved_by_user_id,resolution_note,created_at,resolved_at FROM reports WHERE ($1 IS NULL OR status=$2) ORDER BY id DESC LIMIT $3")
             .bind(status).bind(status).bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| {
@@ -657,12 +656,8 @@ impl Store {
                     status: r.get("status"),
                     resolved_by_user_id: r.get("resolved_by_user_id"),
                     resolution_note: r.get("resolution_note"),
-                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
-                    resolved_at: r
-                        .get::<Option<String>, _>("resolved_at")
-                        .as_deref()
-                        .map(parse_time)
-                        .transpose()?,
+                    created_at: r.get("created_at"),
+                    resolved_at: r.get("resolved_at"),
                 })
             })
             .collect()
@@ -677,25 +672,25 @@ impl Store {
         if !matches!(status, "resolved" | "dismissed") {
             anyhow::bail!("invalid report resolution status");
         }
-        sqlx::query("UPDATE reports SET status=?,resolved_by_user_id=?,resolution_note=?,resolved_at=? WHERE id=? AND status='open'").bind(status).bind(resolver_user_id).bind(resolution_note).bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).bind(id).execute(&self.pool).await?;
+        sqlx::query("UPDATE reports SET status=$1,resolved_by_user_id=$2,resolution_note=$3,resolved_at=$4 WHERE id=$5 AND status='open'").bind(status).bind(resolver_user_id).bind(resolution_note).bind(Utc::now()).bind(id).execute(&self.pool).await?;
         Ok(())
     }
 
     // ---- boards — ported from Go internal/store/boards.go ----
-    fn row_to_board(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Board> {
-        let created: String = row.get("created_at");
+    fn row_to_board(row: &PgRow) -> anyhow::Result<Board> {
+        let created: DateTime<Utc> = row.get("created_at");
         Ok(Board {
             id: row.get("id"),
             slug: row.get("slug"),
             name: row.get("name"),
             description: row.get("description"),
-            allow_anonymous: row.get::<i64, _>("allow_anonymous") == 1,
-            guest_readable: row.get::<i64, _>("guest_readable") == 1,
-            created_at: parse_time(&created)?,
+            allow_anonymous: row.get::<bool, _>("allow_anonymous"),
+            guest_readable: row.get::<bool, _>("guest_readable"),
+            created_at: created,
         })
     }
 
-    /// CreateBoard — INSERT INTO boards(...) VALUES(?,?,?,?,?,?) ; bool→int, created_at chrono RFC3339Nano
+    /// CreateBoard — INSERT INTO boards(...) VALUES($1..$6) RETURNING id
     pub async fn create_board(
         &self,
         slug: &str,
@@ -704,14 +699,13 @@ impl Store {
         allow_anonymous: bool,
         guest_readable: bool,
     ) -> anyhow::Result<i64> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let res = sqlx::query("INSERT INTO boards(slug,name,description,allow_anonymous,guest_readable,created_at) VALUES(?,?,?,?,?,?)")
+        let id = sqlx::query_scalar::<_, i64>("INSERT INTO boards(slug,name,description,allow_anonymous,guest_readable,created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id")
             .bind(slug).bind(name).bind(desc)
-            .bind(if allow_anonymous {1} else {0})
-            .bind(if guest_readable {1} else {0})
-            .bind(&now)
-            .execute(&self.pool).await?;
-        Ok(res.last_insert_rowid())
+            .bind(allow_anonymous)
+            .bind(guest_readable)
+            .bind(Utc::now())
+            .fetch_one(&self.pool).await?;
+        Ok(id)
     }
 
     /// ListBoards — ORDER BY id ASC, bool映射, chrono文本解析 (RFC3339Nano/RFC3339兼容)
@@ -723,14 +717,14 @@ impl Store {
 
     /// GetBoardBySlug — SELECT ... WHERE slug=?
     pub async fn get_board_by_slug(&self, slug: &str) -> anyhow::Result<Option<Board>> {
-        let row = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards WHERE slug=?")
+        let row = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards WHERE slug=$1")
             .bind(slug).fetch_optional(&self.pool).await?;
         row.as_ref().map(Self::row_to_board).transpose()
     }
 
     /// GetBoardByID — SELECT ... WHERE id=?
     pub async fn get_board_by_id(&self, id: i64) -> anyhow::Result<Option<Board>> {
-        let row = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards WHERE id=?")
+        let row = sqlx::query("SELECT id,slug,name,description,allow_anonymous,guest_readable,created_at FROM boards WHERE id=$1")
             .bind(id).fetch_optional(&self.pool).await?;
         row.as_ref().map(Self::row_to_board).transpose()
     }
@@ -745,12 +739,12 @@ impl Store {
         guest_readable: bool,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE boards SET name=?,description=?,allow_anonymous=?,guest_readable=? WHERE id=?",
+            "UPDATE boards SET name=$1,description=$2,allow_anonymous=$3,guest_readable=$4 WHERE id=$5",
         )
         .bind(name)
         .bind(desc)
-        .bind(if allow_anonymous { 1 } else { 0 })
-        .bind(if guest_readable { 1 } else { 0 })
+        .bind(allow_anonymous)
+        .bind(guest_readable)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -759,7 +753,7 @@ impl Store {
 
     /// DeleteBoard — DELETE FROM boards WHERE id=?
     pub async fn delete_board(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM boards WHERE id=?")
+        sqlx::query("DELETE FROM boards WHERE id=$1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -781,6 +775,15 @@ impl Store {
         self.create_post_with_parent(thread_id, board_id, author_id, is_anonymous, md, html, None)
             .await
     }
+    pub async fn last_post_at(&self, author_id: i64) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+            "SELECT created_at FROM posts WHERE author_id=$1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(author_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(value,)| value))
+    }
     /// CreatePostWithParent: 楼中楼，parent_post_id None 表示回楼主，Some(pid) 表示回复某条评论
     #[allow(clippy::too_many_arguments)]
     pub async fn create_post_with_parent(
@@ -793,14 +796,13 @@ impl Store {
         html: &str,
         parent_post_id: Option<i64>,
     ) -> anyhow::Result<i64> {
-        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,parent_post_id,content_md,content_html,created_at) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(thread_id).bind(board_id).bind(author_id).bind(if is_anonymous {1} else {0}).bind(parent_post_id).bind(md).bind(html).bind(&now)
-            .execute(&mut *tx).await?;
-        let id = res.last_insert_rowid();
-        sqlx::query("UPDATE threads SET reply_count=reply_count+1, last_reply_at=? WHERE id=?")
-            .bind(&now)
+        let id = sqlx::query_scalar::<_, i64>("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,parent_post_id,content_md,content_html,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
+            .bind(thread_id).bind(board_id).bind(author_id).bind(is_anonymous).bind(parent_post_id).bind(md).bind(html).bind(now)
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("UPDATE threads SET reply_count=reply_count+1, last_reply_at=$1 WHERE id=$2")
+            .bind(now)
             .bind(thread_id)
             .execute(&mut *tx)
             .await?;
@@ -818,30 +820,30 @@ impl Store {
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
         let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=? AND deleted_at IS NULL")
+            sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=$1 AND deleted_at IS NULL")
                 .bind(thread_id)
                 .fetch_one(&self.pool)
                 .await?;
         let rows = sqlx::query(
             "SELECT p.id, p.thread_id, p.board_id, p.author_id, p.is_anonymous, p.parent_post_id, p.content_md, p.content_html, p.created_at, COALESCE(u.username,'deleted') \
              FROM posts p LEFT JOIN users u ON u.id=p.author_id \
-             WHERE p.thread_id=? AND p.deleted_at IS NULL ORDER BY p.id ASC LIMIT ? OFFSET ?"
+             WHERE p.thread_id=$1 AND p.deleted_at IS NULL ORDER BY p.id ASC LIMIT $2 OFFSET $3"
         )
         .bind(thread_id).bind(page_size).bind(offset)
         .fetch_all(&self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let created: String = r.get("created_at");
+            let created: DateTime<Utc> = r.get("created_at");
             out.push(Post {
                 id: r.get("id"),
                 thread_id: r.get("thread_id"),
                 board_id: r.get("board_id"),
                 author_id: r.get("author_id"),
-                is_anonymous: r.get::<i64, _>("is_anonymous") == 1,
+                is_anonymous: r.get::<bool, _>("is_anonymous"),
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
                 content_html: r.get("content_html"),
-                created_at: parse_time(&created)?,
+                created_at: created,
                 author_name: r.get::<String, _>(9),
             });
         }
@@ -851,21 +853,21 @@ impl Store {
     pub async fn get_post(&self, id: i64) -> anyhow::Result<Option<Post>> {
         let row = sqlx::query(
             "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted') \
-             FROM posts p LEFT JOIN users u ON u.id=p.author_id WHERE p.id=? AND p.deleted_at IS NULL"
+             FROM posts p LEFT JOIN users u ON u.id=p.author_id WHERE p.id=$1 AND p.deleted_at IS NULL"
         )
         .bind(id).fetch_optional(&self.pool).await?;
         if let Some(r) = row {
-            let created: String = r.get("created_at");
+            let created: DateTime<Utc> = r.get("created_at");
             return Ok(Some(Post {
                 id: r.get("id"),
                 thread_id: r.get("thread_id"),
                 board_id: r.get("board_id"),
                 author_id: r.get("author_id"),
-                is_anonymous: r.get::<i64, _>("is_anonymous") == 1,
+                is_anonymous: r.get::<bool, _>("is_anonymous"),
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
                 content_html: r.get("content_html"),
-                created_at: parse_time(&created)?,
+                created_at: created,
                 author_name: r.get::<String, _>(9),
             }));
         }
@@ -874,7 +876,7 @@ impl Store {
 
     pub async fn delete_post(&self, id: i64) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        let post = sqlx::query("SELECT thread_id FROM posts WHERE id=?")
+        let post = sqlx::query("SELECT thread_id FROM posts WHERE id=$1")
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -883,17 +885,17 @@ impl Store {
         };
         let thread_id: i64 = post.get("thread_id");
         let first_post: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM posts WHERE thread_id=? ORDER BY id ASC LIMIT 1")
+            sqlx::query_as("SELECT id FROM posts WHERE thread_id=$1 ORDER BY id ASC LIMIT 1")
                 .bind(thread_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        sqlx::query("DELETE FROM posts WHERE id=?")
+        sqlx::query("DELETE FROM posts WHERE id=$1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
         if first_post.map(|row| row.0 != id).unwrap_or(false) {
             sqlx::query(
-                "UPDATE threads SET reply_count=MAX(reply_count-1, 0), last_reply_at=COALESCE((SELECT MAX(created_at) FROM posts WHERE thread_id=?), created_at) WHERE id=?",
+                "UPDATE threads SET reply_count=GREATEST(reply_count-1, 0), last_reply_at=COALESCE((SELECT MAX(created_at) FROM posts WHERE thread_id=$1), created_at) WHERE id=$2",
             )
             .bind(thread_id)
             .bind(thread_id)
@@ -909,9 +911,9 @@ impl Store {
         deleted_by_user_id: Option<i64>,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE posts SET deleted_at=?, deleted_by_user_id=? WHERE id=? AND deleted_at IS NULL",
+            "UPDATE posts SET deleted_at=$1, deleted_by_user_id=$2 WHERE id=$3 AND deleted_at IS NULL",
         )
-        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true))
+        .bind(Utc::now())
         .bind(deleted_by_user_id)
         .bind(id)
         .execute(&self.pool)
@@ -919,7 +921,7 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
     pub async fn restore_post(&self, id: i64) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE posts SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=? AND deleted_at IS NOT NULL")
+        let result = sqlx::query("UPDATE posts SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=$1 AND deleted_at IS NOT NULL")
             .bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
@@ -927,7 +929,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at,COALESCE(u.username,'deleted') \
              FROM posts p LEFT JOIN users u ON u.id=p.author_id \
-             WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC,p.id DESC LIMIT ?",
+             WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC,p.id DESC LIMIT $1",
         )
         .bind(limit.clamp(1, 200))
         .fetch_all(&self.pool)
@@ -939,82 +941,109 @@ impl Store {
                     thread_id: r.get("thread_id"),
                     board_id: r.get("board_id"),
                     author_id: r.get("author_id"),
-                    is_anonymous: r.get::<i64, _>("is_anonymous") != 0,
+                    is_anonymous: r.get::<bool, _>("is_anonymous"),
                     parent_post_id: r.get("parent_post_id"),
                     content_md: r.get("content_md"),
                     content_html: r.get("content_html"),
-                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
+                    created_at: r.get("created_at"),
                     author_name: r.get(9),
                 })
             })
             .collect()
     }
 
-    /// SearchPosts: FTS5 posts_fts MATCH + rank 分页，返回 (posts, threads, total)
-    /// 对齐 Go: SELECT ... FROM posts_fts JOIN posts ... JOIN threads ... WHERE posts_fts MATCH ? ORDER BY rank
+    /// SearchPosts: substring search across thread titles and post bodies.
+    ///
+    /// SQLite FTS5 is replaced by `pg_trgm`. The input is treated as plain text
+    /// rather than a search expression, and the GIN trigram indexes on
+    /// `threads.title` and `posts.content_md` serve selective terms directly.
+    ///
+    /// The matching set is built per table (`SEARCH_MATCHES`) because a single
+    /// `title ILIKE .. OR content ILIKE ..` predicate spans two tables, which
+    /// forces a sequential scan on both sides of the join and cannot use either
+    /// index. Ordering depends on the match count: a small result set is ranked
+    /// by trigram similarity, while a very common term is returned newest-first,
+    /// which lets PostgreSQL stop after the requested page.
+    ///
+    /// Returns (posts, threads, total).
     pub async fn search_posts(
         &self,
         query: &str,
         page: i64,
         page_size: i64,
+        include_private_boards: bool,
     ) -> anyhow::Result<(Vec<Post>, Vec<ThreadBrief>, i64)> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
-        // FTS5 MATCH has a query language of its own. Treat search as plain
-        // text, not an FTS expression: strip control bytes and quotes that can
-        // otherwise produce parser errors such as "unterminated string".
         let normalized = query
             .chars()
-            .filter(|c| !c.is_control() && *c != '"')
+            .filter(|c| !c.is_control())
             .take(1024)
             .collect::<String>();
         let q = normalized.trim();
         if q.is_empty() {
             return Ok((Vec::new(), Vec::new(), 0));
         }
-        let short_query = q.chars().count() < 3;
-        // Quote the complete normalized input so punctuation cannot become an
-        // operator. Quotes were removed above, so this is always valid FTS5.
-        let fts_query = format!("\"{q}\"");
-        let total: (i64,) = if short_query {
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM posts p JOIN threads th ON th.id=p.thread_id WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND (th.title LIKE ? OR p.content_md LIKE ?)",
-            )
-            .bind(format!("%{}%", q))
-            .bind(format!("%{}%", q))
-            .fetch_one(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as("SELECT COUNT(*) FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN threads th ON th.id=p.thread_id WHERE posts_fts MATCH ? AND p.deleted_at IS NULL AND th.deleted_at IS NULL")
-                .bind(&fts_query)
+        // Escape LIKE wildcards so plain input cannot become a pattern that
+        // matches everything. Backslash is PostgreSQL's default LIKE escape.
+        let pattern = format!("%{}%", escape_like_pattern(q));
+        let total =
+            sqlx::query_scalar::<_, i64>(&format!("{SEARCH_MATCHES} SELECT COUNT(*) FROM matches"))
+                .bind(include_private_boards)
+                .bind(&pattern)
                 .fetch_one(&self.pool)
+                .await?;
+        if total == 0 {
+            return Ok((Vec::new(), Vec::new(), 0));
+        }
+        let rows = if total <= SEARCH_RANK_LIMIT {
+            // Few matches: score every row and rank by relevance.
+            let sql = format!(
+                "{SEARCH_MATCHES} \
+                 SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,\
+                        p.content_md,p.content_html,p.created_at, \
+                        COALESCE(u.username,'deleted') AS author_name, th.title, th.board_id AS th_board_id \
+                 FROM matches m \
+                 JOIN posts p ON p.id = m.post_id \
+                 JOIN threads th ON th.id = p.thread_id \
+                 JOIN boards b ON b.id = th.board_id \
+                 LEFT JOIN users u ON u.id = p.author_id \
+                 ORDER BY GREATEST(similarity(th.title,$3), similarity(p.content_md,$3)) DESC, p.id DESC \
+                 LIMIT $4 OFFSET $5"
+            );
+            sqlx::query(&sql)
+                .bind(include_private_boards)
+                .bind(&pattern)
+                .bind(q)
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
                 .await?
-        };
-        let rows = if short_query {
-            sqlx::query(
-                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts p JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND (th.title LIKE ? OR p.content_md LIKE ?) ORDER BY p.id DESC LIMIT ? OFFSET ?",
-            )
-            .bind(format!("%{}%", q))
-            .bind(format!("%{}%", q))
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
         } else {
-            sqlx::query(
-                "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted'), th.title, th.board_id as th_board_id FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN threads th ON th.id=p.thread_id LEFT JOIN users u ON u.id=p.author_id WHERE posts_fts MATCH ? AND p.deleted_at IS NULL AND th.deleted_at IS NULL ORDER BY rank LIMIT ? OFFSET ?",
-            )
-            .bind(&fts_query)
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+            // A very common term: newest first, which the primary key index
+            // satisfies by scanning backwards and stopping at the page size.
+            let sql = "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,\
+                              p.content_md,p.content_html,p.created_at, \
+                       COALESCE(u.username,'deleted') AS author_name, th.title, th.board_id AS th_board_id \
+                FROM posts p \
+                JOIN threads th ON th.id=p.thread_id \
+                JOIN boards b ON b.id=th.board_id \
+                LEFT JOIN users u ON u.id=p.author_id \
+                WHERE p.deleted_at IS NULL AND th.deleted_at IS NULL AND ($1 OR b.guest_readable) \
+                  AND (th.title ILIKE $2 ESCAPE '\\' OR p.content_md ILIKE $2 ESCAPE '\\') \
+                ORDER BY p.id DESC LIMIT $3 OFFSET $4";
+            sqlx::query(sql)
+                .bind(include_private_boards)
+                .bind(&pattern)
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
         };
         let mut posts = Vec::with_capacity(rows.len());
         let mut map: std::collections::HashMap<i64, ThreadBrief> = std::collections::HashMap::new();
         for r in rows {
-            let created: String = r.get("created_at");
             let tid: i64 = r.get("thread_id");
             let title: String = r.get("title");
             let th_board: i64 = r.get("th_board_id");
@@ -1023,12 +1052,12 @@ impl Store {
                 thread_id: tid,
                 board_id: r.get("board_id"),
                 author_id: r.get("author_id"),
-                is_anonymous: r.get::<i64, _>("is_anonymous") == 1,
+                is_anonymous: r.get::<bool, _>("is_anonymous"),
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
                 content_html: r.get("content_html"),
-                created_at: parse_time(&created)?,
-                author_name: r.get::<String, _>(9),
+                created_at: r.get("created_at"),
+                author_name: r.get::<String, _>("author_name"),
             });
             map.entry(tid).or_insert(ThreadBrief {
                 id: tid,
@@ -1037,23 +1066,23 @@ impl Store {
             });
         }
         let threads: Vec<ThreadBrief> = map.into_values().collect();
-        Ok((posts, threads, total.0))
+        Ok((posts, threads, total))
     }
 
     // ---- threads — ported from Go internal/store/threads.go ----
-    fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Thread> {
-        let last: String = row.get("last_reply_at");
-        let created: String = row.get("created_at");
+    fn row_to_thread(row: &PgRow) -> anyhow::Result<Thread> {
+        let last: DateTime<Utc> = row.get("last_reply_at");
+        let created: DateTime<Utc> = row.get("created_at");
         Ok(Thread {
             id: row.get("id"),
             board_id: row.get("board_id"),
             title: row.get("title"),
             author_id: row.get("author_id"),
-            is_pinned: row.get::<i64, _>("is_pinned") == 1,
-            is_locked: row.get::<i64, _>("is_locked") == 1,
+            is_pinned: row.get::<bool, _>("is_pinned"),
+            is_locked: row.get::<bool, _>("is_locked"),
             reply_count: row.get("reply_count"),
-            last_reply_at: parse_time(&last)?,
-            created_at: parse_time(&created)?,
+            last_reply_at: last,
+            created_at: created,
             author_name: row.get::<String, _>("author_name"),
             board_slug: row.get::<String, _>("board_slug"),
         })
@@ -1069,14 +1098,13 @@ impl Store {
         content_html: &str,
         is_anonymous: bool,
     ) -> anyhow::Result<i64> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query("INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(board_id).bind(title).bind(author_id).bind(0).bind(0).bind(0).bind(&now).bind(&now)
-            .execute(&mut *tx).await?;
-        let tid = res.last_insert_rowid();
-        sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,content_md,content_html,created_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(tid).bind(board_id).bind(author_id).bind(if is_anonymous {1} else {0}).bind(content_md).bind(content_html).bind(&now)
+        let tid = sqlx::query_scalar::<_, i64>("INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
+            .bind(board_id).bind(title).bind(author_id).bind(false).bind(false).bind(0i64).bind(now).bind(now)
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,content_md,content_html,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
+            .bind(tid).bind(board_id).bind(author_id).bind(is_anonymous).bind(content_md).bind(content_html).bind(now)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(tid)
@@ -1086,11 +1114,11 @@ impl Store {
     pub async fn get_thread(&self, id: i64) -> anyhow::Result<Option<Thread>> {
         let row = sqlx::query(
             "SELECT th.id, th.board_id, th.title, th.author_id, th.is_pinned, th.is_locked, th.reply_count, th.last_reply_at, th.created_at, \
-                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous=1) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
+                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
              FROM threads th \
              LEFT JOIN users u ON u.id=th.author_id \
              LEFT JOIN boards b ON b.id=th.board_id \
-             WHERE th.id=? AND th.deleted_at IS NULL"
+             WHERE th.id=$1 AND th.deleted_at IS NULL"
         )
         .bind(id).fetch_optional(&self.pool).await?;
         row.as_ref().map(Self::row_to_thread).transpose()
@@ -1107,19 +1135,19 @@ impl Store {
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
         let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM threads WHERE board_id=? AND deleted_at IS NULL")
+            sqlx::query_as("SELECT COUNT(*) FROM threads WHERE board_id=$1 AND deleted_at IS NULL")
                 .bind(board_id)
                 .fetch_one(&self.pool)
                 .await?;
         let rows = sqlx::query(
             "SELECT th.id, th.board_id, th.title, th.author_id, th.is_pinned, th.is_locked, th.reply_count, th.last_reply_at, th.created_at, \
-                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous=1) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
+                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
              FROM threads th \
              LEFT JOIN users u ON u.id=th.author_id \
              LEFT JOIN boards b ON b.id=th.board_id \
-             WHERE th.board_id=? AND th.deleted_at IS NULL \
+             WHERE th.board_id=$1 AND th.deleted_at IS NULL \
              ORDER BY th.is_pinned DESC, th.last_reply_at DESC, th.id DESC \
-             LIMIT ? OFFSET ?"
+             LIMIT $2 OFFSET $3"
         )
         .bind(board_id).bind(page_size).bind(offset)
         .fetch_all(&self.pool).await?;
@@ -1133,8 +1161,8 @@ impl Store {
 
     /// SetThreadPinned — UPDATE threads SET is_pinned=?
     pub async fn set_thread_pinned(&self, id: i64, pinned: bool) -> anyhow::Result<()> {
-        sqlx::query("UPDATE threads SET is_pinned=? WHERE id=?")
-            .bind(if pinned { 1 } else { 0 })
+        sqlx::query("UPDATE threads SET is_pinned=$1 WHERE id=$2")
+            .bind(pinned)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1143,8 +1171,8 @@ impl Store {
 
     /// SetThreadLocked — UPDATE threads SET is_locked=?
     pub async fn set_thread_locked(&self, id: i64, locked: bool) -> anyhow::Result<()> {
-        sqlx::query("UPDATE threads SET is_locked=? WHERE id=?")
-            .bind(if locked { 1 } else { 0 })
+        sqlx::query("UPDATE threads SET is_locked=$1 WHERE id=$2")
+            .bind(locked)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1153,7 +1181,7 @@ impl Store {
 
     /// DeleteThread — DELETE FROM threads WHERE id=? (posts CASCADE via FK)
     pub async fn delete_thread(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM threads WHERE id=?")
+        sqlx::query("DELETE FROM threads WHERE id=$1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1164,21 +1192,21 @@ impl Store {
         id: i64,
         deleted_by_user_id: Option<i64>,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET deleted_at=?, deleted_by_user_id=? WHERE id=? AND deleted_at IS NULL")
-            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)).bind(deleted_by_user_id).bind(id).execute(&self.pool).await?;
+        let result = sqlx::query("UPDATE threads SET deleted_at=$1, deleted_by_user_id=$2 WHERE id=$3 AND deleted_at IS NULL")
+            .bind(Utc::now()).bind(deleted_by_user_id).bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
     pub async fn restore_thread(&self, id: i64) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=? AND deleted_at IS NOT NULL")
+        let result = sqlx::query("UPDATE threads SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=$1 AND deleted_at IS NOT NULL")
             .bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
     pub async fn list_deleted_threads(&self, limit: i64) -> anyhow::Result<Vec<Thread>> {
         let rows = sqlx::query(
             "SELECT th.id,th.board_id,th.title,th.author_id,th.is_pinned,th.is_locked,th.reply_count,th.last_reply_at,th.created_at, \
-                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous=1) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name,COALESCE(b.slug,'') AS board_slug \
+                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name,COALESCE(b.slug,'') AS board_slug \
              FROM threads th LEFT JOIN users u ON u.id=th.author_id LEFT JOIN boards b ON b.id=th.board_id \
-             WHERE th.deleted_at IS NOT NULL ORDER BY th.deleted_at DESC,th.id DESC LIMIT ?",
+             WHERE th.deleted_at IS NOT NULL ORDER BY th.deleted_at DESC,th.id DESC LIMIT $1",
         )
         .bind(limit.clamp(1, 200))
         .fetch_all(&self.pool)
@@ -1188,23 +1216,38 @@ impl Store {
 
     // ---- invite_codes — ported from Go internal/store/invite.go ----
     pub async fn create_invite(&self, code: &str, created_by: i64) -> anyhow::Result<()> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        sqlx::query("INSERT INTO invite_codes(code,created_by,created_at) VALUES(?,?,?)")
+        self.create_invite_with_options(code, created_by, 1, None, "")
+            .await
+    }
+    pub async fn create_invite_with_options(
+        &self,
+        code: &str,
+        created_by: i64,
+        max_uses: i64,
+        expires_at: Option<&str>,
+        note: &str,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now();
+        sqlx::query("INSERT INTO invite_codes(code,created_by,created_at,max_uses,expires_at,note) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(code)
             .bind(created_by)
-            .bind(&now)
+            .bind(now)
+            .bind(max_uses.clamp(1, 100000))
+            .bind(expires_at)
+            .bind(note)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn use_invite(&self, code: &str, used_by: i64) -> anyhow::Result<()> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let now = Utc::now();
         let res = sqlx::query(
-            "UPDATE invite_codes SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL",
+            "UPDATE invite_codes SET used_by=COALESCE(used_by,$1), used_at=$2, use_count=use_count+1 WHERE code=$3 AND revoked_at IS NULL AND use_count < max_uses AND (expires_at IS NULL OR expires_at > $4)",
         )
         .bind(used_by)
-        .bind(&now)
+        .bind(now)
         .bind(code)
+        .bind(now)
         .execute(&self.pool)
         .await?;
         if res.rows_affected() == 0 {
@@ -1219,22 +1262,22 @@ impl Store {
         code: &str,
     ) -> anyhow::Result<i64> {
         let mut tx = self.pool.begin().await?;
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let user = sqlx::query(
-            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,0,?)",
+        let now = Utc::now();
+        let uid = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES($1,$2,FALSE,$3) RETURNING id",
         )
         .bind(username)
         .bind(hash)
-        .bind(&now)
-        .execute(&mut *tx)
+        .bind(now)
+        .fetch_one(&mut *tx)
         .await?;
-        let uid = user.last_insert_rowid();
         let used = sqlx::query(
-            "UPDATE invite_codes SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL",
+            "UPDATE invite_codes SET used_by=COALESCE(used_by,$1), used_at=$2, use_count=use_count+1 WHERE code=$3 AND revoked_at IS NULL AND use_count < max_uses AND (expires_at IS NULL OR expires_at > $4)",
         )
         .bind(uid)
-        .bind(&now)
+        .bind(now)
         .bind(code)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         if used.rows_affected() != 1 {
@@ -1246,31 +1289,47 @@ impl Store {
     }
     pub async fn invite_exists(&self, code: &str) -> anyhow::Result<bool> {
         let row =
-            sqlx::query("SELECT 1 as avail FROM invite_codes WHERE code=? AND used_by IS NULL")
+            sqlx::query("SELECT 1 as avail FROM invite_codes WHERE code=$1 AND revoked_at IS NULL AND use_count < max_uses AND (expires_at IS NULL OR expires_at > now())")
                 .bind(code)
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.is_some())
     }
     pub async fn list_invites(&self) -> anyhow::Result<Vec<InviteCode>> {
-        let rows = sqlx::query("SELECT code,created_by,used_by,created_at,used_at FROM invite_codes ORDER BY created_at DESC")
+        let rows = sqlx::query("SELECT code,created_by,used_by,created_at,used_at,max_uses,use_count,expires_at,revoked_at,revoked_by,note FROM invite_codes ORDER BY created_at DESC")
             .fetch_all(&self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let created: String = r.get("created_at");
-            let used: Option<String> = r.get("used_at");
+            let created: DateTime<Utc> = r.get("created_at");
+            let used: Option<DateTime<Utc>> = r.get("used_at");
             out.push(InviteCode {
                 code: r.get("code"),
                 created_by: r.get("created_by"),
                 used_by: r.get("used_by"),
-                created_at: parse_time(&created)?,
-                used_at: used.as_deref().map(parse_time).transpose()?,
+                created_at: created,
+                used_at: used,
+                max_uses: r.get("max_uses"),
+                use_count: r.get("use_count"),
+                expires_at: r.get("expires_at"),
+                revoked_at: r.get("revoked_at"),
+                revoked_by: r.get("revoked_by"),
+                note: r.get("note"),
             });
         }
         Ok(out)
     }
     pub async fn delete_invite(&self, code: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM invite_codes WHERE code=?")
+        sqlx::query(
+            "UPDATE invite_codes SET revoked_at=now() WHERE code=$1 AND revoked_at IS NULL",
+        )
+        .bind(code)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    pub async fn revoke_invite(&self, code: &str, revoked_by: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE invite_codes SET revoked_at=now(), revoked_by=$1 WHERE code=$2 AND revoked_at IS NULL")
+            .bind(revoked_by)
             .bind(code)
             .execute(&self.pool)
             .await?;
@@ -1286,42 +1345,44 @@ impl Store {
         let now = Utc::now();
         let exp = now + chrono::Duration::hours(30 * 24);
         sqlx::query(
-            "INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at) VALUES($1,$2,$3,$4,$5)",
         )
         .bind(&id)
         .bind(user_id)
-        .bind(now.to_rfc3339_opts(SecondsFormat::Nanos, true))
-        .bind(exp.to_rfc3339_opts(SecondsFormat::Nanos, true))
-        .bind(now.to_rfc3339_opts(SecondsFormat::Nanos, true))
+        .bind(now)
+        .bind(exp)
+        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(id)
     }
     pub async fn get_session(&self, id: &str) -> anyhow::Result<Option<Session>> {
-        let row = sqlx::query("SELECT s.id,s.user_id,s.created_at,s.expires_at,s.last_seen_at, u.username, u.is_banned FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=?")
+        let row = sqlx::query("SELECT s.id,s.user_id,s.created_at,s.expires_at,s.last_seen_at, u.username, u.is_banned FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1")
             .bind(id).fetch_optional(&self.pool).await?;
         if let Some(r) = row {
-            let created: String = r.get("created_at");
-            let exp: String = r.get("expires_at");
-            let last_seen: String = r.get("last_seen_at");
-            let is_banned: i64 = r.get("is_banned");
+            let created: DateTime<Utc> = r.get("created_at");
+            let exp: DateTime<Utc> = r.get("expires_at");
+            let last_seen: Option<DateTime<Utc>> = r.get("last_seen_at");
+            let is_banned: bool = r.get("is_banned");
             let sess = Session {
                 id: r.get("id"),
                 user_id: r.get("user_id"),
-                created_at: parse_time(&created)?,
-                expires_at: parse_time(&exp)?,
-                last_seen_at: parse_time(&last_seen)?,
+                created_at: created,
+                expires_at: exp,
+                last_seen_at: last_seen,
             };
             let now = Utc::now();
             if now > sess.expires_at
-                || now - sess.last_seen_at > chrono::Duration::hours(12)
-                || is_banned == 1
+                || sess
+                    .last_seen_at
+                    .is_none_or(|seen| now - seen > chrono::Duration::hours(12))
+                || is_banned
             {
                 let _ = self.delete_session(id).await;
                 return Ok(None);
             }
-            let _ = sqlx::query("UPDATE sessions SET last_seen_at=? WHERE id=?")
-                .bind(now.to_rfc3339_opts(SecondsFormat::Nanos, true))
+            let _ = sqlx::query("UPDATE sessions SET last_seen_at=$1 WHERE id=$2")
+                .bind(now)
                 .bind(id)
                 .execute(&self.pool)
                 .await;
@@ -1330,50 +1391,47 @@ impl Store {
         Ok(None)
     }
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE id=?")
+        sqlx::query("DELETE FROM sessions WHERE id=$1")
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn delete_sessions_by_user(&self, user_id: i64) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE user_id=?")
+        sqlx::query("DELETE FROM sessions WHERE user_id=$1")
             .bind(user_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn list_sessions_by_user(&self, user_id: i64) -> anyhow::Result<Vec<Session>> {
-        let rows = sqlx::query("SELECT id,user_id,created_at,expires_at,last_seen_at FROM sessions WHERE user_id=? ORDER BY created_at DESC")
+        let rows = sqlx::query("SELECT id,user_id,created_at,expires_at,last_seen_at FROM sessions WHERE user_id=$1 ORDER BY created_at DESC")
             .bind(user_id).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| {
                 Ok(Session {
                     id: r.get("id"),
                     user_id: r.get("user_id"),
-                    created_at: parse_time(&r.get::<String, _>("created_at"))?,
-                    expires_at: parse_time(&r.get::<String, _>("expires_at"))?,
-                    last_seen_at: parse_time(&r.get::<String, _>("last_seen_at"))?,
+                    created_at: r.get("created_at"),
+                    expires_at: r.get("expires_at"),
+                    last_seen_at: r.get("last_seen_at"),
                 })
             })
             .collect()
     }
     pub async fn count_sessions_by_user(&self, user_id: i64) -> anyhow::Result<i64> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id=?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id=$1")
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
             .map_err(Into::into)
     }
     pub async fn delete_expired_sessions(&self) -> anyhow::Result<u64> {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let now = Utc::now();
         Ok(
-            sqlx::query("DELETE FROM sessions WHERE expires_at <= ? OR last_seen_at <= ?")
-                .bind(&now)
-                .bind(
-                    (Utc::now() - chrono::Duration::hours(12))
-                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
-                )
+            sqlx::query("DELETE FROM sessions WHERE expires_at <= $1 OR last_seen_at <= $2")
+                .bind(now)
+                .bind(Utc::now() - chrono::Duration::hours(12))
                 .execute(&self.pool)
                 .await?
                 .rows_affected(),
@@ -1392,48 +1450,125 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn test_posts_crud_and_search() -> anyhow::Result<()> {
-        let s = Store::open(":memory:").await?;
-        sqlx::query(
-            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,0,?)",
+
+    /// Every credential form sqlx accepts must lose its password before the
+    /// string can reach a log line or an error message.
+    #[test]
+    fn passwords_are_redacted_from_every_connection_string_form() {
+        for (input, expected) in [
+            (
+                "postgres://user:hunter2@127.0.0.1:5432/db",
+                "postgres://user:***@127.0.0.1:5432/db",
+            ),
+            // A password containing '@': the last '@' is the separator.
+            (
+                "postgres://user:p@ss@127.0.0.1:5432/db",
+                "postgres://user:***@127.0.0.1:5432/db",
+            ),
+            // Query parameter form.
+            (
+                "postgres:///db?host=/var/run/postgresql&password=hunter2",
+                "postgres:///db?host=/var/run/postgresql&password=***",
+            ),
+            // libpq keyword/value form, password first and in the middle.
+            (
+                "password=hunter2 host=127.0.0.1 user=u",
+                "password=*** host=127.0.0.1 user=u",
+            ),
+            (
+                "host=127.0.0.1 password=hunter2 user=u dbname=x",
+                "host=127.0.0.1 password=*** user=u dbname=x",
+            ),
+            // Quoted keyword value with a space inside.
+            (
+                "host=h password='two words' user=u",
+                "host=h password=*** user=u",
+            ),
+            // Already redacted stays redacted.
+            ("postgres://u:***@h/db", "postgres://u:***@h/db"),
+            // No credential at all is left alone, including lookalike keys.
+            (
+                "postgres:///veil_forum?host=/var/run/postgresql",
+                "postgres:///veil_forum?host=/var/run/postgresql",
+            ),
+            ("host=h mypassword=x user=u", "host=h mypassword=x user=u"),
+        ] {
+            assert_eq!(redact_database_url(input), expected, "input: {input}");
+        }
+    }
+
+    /// The scan must always make progress: a repeated key cannot hang it.
+    #[test]
+    fn redaction_terminates_on_repeated_keys() {
+        assert_eq!(
+            redact_database_url("password=password=password=x"),
+            "password=***"
+        );
+        assert_eq!(redact_database_url("password="), "password=***");
+    }
+
+    /// `sqlx::test` provisions a fresh database with `migrations/` applied.
+    /// Seeding is done here because first-run defaults live in the store, not
+    /// in the schema.
+    async fn test_store(pool: PgPool) -> anyhow::Result<Store> {
+        let store = Store { pool };
+        store.seed_defaults().await?;
+        Ok(store)
+    }
+
+    async fn add_user(pool: &PgPool, username: &str, is_admin: bool) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES($1,$2,$3,$4) RETURNING id",
         )
-        .bind("alice")
+        .bind(username)
         .bind("hash")
-        .bind(Utc::now().to_rfc3339())
-        .execute(&s.pool)
-        .await?;
-        let uid: (i64,) = sqlx::query_as("SELECT id FROM users WHERE username='alice'")
-            .fetch_one(&s.pool)
-            .await?;
+        .bind(is_admin)
+        .bind(Utc::now())
+        .fetch_one(pool)
+        .await?)
+    }
+
+    async fn add_thread(
+        pool: &PgPool,
+        board_id: i64,
+        author_id: i64,
+        title: &str,
+    ) -> anyhow::Result<i64> {
+        let now = Utc::now();
+        Ok(sqlx::query_scalar::<_, i64>(
+            "INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) \
+             VALUES($1,$2,$3,FALSE,FALSE,0,$4,$4) RETURNING id",
+        )
+        .bind(board_id)
+        .bind(title)
+        .bind(author_id)
+        .bind(now)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    #[sqlx::test]
+    async fn test_posts_crud_and_search(pool: PgPool) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let uid = add_user(&s.pool, "alice", false).await?;
         let bid: (i64,) = sqlx::query_as("SELECT id FROM boards LIMIT 1")
             .fetch_one(&s.pool)
             .await?;
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let res = sqlx::query("INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(bid.0).bind("hello world").bind(uid.0).bind(0).bind(0).bind(0).bind(&now).bind(&now).execute(&s.pool).await?;
-        let tid = res.last_insert_rowid();
+        let tid = add_thread(&s.pool, bid.0, uid, "hello world").await?;
         let pid1 = s
-            .create_post(
-                tid,
-                bid.0,
-                uid.0,
-                false,
-                "first post **md**",
-                "<p>first</p>",
-            )
+            .create_post(tid, bid.0, uid, false, "first post **md**", "<p>first</p>")
             .await?;
         let pid2 = s
             .create_post(
                 tid,
                 bid.0,
-                uid.0,
+                uid,
                 true,
                 "anonymous reply secret",
                 "<p>anon</p>",
             )
             .await?;
-        let rc: (i64,) = sqlx::query_as("SELECT reply_count FROM threads WHERE id=?")
+        let rc: (i64,) = sqlx::query_as("SELECT reply_count FROM threads WHERE id=$1")
             .bind(tid)
             .fetch_one(&s.pool)
             .await?;
@@ -1447,74 +1582,154 @@ mod tests {
         assert_eq!(p2.len(), 1);
         assert_eq!(p2[0].id, pid2);
         s.delete_post(pid2).await?;
-        let rc_after_delete: (i64,) = sqlx::query_as("SELECT reply_count FROM threads WHERE id=?")
+        let rc_after_delete: (i64,) = sqlx::query_as("SELECT reply_count FROM threads WHERE id=$1")
             .bind(tid)
             .fetch_one(&s.pool)
             .await?;
         assert_eq!(rc_after_delete.0, 1);
-        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=?")
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts WHERE thread_id=$1")
             .bind(tid)
             .fetch_one(&s.pool)
             .await?;
         assert_eq!(remaining.0, 1);
         let gp = s.get_post(pid1).await?.unwrap();
         assert_eq!(gp.id, pid1);
+
         let pid3 = s
             .create_post(
                 tid,
                 bid.0,
-                uid.0,
+                uid,
                 false,
-                "rust fts5 search banana",
+                "trigram search banana",
                 "<p>banana</p>",
             )
             .await?;
-        let (hits, threads, _total) = s.search_posts("banana", 1, 10).await?;
+        let (hits, threads, total) = s.search_posts("banana", 1, 10, true).await?;
+        assert_eq!(total, 1);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, pid3);
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].title, "hello world");
-        let (short_hits, _, short_total) = s.search_posts("ba", 1, 10).await?;
+
+        // Shorter than a full trigram: still matched, via the sequential path.
+        let (short_hits, _, short_total) = s.search_posts("ba", 1, 10, true).await?;
         assert_eq!(short_total, 1);
         assert_eq!(short_hits[0].id, pid3);
-        let (bounded_hits, _, bounded_total) = s.search_posts("a", 1, 10_000).await?;
+
+        // Chinese substring search, which the trigram index serves directly.
+        let zh = s
+            .create_post(tid, bid.0, uid, false, "中文检索测试内容", "<p>zh</p>")
+            .await?;
+        let (zh_hits, _, zh_total) = s.search_posts("检索测试", 1, 10, true).await?;
+        assert_eq!(zh_total, 1);
+        assert_eq!(zh_hits[0].id, zh);
+
+        // A single-character query still matches; page size is clamped to 100.
+        let (bounded_hits, _, bounded_total) = s.search_posts("a", 1, 10_000, true).await?;
         assert_eq!(bounded_total, 1);
         assert_eq!(bounded_hits.len(), 1);
-        let (late_hits, _, late_total) = s.search_posts("banana", 2, 10_000).await?;
+        assert_eq!(bounded_hits[0].id, pid3);
+
+        // A page past the last match still reports the real total.
+        let (late_hits, _, late_total) = s.search_posts("banana", 2, 10_000, true).await?;
         assert_eq!(late_total, 1);
         assert!(late_hits.is_empty());
-        let (quoted_hits, _, quoted_total) = s.search_posts("banana\"", 1, 10).await?;
-        assert_eq!(quoted_total, 1);
-        assert_eq!(quoted_hits[0].id, pid3);
-        let (empty_hits, empty_threads, empty_total) = s.search_posts("  ", 1, 1000).await?;
+
+        let (empty_hits, empty_threads, empty_total) = s.search_posts("  ", 1, 1000, true).await?;
         assert!(empty_hits.is_empty());
         assert!(empty_threads.is_empty());
         assert_eq!(empty_total, 0);
+
         s.delete_post(pid1).await?;
         assert!(s.get_post(pid1).await?.is_none());
-        let (hits3, _, _) = s.search_posts("first", 1, 10).await?;
-        // deleted post should not appear
+        let (hits3, _, _) = s.search_posts("first", 1, 10, true).await?;
         assert!(hits3.is_empty());
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_invite_registration_is_atomic_and_single_use() -> anyhow::Result<()> {
-        let s = Store::open(":memory:").await?;
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let admin = sqlx::query(
-            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,1,?)",
+    #[sqlx::test]
+    async fn search_treats_wildcards_literally(pool: PgPool) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let uid = add_user(&s.pool, "alice", false).await?;
+        let bid: (i64,) = sqlx::query_as("SELECT id FROM boards LIMIT 1")
+            .fetch_one(&s.pool)
+            .await?;
+        let tid = add_thread(&s.pool, bid.0, uid, "pricing thread").await?;
+        s.create_post(
+            tid,
+            bid.0,
+            uid,
+            false,
+            "discount is 50% today",
+            "<p>50%</p>",
         )
-        .bind("admin")
-        .bind("hash")
-        .bind(&now)
-        .execute(&s.pool)
-        .await?
-        .last_insert_rowid();
-        sqlx::query("INSERT INTO invite_codes(code,created_by,created_at) VALUES(?,?,?)")
+        .await?;
+        s.create_post(tid, bid.0, uid, false, "unrelated body", "<p>x</p>")
+            .await?;
+
+        // `%` and `_` are escaped, so they match literally instead of matching
+        // everything.
+        let (hits, _, total) = s.search_posts("50%", 1, 10, true).await?;
+        assert_eq!(total, 1);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content_md.contains("50%"));
+
+        // `%` matches the post that contains a literal percent sign, and only
+        // that post: without escaping it would match every row.
+        let (wild, _, wild_total) = s.search_posts("%", 1, 10, true).await?;
+        assert_eq!(wild_total, 1, "escaped % must match literally");
+        assert_eq!(wild.len(), 1);
+        assert!(wild[0].content_md.contains("50%"));
+
+        let (under, _, under_total) = s.search_posts("_", 1, 10, true).await?;
+        assert_eq!(
+            under_total, 0,
+            "escaped _ must not match any single character"
+        );
+        assert!(under.is_empty());
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn search_hides_non_guest_readable_boards_from_visitors(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let user_id = add_user(&s.pool, "searcher", false).await?;
+        let private_board = s
+            .create_board("private", "Private", "restricted", false, false)
+            .await?;
+        s.create_thread(
+            private_board,
+            user_id,
+            "private audit marker",
+            "private audit marker",
+            "<p>private audit marker</p>",
+            false,
+        )
+        .await?;
+
+        let (visitor_hits, _, visitor_total) =
+            s.search_posts("private audit marker", 1, 20, false).await?;
+        assert_eq!(visitor_total, 0);
+        assert!(visitor_hits.is_empty());
+
+        let (member_hits, _, member_total) =
+            s.search_posts("private audit marker", 1, 20, true).await?;
+        assert_eq!(member_total, 1);
+        assert_eq!(member_hits.len(), 1);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_invite_registration_is_atomic_and_single_use(pool: PgPool) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let admin = add_user(&s.pool, "admin", true).await?;
+        sqlx::query("INSERT INTO invite_codes(code,created_by,created_at) VALUES($1,$2,$3)")
             .bind("one-use")
             .bind(admin)
-            .bind(&now)
+            .bind(Utc::now())
             .execute(&s.pool)
             .await?;
 
@@ -1533,40 +1748,29 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_session_absolute_and_idle_expiry_are_enforced() -> anyhow::Result<()> {
-        let s = Store::open(":memory:").await?;
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let uid = sqlx::query("INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)")
-            .bind("alice")
-            .bind("hash")
-            .bind(&now)
-            .execute(&s.pool)
-            .await?
-            .last_insert_rowid();
+    #[sqlx::test]
+    async fn test_session_absolute_and_idle_expiry_are_enforced(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let uid = add_user(&s.pool, "alice", false).await?;
 
         let absolute = s.create_session(uid).await?;
-        sqlx::query("UPDATE sessions SET expires_at=? WHERE id=?")
-            .bind(
-                (Utc::now() - chrono::Duration::seconds(1))
-                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
+        sqlx::query("UPDATE sessions SET expires_at=$1 WHERE id=$2")
+            .bind(Utc::now() - chrono::Duration::seconds(1))
             .bind(&absolute)
             .execute(&s.pool)
             .await?;
         assert!(s.get_user_by_session(&absolute).await?.is_none());
-        assert!(sqlx::query("SELECT 1 FROM sessions WHERE id=?")
+        assert!(sqlx::query("SELECT 1 FROM sessions WHERE id=$1")
             .bind(&absolute)
             .fetch_optional(&s.pool)
             .await?
             .is_none());
 
         let idle = s.create_session(uid).await?;
-        sqlx::query("UPDATE sessions SET last_seen_at=? WHERE id=?")
-            .bind(
-                (Utc::now() - chrono::Duration::hours(12) - chrono::Duration::seconds(1))
-                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
+        sqlx::query("UPDATE sessions SET last_seen_at=$1 WHERE id=$2")
+            .bind(Utc::now() - chrono::Duration::hours(12) - chrono::Duration::seconds(1))
             .bind(&idle)
             .execute(&s.pool)
             .await?;
@@ -1574,22 +1778,16 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_anonymous_thread_author_is_hidden_in_detail_and_listing() -> anyhow::Result<()> {
-        let s = Store::open(":memory:").await?;
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let uid = sqlx::query("INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)")
-            .bind("alice")
-            .bind("hash")
-            .bind(&now)
-            .execute(&s.pool)
-            .await?
-            .last_insert_rowid();
+    #[sqlx::test]
+    async fn test_anonymous_thread_author_is_hidden_in_detail_and_listing(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let uid = add_user(&s.pool, "alice", false).await?;
         let bid: (i64,) = sqlx::query_as("SELECT id FROM boards LIMIT 1")
             .fetch_one(&s.pool)
             .await?;
-        let tid = sqlx::query("INSERT INTO threads(board_id,title,author_id,last_reply_at,created_at) VALUES(?,?,?,?,?)")
-            .bind(bid.0).bind("private title").bind(uid).bind(&now).bind(&now).execute(&s.pool).await?.last_insert_rowid();
+        let tid = add_thread(&s.pool, bid.0, uid, "private title").await?;
         s.create_post(tid, bid.0, uid, true, "anonymous", "<p>anonymous</p>")
             .await?;
         s.create_post(tid, bid.0, uid, false, "named reply", "<p>reply</p>")
@@ -1606,272 +1804,116 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_thread_listing_uses_complete_order_index() -> anyhow::Result<()> {
-        let s = Store::open(":memory:").await?;
-        let plan: Vec<String> = sqlx::query(
-            "EXPLAIN QUERY PLAN SELECT id FROM threads WHERE board_id=? ORDER BY is_pinned DESC, last_reply_at DESC, id DESC LIMIT ? OFFSET ?",
+    #[sqlx::test]
+    async fn test_thread_listing_uses_complete_order_index(pool: PgPool) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let uid = add_user(&s.pool, "alice", false).await?;
+        let bid: (i64,) = sqlx::query_as("SELECT id FROM boards LIMIT 1")
+            .fetch_one(&s.pool)
+            .await?;
+        // Enough rows that the planner prefers the ordering index over a sort.
+        sqlx::query(
+            "INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) \
+             SELECT $1, 'thread '||g, $2, FALSE, FALSE, 0, now() - (g || ' seconds')::interval, now() \
+             FROM generate_series(1, 500) g",
         )
-        .bind(1_i64)
+        .bind(bid.0)
+        .bind(uid)
+        .execute(&s.pool)
+        .await?;
+
+        // This mirrors the board listing query. PostgreSQL must reach the rows
+        // through an index that also provides the complete ordering, so the
+        // plan must not contain a sort node. Sequence scans are disabled so the
+        // assertion tests index coverage rather than table size, and statistics
+        // are refreshed so the plan does not depend on default estimates.
+        sqlx::query("ANALYZE threads").execute(&s.pool).await?;
+        let mut tx = s.pool.begin().await?;
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN SELECT th.id FROM threads th WHERE th.board_id=$1 AND th.deleted_at IS NULL \
+             ORDER BY th.is_pinned DESC, th.last_reply_at DESC, th.id DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(bid.0)
         .bind(20_i64)
         .bind(0_i64)
-        .fetch_all(&s.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.get::<String, _>("detail"))
-        .collect();
-        assert!(plan
-            .iter()
-            .any(|line| line.contains("idx_threads_board_order")));
-        assert!(!plan.iter().any(|line| line.contains("TEMP B-TREE")));
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        let plan = rows
+            .into_iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("idx_threads"), "plan: {plan}");
+        assert!(!plan.contains("Sort"), "unexpected sort node: {plan}");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn search_plan_uses_trigram_index(pool: PgPool) -> anyhow::Result<()> {
+        let s = test_store(pool).await?;
+        let uid = add_user(&s.pool, "alice", false).await?;
+        let bid: (i64,) = sqlx::query_as("SELECT id FROM boards LIMIT 1")
+            .fetch_one(&s.pool)
+            .await?;
+        let tid = add_thread(&s.pool, bid.0, uid, "index probe").await?;
+        for i in 0..200 {
+            s.create_post(
+                tid,
+                bid.0,
+                uid,
+                false,
+                &format!("filler body number {i} with distinctive tokens"),
+                "<p>filler</p>",
+            )
+            .await?;
+        }
+        // The planner needs statistics for the trigram index to be chosen.
+        sqlx::query("ANALYZE posts").execute(&s.pool).await?;
+        let mut tx = s.pool.begin().await?;
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN SELECT p.id FROM posts p WHERE p.content_md ILIKE $1 ESCAPE '\\'",
+        )
+        .bind("%distinctive tokens%")
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        let plan = rows
+            .into_iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("idx_posts_content_trgm"), "plan: {plan}");
         Ok(())
     }
 
     #[test]
-    fn test_parse_time_dual_format() {
-        // Go time.RFC3339Nano 写入示例: 2026-08-26T08:17:36.853853123Z
-        let nano = "2026-08-26T08:17:36.853853123Z";
-        let dt_nano = parse_time(nano).expect("valid test timestamp");
+    fn test_redact_database_url_removes_password() {
         assert_eq!(
-            dt_nano.to_rfc3339_opts(SecondsFormat::Nanos, true),
-            "2026-08-26T08:17:36.853853123Z"
+            redact_database_url("postgres://veil:secret@localhost:5432/veil_forum"),
+            "postgres://veil:***@localhost:5432/veil_forum"
         );
-
-        // Go time.RFC3339Nano 带 offset
-        let nano_offset = "2026-08-26T16:17:36.123456789+08:00";
-        let dt_nano_off = parse_time(nano_offset).expect("valid test timestamp");
-        // 验证解析后 UTC 时间正确（+08:00 -> Z 差 8h）
         assert_eq!(
-            dt_nano_off.to_rfc3339_opts(SecondsFormat::Nanos, true),
-            "2026-08-26T08:17:36.123456789Z"
+            redact_database_url("postgres://veil_forum?host=/var/run/postgresql"),
+            "postgres://veil_forum?host=/var/run/postgresql"
         );
-
-        // Go time.RFC3339 写入示例: 2026-08-26T08:17:36Z (seedDefaults 使用)
-        let rfc = "2026-08-26T08:17:36Z";
-        let dt_rfc = parse_time(rfc).expect("valid test timestamp");
         assert_eq!(
-            dt_rfc.to_rfc3339_opts(SecondsFormat::Secs, true),
-            "2026-08-26T08:17:36Z"
+            redact_database_url("postgres:///veil?host=/run&password=hunter2&user=x"),
+            "postgres:///veil?host=/run&password=***&user=x"
         );
-
-        // Go time.RFC3339 带 offset
-        let rfc_offset = "2026-08-26T16:17:36+08:00";
-        let dt_rfc_off = parse_time(rfc_offset).expect("valid test timestamp");
-        assert_eq!(
-            dt_rfc_off.to_rfc3339_opts(SecondsFormat::Secs, true),
-            "2026-08-26T08:17:36Z"
-        );
-
-        // 额外: RFC3339Nano 秒级精度但带 nanos=0 也应解析
-        let nano_zero = "2026-08-26T08:17:36.000000000Z";
-        let dt_nano_zero = parse_time(nano_zero).expect("valid test timestamp");
-        assert_eq!(dt_nano_zero.timestamp(), dt_rfc.timestamp());
-
-        // 遗留格式兼容: "2006-01-02 15:04:05"
-        let legacy = "2026-08-26 08:17:36";
-        let dt_legacy = parse_time(legacy).expect("valid test timestamp");
-        assert_eq!(
-            dt_legacy.to_rfc3339_opts(SecondsFormat::Secs, true),
-            "2026-08-26T08:17:36Z"
-        );
-
-        // 混合: Go 两种格式写入后 Rust 读取往返
-        let go_nano_written = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let go_rfc_written = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        // 不 panic 且往返时间差 <1s
-        let p1 = parse_time(&go_nano_written).expect("valid test timestamp");
-        let p2 = parse_time(&go_rfc_written).expect("valid test timestamp");
-        assert!((p1.timestamp() - chrono::Utc::now().timestamp()).abs() < 2);
-        assert!((p2.timestamp() - chrono::Utc::now().timestamp()).abs() < 2);
     }
 
     #[test]
-    fn test_parse_time_rejects_invalid_input() {
-        let err =
-            parse_time("not-a-timestamp").expect_err("invalid timestamp must return an error");
-        assert!(err.to_string().contains("invalid timestamp"));
-    }
-
-    #[tokio::test]
-    async fn test_go_written_dual_format_roundtrip() -> anyhow::Result<()> {
-        // 模拟 Go 写入的两种格式：RFC3339Nano (nowStr) 与 RFC3339 (seedDefaults)
-        let s = Store::open(":memory:").await?;
-        let go_nano = "2026-08-26T08:17:36.853853123Z"; // Go time.RFC3339Nano
-        let go_rfc = "2026-08-26T08:17:36Z"; // Go time.RFC3339
-
-        // users 表两种格式
-        sqlx::query(
-            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,0,?)",
-        )
-        .bind("bob_nano")
-        .bind("h")
-        .bind(go_nano)
-        .execute(&s.pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,0,?)",
-        )
-        .bind("bob_rfc")
-        .bind("h")
-        .bind(go_rfc)
-        .execute(&s.pool)
-        .await?;
-        let u1 = s.get_user_by_username("bob_nano").await?.unwrap();
-        let u2 = s.get_user_by_username("bob_rfc").await?.unwrap();
-        assert_eq!(
-            u1.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        assert_eq!(
-            u2.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-
-        // boards 表
-        sqlx::query("INSERT INTO boards(slug,name,description,allow_anonymous,guest_readable,created_at) VALUES(?,?,?,?,?,?)")
-            .bind("b-nano").bind("n").bind("d").bind(1).bind(1).bind(go_nano).execute(&s.pool).await?;
-        sqlx::query("INSERT INTO boards(slug,name,description,allow_anonymous,guest_readable,created_at) VALUES(?,?,?,?,?,?)")
-            .bind("b-rfc").bind("n").bind("d").bind(1).bind(1).bind(go_rfc).execute(&s.pool).await?;
-        let bn = s.get_board_by_slug("b-nano").await?.unwrap();
-        let br = s.get_board_by_slug("b-rfc").await?.unwrap();
-        assert_eq!(
-            bn.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        assert_eq!(
-            br.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-
-        // threads/posts/sessions/invite_codes 全覆盖
-        let uid = u1.id;
-        let bid = bn.id;
-        // threads 两种格式通过原始 SQL 插入后再读
-        sqlx::query("INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(bid).bind("t-nano").bind(uid).bind(0).bind(0).bind(0).bind(go_nano).bind(go_nano).execute(&s.pool).await?;
-        sqlx::query("INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(bid).bind("t-rfc").bind(uid).bind(0).bind(0).bind(0).bind(go_rfc).bind(go_rfc).execute(&s.pool).await?;
-        let t1: (i64,) = sqlx::query_as("SELECT id FROM threads WHERE title='t-nano'")
-            .fetch_one(&s.pool)
-            .await?;
-        let t2: (i64,) = sqlx::query_as("SELECT id FROM threads WHERE title='t-rfc'")
-            .fetch_one(&s.pool)
-            .await?;
-        let th1 = s.get_thread(t1.0).await?.unwrap();
-        let th2 = s.get_thread(t2.0).await?.unwrap();
-        assert_eq!(
-            th1.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        assert_eq!(
-            th2.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-
-        // posts
-        sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,content_md,content_html,created_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(t1.0).bind(bid).bind(uid).bind(0).bind("md").bind("html").bind(go_nano).execute(&s.pool).await?;
-        sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,content_md,content_html,created_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(t2.0).bind(bid).bind(uid).bind(0).bind("md").bind("html").bind(go_rfc).execute(&s.pool).await?;
-        let (posts1, _) = s.list_posts(t1.0, 1, 10).await?;
-        let (posts2, _) = s.list_posts(t2.0, 1, 10).await?;
-        assert_eq!(
-            posts1[0]
-                .created_at
-                .to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        assert_eq!(
-            posts2[0]
-                .created_at
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-
-        // sessions
-        let active_last_seen = "2099-01-01T00:00:00Z";
-        sqlx::query(
-            "INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",
-        )
-        .bind("sess-nano")
-        .bind(uid)
-        .bind(go_nano)
-        .bind(active_last_seen)
-        .bind(active_last_seen)
-        .execute(&s.pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",
-        )
-        .bind("sess-rfc")
-        .bind(uid)
-        .bind(go_rfc)
-        .bind(active_last_seen)
-        .bind(active_last_seen)
-        .execute(&s.pool)
-        .await?;
-        let sess1 = s.get_session("sess-nano").await?.unwrap();
-        assert_eq!(
-            sess1.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        let sess2 = s.get_session("sess-rfc").await?.unwrap();
-        assert_eq!(
-            sess2.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-
-        // invite_codes
-        sqlx::query("INSERT INTO invite_codes(code,created_by,created_at) VALUES(?,?,?)")
-            .bind("code-nano")
-            .bind(uid)
-            .bind(go_nano)
-            .execute(&s.pool)
-            .await?;
-        sqlx::query("INSERT INTO invite_codes(code,created_by,created_at) VALUES(?,?,?)")
-            .bind("code-rfc")
-            .bind(uid)
-            .bind(go_rfc)
-            .execute(&s.pool)
-            .await?;
-        sqlx::query("UPDATE invite_codes SET used_at=? WHERE code=?")
-            .bind(go_nano)
-            .bind("code-nano")
-            .execute(&s.pool)
-            .await?;
-        sqlx::query("UPDATE invite_codes SET used_at=? WHERE code=?")
-            .bind(go_rfc)
-            .bind("code-rfc")
-            .execute(&s.pool)
-            .await?;
-        let invites = s.list_invites().await?;
-        let in_nano = invites.iter().find(|x| x.code == "code-nano").unwrap();
-        let in_rfc = invites.iter().find(|x| x.code == "code-rfc").unwrap();
-        assert_eq!(
-            in_nano
-                .created_at
-                .to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        assert_eq!(
-            in_rfc.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-        assert_eq!(
-            in_nano
-                .used_at
-                .unwrap()
-                .to_rfc3339_opts(SecondsFormat::Nanos, true),
-            go_nano
-        );
-        assert_eq!(
-            in_rfc
-                .used_at
-                .unwrap()
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            go_rfc
-        );
-
-        Ok(())
+    fn test_escape_like_pattern() {
+        assert_eq!(escape_like_pattern("50%"), "50\\%");
+        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
+        assert_eq!(escape_like_pattern("c:\\tmp"), "c:\\\\tmp");
+        assert_eq!(escape_like_pattern("plain"), "plain");
     }
 }

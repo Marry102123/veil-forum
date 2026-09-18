@@ -1,4 +1,5 @@
-use axum::middleware;
+pub mod middleware;
+use axum::middleware as axum_middleware;
 use axum::{
     extract::{Form, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -23,6 +24,24 @@ pub struct AppState {
     pub captcha: crate::captcha::Manager,
     pub password_gate: Arc<Semaphore>,
     pub limits: crate::rate_limit::Limits,
+    pub secure_session_cookie: bool,
+}
+
+#[derive(serde::Serialize)]
+struct FriendLink {
+    name: String,
+    url: String,
+}
+
+#[derive(Default)]
+struct SidebarSettings {
+    panels: Vec<String>,
+    announcement_enabled: bool,
+    display_enabled: bool,
+    stats_enabled: bool,
+    recent_enabled: bool,
+    ads_enabled: bool,
+    ads_body: String,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +52,13 @@ struct PowQuery {
 const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'";
 const MAX_FORM_BYTES: usize = 64 * 1024;
 
+fn session_cookie(value: &str, max_age: i64, secure: bool) -> String {
+    format!(
+        "session_id={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
 fn csrf_key() -> &'static [u8; 32] {
     static KEY: OnceLock<[u8; 32]> = OnceLock::new();
     KEY.get_or_init(|| {
@@ -41,7 +67,7 @@ fn csrf_key() -> &'static [u8; 32] {
         k
     })
 }
-fn session_id(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn session_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -86,22 +112,27 @@ fn valid_csrf(headers: &HeaderMap, form: &HashMap<String, String>) -> bool {
         .is_ok()
 }
 fn valid_origin(headers: &HeaderMap) -> bool {
-    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    origin
-        .map(|v| {
-            if v == "null" {
-                return true;
-            }
-            v.strip_prefix("https://")
-                .or_else(|| v.strip_prefix("http://"))
-                .and_then(|rest| rest.split('/').next())
-                == Some(host)
-        })
-        .unwrap_or(true)
+    let same_origin = |value: &str| {
+        value
+            .strip_prefix("https://")
+            .or_else(|| value.strip_prefix("http://"))
+            .and_then(|rest| rest.split('/').next())
+            == Some(host)
+    };
+    let same_referer = || {
+        headers
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(same_origin)
+    };
+    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some("null") | None => same_referer(),
+        Some(origin) => same_origin(origin),
+    }
 }
 fn require_form_security(headers: &HeaderMap, form: &HashMap<String, String>) -> bool {
     valid_csrf(headers, form) && valid_origin(headers)
@@ -144,6 +175,17 @@ fn internal_error_response<E: std::fmt::Display>(
 mod security_tests {
     use super::*;
 
+    #[test]
+    fn session_cookie_sets_secure_only_when_enabled() {
+        let secure = session_cookie("test-session", 60, true);
+        assert!(secure.contains("; Secure"));
+        assert!(secure.contains("HttpOnly"));
+        assert!(secure.contains("SameSite=Strict"));
+
+        let loopback = session_cookie("test-session", 60, false);
+        assert!(!loopback.contains("; Secure"));
+    }
+
     fn valid_pow_form() -> HashMap<String, String> {
         HashMap::from([
             ("pow_challenge".into(), "a".repeat(32)),
@@ -178,7 +220,7 @@ mod security_tests {
     }
 
     #[test]
-    fn origin_must_match_host_except_null_origin() {
+    fn origin_or_referer_must_match_host() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "forum.test".parse().unwrap());
         headers.insert(header::ORIGIN, "https://forum.test".parse().unwrap());
@@ -188,7 +230,23 @@ mod security_tests {
         assert!(!valid_origin(&headers));
 
         headers.insert(header::ORIGIN, "null".parse().unwrap());
+        assert!(!valid_origin(&headers));
+
+        headers.remove(header::ORIGIN);
+        assert!(!valid_origin(&headers));
+
+        headers.insert(
+            header::REFERER,
+            "https://forum.test/thread/1".parse().unwrap(),
+        );
         assert!(valid_origin(&headers));
+        headers.insert(header::ORIGIN, "null".parse().unwrap());
+        assert!(valid_origin(&headers));
+        headers.insert(
+            header::REFERER,
+            "https://attacker.test/thread/1".parse().unwrap(),
+        );
+        assert!(!valid_origin(&headers));
     }
 
     #[test]
@@ -212,10 +270,13 @@ mod security_tests {
 
     #[tokio::test]
     async fn internal_errors_do_not_expose_details() {
+        // A database connection failure must not leak the target or password.
         let response = internal_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "test operation",
-            anyhow::anyhow!("database path=/private/data.sqlite: permission denied"),
+            anyhow::anyhow!(
+                "connect to database postgres://veil:hunter2@db.internal/veil_forum: permission denied"
+            ),
             "operation temporarily unavailable",
         );
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -224,7 +285,8 @@ mod security_tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(body, "operation temporarily unavailable");
-        assert!(!body.contains("private/data.sqlite"));
+        assert!(!body.contains("hunter2"));
+        assert!(!body.contains("db.internal"));
         assert!(!body.contains("permission denied"));
     }
 }
@@ -234,7 +296,7 @@ fn sec_headers() -> HeaderMap {
     h.insert(header::CONTENT_SECURITY_POLICY, CSP.parse().unwrap());
     h.insert("X-Frame-Options", "DENY".parse().unwrap());
     h.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
-    h.insert("Referrer-Policy", "no-referrer".parse().unwrap());
+    h.insert("Referrer-Policy", "same-origin".parse().unwrap());
     h.insert(
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
@@ -279,12 +341,57 @@ fn get_theme(headers: &HeaderMap) -> &'static str {
     }
     "dark"
 }
+async fn get_palette(store: &crate::store::Store) -> String {
+    let palette = store
+        .get_config("theme_palette")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    if [
+        "veil", "ocean", "forest", "sunset", "lavender", "amber", "rose", "slate", "terminal",
+    ]
+    .contains(&palette.as_str())
+    {
+        palette
+    } else {
+        "veil".to_string()
+    }
+}
 async fn get_site_name(store: &crate::store::Store) -> String {
     store
         .get_config("site_name")
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "secure-forum".to_string())
+}
+async fn post_cooldown_response(
+    store: &crate::store::Store,
+    user: &crate::store::User,
+) -> Option<Response> {
+    if user.is_admin {
+        return None;
+    }
+    let seconds: i64 = store
+        .get_config_opt("post_cooldown_seconds")
+        .await
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .clamp(0, 86400);
+    if seconds == 0 {
+        return None;
+    }
+    let last = store.last_post_at(user.id).await.ok().flatten()?;
+    let elapsed = (chrono::Utc::now() - last).num_seconds();
+    if elapsed < seconds {
+        return Some(apply_sec(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("please wait {} seconds before posting", seconds - elapsed),
+            )
+                .into_response(),
+        ));
+    }
+    None
 }
 async fn get_footer_text(store: &crate::store::Store, locale: &str) -> String {
     store
@@ -306,6 +413,57 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Option<crate::st
     let sid = session_id(headers)?;
     state.store.get_user_by_session(&sid).await.ok().flatten()
 }
+fn parse_friend_links(value: &str) -> Vec<FriendLink> {
+    value
+        .lines()
+        .filter_map(|line| {
+            let (name, url) = line.split_once('|')?;
+            let name = name.trim();
+            let url = url.trim();
+            if name.is_empty()
+                || name.len() > 80
+                || url.len() > 500
+                || !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                return None;
+            }
+            Some(FriendLink {
+                name: name.to_string(),
+                url: url.to_string(),
+            })
+        })
+        .take(20)
+        .collect()
+}
+
+fn sidebar_settings(configs: &HashMap<String, String>) -> SidebarSettings {
+    let allowed = ["announcement", "display", "stats", "recent", "links", "ads"];
+    let mut panels: Vec<String> = configs
+        .get("sidebar_order")
+        .map(String::as_str)
+        .unwrap_or("announcement,display,stats,recent,links,ads")
+        .split(',')
+        .map(str::trim)
+        .filter(|panel| allowed.contains(panel))
+        .map(str::to_string)
+        .collect();
+    for panel in allowed {
+        if !panels.iter().any(|item| item == panel) {
+            panels.push(panel.to_string());
+        }
+    }
+    let enabled = |key: &str| configs.get(key).map(String::as_str).unwrap_or("1") == "1";
+    SidebarSettings {
+        panels,
+        announcement_enabled: enabled("sidebar_announcement_enabled"),
+        display_enabled: enabled("sidebar_display_enabled"),
+        stats_enabled: enabled("sidebar_stats_enabled"),
+        recent_enabled: enabled("sidebar_recent_enabled"),
+        ads_enabled: enabled("sidebar_ads_enabled"),
+        ads_body: configs.get("sidebar_ads").cloned().unwrap_or_default(),
+    }
+}
+
 async fn sidebar_data(
     store: &crate::store::Store,
 ) -> (
@@ -316,6 +474,8 @@ async fn sidebar_data(
     i64,
     Vec<crate::store::Thread>,
     String,
+    Vec<FriendLink>,
+    SidebarSettings,
 ) {
     let boards = store.list_boards().await.unwrap_or_default();
     let pow_min = store
@@ -333,11 +493,11 @@ async fn sidebar_data(
     {
         stats_threads = row.0;
     }
-    // Each thread has one opening post. The sidebar label is "Replies", so
-    // exclude those opening posts instead of reporting the total post count.
-    if let Ok(row) = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM posts p WHERE p.id != (SELECT MIN(op.id) FROM posts op WHERE op.thread_id = p.thread_id)",
-    )
+    // Each thread has one opening post. The sidebar label is "Replies", so sum
+    // the maintained reply_count. Counting posts instead scaled with every post
+    // in the database (covering-index scan plus a correlated subquery per row)
+    // on every page render; this is O(threads).
+    if let Ok(row) = sqlx::query_as::<_, (i64,)>("SELECT COALESCE(SUM(reply_count),0) FROM threads")
         .fetch_one(pool)
         .await
     {
@@ -355,16 +515,16 @@ async fn sidebar_data(
         if let Ok(rows) = sqlx::query("SELECT id, board_id, title, author_id, is_pinned, is_locked, reply_count, last_reply_at, created_at FROM threads ORDER BY last_reply_at DESC LIMIT 5").fetch_all(pool).await {
             for r in rows {
                 use sqlx::Row;
-                let last: String = r.get("last_reply_at");
-                let created: String = r.get("created_at");
+                let last: chrono::DateTime<chrono::Utc> = r.get("last_reply_at");
+                let created: chrono::DateTime<chrono::Utc> = r.get("created_at");
                 // fetch author_name and slug crudely
                 let tid: i64 = r.get("id");
                 let th = store.get_thread(tid).await.ok().flatten();
                 if let Some(t) = th { v.push(t); } else {
                     v.push(crate::store::Thread{
                         id: r.get("id"), board_id: r.get("board_id"), title: r.get("title"),
-                        author_id: r.get("author_id"), is_pinned: r.get::<i64,_>("is_pinned")==1, is_locked: r.get::<i64,_>("is_locked")==1,
-                        reply_count: r.get("reply_count"), last_reply_at: crate::store::parse_time(&last).unwrap_or_else(|_| chrono::Utc::now()), created_at: crate::store::parse_time(&created).unwrap_or_else(|_| chrono::Utc::now()),
+                        author_id: r.get("author_id"), is_pinned: r.get("is_pinned"), is_locked: r.get("is_locked"),
+                        reply_count: r.get("reply_count"), last_reply_at: last, created_at: created,
                         author_name: "".to_string(), board_slug: "".to_string(),
                     });
                 }
@@ -377,6 +537,14 @@ async fn sidebar_data(
         .await
         .unwrap_or(None)
         .unwrap_or_default();
+    let configs = store.get_all_configs().await.unwrap_or_default();
+    let friend_links = parse_friend_links(
+        configs
+            .get("friend_links")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    let sidebar_settings = sidebar_settings(&configs);
     (
         boards,
         pow_min,
@@ -385,6 +553,8 @@ async fn sidebar_data(
         stats_users,
         recent,
         announcement,
+        friend_links,
+        sidebar_settings,
     )
 }
 
@@ -400,11 +570,14 @@ fn layout_html(
     stats_users: i64,
     recent: &[crate::store::Thread],
     announcement: &str,
+    friend_links: &[FriendLink],
+    sidebar_settings: &SidebarSettings,
     footer_text: &str,
     content: &str,
     need_pow: bool,
     flash: Option<(&str, &str)>,
     theme: &str,
+    palette: &str,
     locale: &str,
     headers: &HeaderMap,
 ) -> String {
@@ -452,6 +625,7 @@ fn layout_html(
     context.insert("site_name", site_name);
     context.insert("locale", locale);
     context.insert("theme", if theme == "light" { "light" } else { "dark" });
+    context.insert("palette", palette);
     context.insert("need_pow", &need_pow);
     context.insert("flash_html", &flash_html);
     context.insert("csrf_field", &csrf_field(headers));
@@ -459,8 +633,15 @@ fn layout_html(
         "account_user",
         &user.map(|u| serde_json::json!({"username": u.username, "is_admin": u.is_admin})),
     );
-    context.insert("boards", &boards.iter().map(|b| serde_json::json!({"slug": b.slug, "name": b.name, "description": b.description})).collect::<Vec<_>>());
-    context.insert("boards_len", &boards.len());
+    let can_view_private = user.is_some();
+    context.insert("boards", &boards.iter().filter(|board| board.guest_readable || can_view_private).map(|b| serde_json::json!({"slug": b.slug, "name": b.name, "description": b.description})).collect::<Vec<_>>());
+    context.insert(
+        "boards_len",
+        &boards
+            .iter()
+            .filter(|board| board.guest_readable || can_view_private)
+            .count(),
+    );
     context.insert("content", &content);
     context.insert("pow_minutes", pow_minutes);
     context.insert("stats_threads", &stats_threads);
@@ -470,10 +651,27 @@ fn layout_html(
         "recent",
         &recent
             .iter()
+            .filter(|thread| {
+                can_view_private
+                    || boards
+                        .iter()
+                        .any(|board| board.id == thread.board_id && board.guest_readable)
+            })
             .map(|t| serde_json::json!({"id": t.id, "title": t.title}))
             .collect::<Vec<_>>(),
     );
     context.insert("announcement_body", &announcement_body);
+    context.insert("friend_links", friend_links);
+    context.insert("sidebar_panels", &sidebar_settings.panels);
+    context.insert(
+        "sidebar_announcement_enabled",
+        &sidebar_settings.announcement_enabled,
+    );
+    context.insert("sidebar_display_enabled", &sidebar_settings.display_enabled);
+    context.insert("sidebar_stats_enabled", &sidebar_settings.stats_enabled);
+    context.insert("sidebar_recent_enabled", &sidebar_settings.recent_enabled);
+    context.insert("sidebar_ads_enabled", &sidebar_settings.ads_enabled);
+    context.insert("ads_body", &html_escape(&sidebar_settings.ads_body));
     context.insert("footer_text", footer_text);
     for (key, value) in [
         ("search_label", search_label),
@@ -498,6 +696,8 @@ fn layout_html(
         ("board_count", board_count),
         ("all_boards", all_boards),
         ("announcement_label", announcement_label),
+        ("friend_links_label", ui("Links", "友链", "Ссылки")),
+        ("ads_label", ui("Advertisements", "广告", "Реклама")),
         ("display_label", display_label),
         ("light_label", light_label),
         ("dark_label", dark_label),
@@ -557,7 +757,10 @@ fn verify_captcha_form(
         .and_then(|v| v.parse::<i64>().ok())
         .ok_or("missing captcha expiry")?;
     let token = form.get("captcha_token").map(String::as_str).unwrap_or("");
-    let answer = form.get("captcha_answer").map(String::as_str).unwrap_or("");
+    let answer = form
+        .get("captcha_answer")
+        .map(|value| value.trim())
+        .unwrap_or("");
     captcha
         .verify(scope, id, expires_at, token, answer)
         .map_err(|_| "captcha verification failed".to_string())
@@ -600,13 +803,13 @@ fn captcha_html(challenge: &crate::captcha::Challenge, locale: &str) -> String {
     );
     let hint = crate::i18n::ui(
         locale,
-        "Enter the characters shown",
-        "输入图片中的字符",
-        "Введите символы с изображения",
+        "Enter the answer shown in the image",
+        "输入图片中的算式答案（A=加法，S=减法）",
+        "Введите ответ на пример (A=сложение, S=вычитание)",
     );
     format!(
-        r#"<div class="captcha-challenge"><label>{label}</label><img src="data:image/png;base64,{}" alt="{label}"><input type="hidden" name="captcha_id" value="{}"><input type="hidden" name="captcha_expires_at" value="{}"><input type="hidden" name="captcha_token" value="{}"><input name="captcha_answer" required autocomplete="off" autocapitalize="characters" maxlength="16" placeholder="{hint}" aria-label="{label}"></div>"#,
-        challenge.image_base64, challenge.id, challenge.expires_at, challenge.token
+        r#"<div class="captcha-challenge"><label>{label}</label><img src="data:image/png;base64,{}" alt="{label}"><input type="hidden" name="captcha_id" value="{}"><input type="hidden" name="captcha_expires_at" value="{}"><input type="hidden" name="captcha_token" value="{}"><input name="captcha_answer" required autocomplete="off" inputmode="numeric" maxlength="3" placeholder="{hint}" aria-label="{label}"></div>"#,
+        challenge.image_base64, challenge.id, challenge.expires_at, challenge.token,
     )
 }
 fn pow_fallback_html(ch: &crate::pow::Challenge, locale: &str) -> String {
@@ -687,8 +890,12 @@ pub fn routes(state: AppState) -> Router {
         .route("/admin", get(admin_hub))
         .route("/admin/settings", get(admin_settings))
         .route("/admin/config/site", post(admin_site))
+        .route("/admin/config/theme", post(admin_theme))
+        .route("/admin/config/maintenance", post(admin_maintenance))
+        .route("/admin/config/post-cooldown", post(admin_post_cooldown))
         .route("/admin/config/announcement", post(admin_announcement))
         .route("/admin/config/footer", post(admin_footer))
+        .route("/admin/config/sidebar", post(admin_sidebar))
         .route("/admin/config/pow", post(admin_pow))
         .route("/admin/config/registration", post(admin_regmode))
         .route("/admin/config/policies", post(admin_policies))
@@ -723,8 +930,21 @@ pub fn routes(state: AppState) -> Router {
         .route("/report/thread/:id", post(report_thread))
         .route("/report/post/:id", post(report_post))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
-        .layer(middleware::from_fn(theme_query_cookie))
+        .layer(axum_middleware::from_fn(
+            crate::handler::middleware::theme_query_cookie,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.store.clone(),
+            crate::handler::middleware::maintenance_gate,
+        ))
+        .fallback(not_found)
         .with_state(state)
+}
+
+/// Unmatched paths still carry the security headers, so a probe cannot use a
+/// 404 to learn that the response pipeline differs.
+async fn not_found() -> Response {
+    apply_sec((StatusCode::NOT_FOUND, "not found").into_response())
 }
 
 async fn pow_challenge(State(s): State<AppState>, Query(q): Query<PowQuery>) -> impl IntoResponse {
@@ -741,7 +961,9 @@ async fn pow_challenge(State(s): State<AppState>, Query(q): Query<PowQuery>) -> 
 }
 
 async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
-    let status = match sqlx::query_scalar::<_, i64>("SELECT 1")
+    // PostgreSQL types a bare `SELECT 1` as int4, so decode it as i32 rather
+    // than i64; a mismatch would report the database as unavailable.
+    let status = match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&s.store.pool)
         .await
     {
@@ -854,7 +1076,10 @@ async fn theme_toggle(
                     .to_string()
             };
             let clean = path.split('#').next().unwrap_or("/");
-            (!clean.starts_with("//") && clean.starts_with('/')).then(|| clean.to_string())
+            // A backslash is an authority separator for URL parsers, so a
+            // Referer of "/\evil.example" must not become a redirect target.
+            (!clean.contains('\\') && !clean.starts_with("//") && clean.starts_with('/'))
+                .then(|| clean.to_string())
         })
         .unwrap_or_else(|| "/".to_string());
     let mut parts = location.splitn(2, '?');
@@ -881,50 +1106,11 @@ async fn theme_toggle(
     apply_sec(response)
 }
 
-// URL theme state is the no-cookie fallback used by NoScript and hardened
-// browsers. Inject it as a synthetic request cookie so all existing handlers
-// use the same rendering path without changing every handler signature.
-async fn theme_query_cookie(
-    mut request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let theme = request.uri().query().and_then(|query| {
-        query.split('&').find_map(|part| {
-            let mut kv = part.splitn(2, '=');
-            match (kv.next(), kv.next()) {
-                (Some("theme"), Some("light")) => Some("light"),
-                (Some("theme"), Some("dark")) => Some("dark"),
-                _ => None,
-            }
-        })
-    });
-    if let Some(theme) = theme {
-        let mut cookies = request
-            .headers()
-            .get(header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .split(';')
-            .filter(|part| !part.trim_start().starts_with("theme="))
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        cookies.push(if theme == "light" {
-            "theme=light"
-        } else {
-            "theme=dark"
-        });
-        if let Ok(value) = cookies.join("; ").parse() {
-            request.headers_mut().insert(header::COOKIE, value);
-        }
-    }
-    next.run(request).await
-}
-
 async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user = current_user(&s, &headers).await;
     let site = get_site_name(&s.store).await;
-    let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, pow_min, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let visible: Vec<_> = boards
         .iter()
         .filter(|b| b.guest_readable || user.is_some())
@@ -961,11 +1147,14 @@ async fn home(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespons
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -1008,7 +1197,8 @@ async fn board(
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "0.02".to_string());
-    let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, _, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let mut context = Context::new();
     let rendered_threads: Vec<_>=threads.iter().map(|t| serde_json::json!({"id":t.id,"title":t.title,"author_name":t.author_name,"reply_count":t.reply_count,"last_reply_at":t.last_reply_at.format("%m-%d %H:%M").to_string(),"is_pinned":t.is_pinned,"is_locked":t.is_locked})).collect();
     context.insert("board",&serde_json::json!({"slug":board.slug,"name":board.name,"description":board.description,"allow_anonymous":board.allow_anonymous}));
@@ -1105,11 +1295,14 @@ async fn board(
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         user.is_some(),
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -1129,7 +1322,16 @@ async fn thread(
         Some(t) => t,
         None => return apply_sec((StatusCode::NOT_FOUND, "thread not found").into_response()),
     };
-    let board = s.store.get_board_by_id(th.board_id).await.unwrap_or(None);
+    // Fail closed: if the board cannot be read, the guest_readable check below
+    // cannot run, so the thread must not be served.
+    let board = match s.store.get_board_by_id(th.board_id).await {
+        Ok(board) => board,
+        Err(_) => {
+            return apply_sec(
+                (StatusCode::SERVICE_UNAVAILABLE, "board unavailable").into_response(),
+            )
+        }
+    };
     let user = current_user(&s, &headers).await;
     if board.as_ref().is_some_and(|b| !b.guest_readable) && user.is_none() {
         return apply_sec(Redirect::to("/login").into_response());
@@ -1158,7 +1360,8 @@ async fn thread(
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "0.02".to_string());
-    let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, _, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let names: HashMap<i64, String> = posts
         .iter()
         .map(|p| {
@@ -1333,11 +1536,14 @@ async fn thread(
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         user.is_some(),
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -1358,7 +1564,8 @@ async fn search(
         .max(1);
     let user = current_user(&s, &headers).await;
     let site = get_site_name(&s.store).await;
-    let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, pow_min, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
     let mut context = Context::new();
@@ -1371,7 +1578,7 @@ async fn search(
         let page_size = 20;
         let (posts, _, count) = s
             .store
-            .search_posts(&query, page, page_size)
+            .search_posts(&query, page, page_size, user.is_some())
             .await
             .unwrap_or((Vec::new(), Vec::new(), 0));
         total = count;
@@ -1426,11 +1633,14 @@ async fn search(
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -1468,7 +1678,8 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
         .unwrap_or(None)
         .unwrap_or_else(|| "0.02".to_string());
     let site = get_site_name(&s.store).await;
-    let (boards, _, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, _, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
     let mut context = Context::new();
@@ -1562,11 +1773,14 @@ async fn register_get(State(s): State<AppState>, headers: HeaderMap) -> impl Int
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         true,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -1719,13 +1933,9 @@ async fn register_post(
     let mut resp = Redirect::to("/").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        format!(
-            "session_id={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            sid,
-            12 * 3600
-        )
-        .parse()
-        .unwrap(),
+        session_cookie(&sid, 12 * 3600, s.secure_session_cookie)
+            .parse()
+            .unwrap(),
     );
     apply_sec(resp)
 }
@@ -1735,7 +1945,8 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         return apply_sec(Redirect::to("/").into_response());
     }
     let site = get_site_name(&s.store).await;
-    let (boards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, pow_min, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let locale = site_locale(&s.store).await;
     let mut context = Context::new();
     let need_pow = challenge_enabled(&s.store, crate::pow::Scope::Login, "pow").await;
@@ -1810,11 +2021,14 @@ async fn login_get(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         true,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -1900,8 +2114,32 @@ async fn login_post(
         let resp = (StatusCode::FORBIDDEN, "invalid credentials").into_response();
         return apply_sec(resp);
     }
-    let _ = s.store.delete_sessions_by_user(u.id).await;
-    let sid = match s.store.create_session(u.id).await {
+    if s.store
+        .get_config_opt("maintenance_enabled")
+        .await
+        .as_deref()
+        == Some("1")
+        && !u.is_admin
+    {
+        return apply_sec(
+            (
+                StatusCode::FORBIDDEN,
+                "forum is under maintenance; only administrators may log in",
+            )
+                .into_response(),
+        );
+    }
+    complete_login(&s, &u, &headers).await
+}
+
+/// Create the session for a verified password step and set its cookie.
+async fn complete_login(
+    state: &AppState,
+    user: &crate::store::User,
+    headers: &HeaderMap,
+) -> Response {
+    let _ = state.store.delete_sessions_by_user(user.id).await;
+    let sid = match state.store.create_session(user.id).await {
         Ok(sid) => sid,
         Err(_) => {
             return apply_sec(
@@ -1912,14 +2150,21 @@ async fn login_post(
     let mut resp = Redirect::to("/").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        format!(
-            "session_id={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            sid,
-            12 * 3600
-        )
-        .parse()
-        .unwrap(),
+        session_cookie(&sid, 12 * 3600, state.secure_session_cookie)
+            .parse()
+            .unwrap(),
     );
+    let _ = state
+        .store
+        .audit(
+            Some(user.id),
+            "login.succeeded",
+            Some("user"),
+            Some(user.id),
+            true,
+        )
+        .await;
+    let _ = headers;
     apply_sec(resp)
 }
 async fn logout(
@@ -1945,7 +2190,7 @@ async fn logout(
     let mut resp = Redirect::to("/").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        "session_id=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        session_cookie("", 0, s.secure_session_cookie)
             .parse()
             .unwrap(),
     );
@@ -1973,6 +2218,9 @@ async fn new_thread(
     if u.is_banned {
         let resp = (StatusCode::FORBIDDEN, "banned").into_response();
         return apply_sec(resp);
+    }
+    if let Some(resp) = post_cooldown_response(&s.store, &u).await {
+        return resp;
     }
     if !s.limits.allow_post(session_id(&headers).as_deref()) {
         return apply_sec((StatusCode::TOO_MANY_REQUESTS, "posting rate limit").into_response());
@@ -2077,6 +2325,9 @@ async fn reply(
         let resp = (StatusCode::FORBIDDEN, "banned").into_response();
         return apply_sec(resp);
     }
+    if let Some(resp) = post_cooldown_response(&s.store, &u).await {
+        return resp;
+    }
     if !s.limits.allow_post(session_id(&headers).as_deref()) {
         return apply_sec((StatusCode::TOO_MANY_REQUESTS, "posting rate limit").into_response());
     }
@@ -2092,7 +2343,16 @@ async fn reply(
         let resp = (StatusCode::FORBIDDEN, "thread locked").into_response();
         return apply_sec(resp);
     }
-    let board = s.store.get_board_by_id(th.board_id).await.unwrap_or(None);
+    // Fail closed: without the board row the anonymous-post rule cannot be
+    // checked, so the reply is refused rather than accepted.
+    let board = match s.store.get_board_by_id(th.board_id).await {
+        Ok(board) => board,
+        Err(_) => {
+            return apply_sec(
+                (StatusCode::SERVICE_UNAVAILABLE, "board unavailable").into_response(),
+            )
+        }
+    };
     if challenge_enabled(&s.store, crate::pow::Scope::Post, "captcha").await
         && verify_captcha_form(&form, crate::pow::Scope::Post, &s.captcha).is_err()
     {
@@ -2263,7 +2523,27 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
     };
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
-    let reports = s.store.list_reports(Some("open"), 100).await.unwrap_or_default().into_iter().map(|r| serde_json::json!({"id":r.id,"target_type":r.target_type,"target_id":r.target_id,"reason":r.reason,"status":r.status})).collect::<Vec<_>>();
+    let mut reports = Vec::new();
+    for report in s
+        .store
+        .list_reports(Some("open"), 100)
+        .await
+        .unwrap_or_default()
+    {
+        let target_url = match report.target_type.as_str() {
+            "thread" => format!("/t/{}", report.target_id),
+            "post" => s
+                .store
+                .get_post(report.target_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|post| format!("/t/{}#p{}", post.thread_id, post.id))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        reports.push(serde_json::json!({"id":report.id,"target_type":report.target_type,"target_id":report.target_id,"target_url":target_url,"reason":report.reason,"status":report.status}));
+    }
     let audit_logs = s.store.list_audit_logs(100, None).await.unwrap_or_default().into_iter().map(|entry| serde_json::json!({"id":entry.id,"action":entry.action,"target":format!("{} #{}", entry.target_type.unwrap_or_default(), entry.target_id.map(|v| v.to_string()).unwrap_or_default()),"success":entry.success,"created_at":entry.created_at.format("%Y-%m-%d %H:%M").to_string()})).collect::<Vec<_>>();
     let can_manage_roles = require_capability(&s, &headers, Capability::RoleManagement)
         .await
@@ -2322,6 +2602,8 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
     }
     let mut context = Context::new();
     context.insert("csrf_field", &csrf_field(&headers));
+    context.insert("version_label", &ui("Version", "版本", "Версия"));
+    context.insert("version", env!("CARGO_PKG_VERSION"));
     context.insert("reports", &reports);
     context.insert("audit_logs", &audit_logs);
     context.insert("users", &rendered_users);
@@ -2338,29 +2620,41 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
             "governance_sections_label",
             ui("Governance sections", "治理栏目", "Разделы модерации"),
         ),
-        ("governance_label", ui("Governance", "治理", "Модерация")),
+        (
+            "governance_label",
+            ui("Moderation & access", "内容与权限", "Модерация и доступ"),
+        ),
         (
             "governance_help",
             ui(
                 "Reports, permissions, and audit history.",
-                "举报、授权与审计历史。",
+                "处理举报、管理权限并查看审计记录。",
                 "Жалобы, права и аудит.",
             ),
         ),
         (
             "system_settings_label",
-            ui("System settings", "论坛设置", "Настройки форума"),
+            ui("System configuration", "系统配置", "Конфигурация системы"),
         ),
         (
             "system_settings_help",
             ui(
                 "Low-frequency site configuration and structure.",
-                "低频的站点配置与版块结构。",
+                "管理站点策略、版块结构和注册访问设置。",
                 "Редкие настройки сайта и структура разделов.",
             ),
         ),
         ("reports_label", ui("Reports", "举报", "Жалобы")),
+        (
+            "reports_help",
+            ui(
+                "Review open reports and jump directly to the reported content.",
+                "处理待办举报并直达被举报内容。",
+                "Проверяйте открытые жалобы и переходите к содержимому.",
+            ),
+        ),
         ("target_label", ui("Target", "对象", "Цель")),
+        ("view_target_label", ui("View", "查看", "Открыть")),
         ("report_reason_label", ui("Reason", "原因", "Причина")),
         ("status_label", ui("Status", "状态", "Статус")),
         ("actions_label", ui("Actions", "操作", "Действия")),
@@ -2377,6 +2671,31 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
         (
             "user_roles_label",
             ui("User roles", "用户授权", "Роли пользователей"),
+        ),
+        (
+            "user_roles_help",
+            ui(
+                "Search by ID, username, or current role before changing access.",
+                "按 ID、用户名或现有角色搜索后再调整授权。",
+                "Ищите по ID, имени или текущей роли перед изменением доступа.",
+            ),
+        ),
+        ("search_label", ui("Search", "搜索", "Поиск")),
+        (
+            "user_search_placeholder",
+            ui(
+                "ID, username, or role",
+                "ID、用户名或角色",
+                "ID, имя или роль",
+            ),
+        ),
+        (
+            "no_users_match_label",
+            ui(
+                "No matching users",
+                "没有匹配用户",
+                "Нет подходящих пользователей",
+            ),
         ),
         ("roles_label", ui("Roles", "角色", "Роли")),
         ("grant_label", ui("Grant", "授予", "Выдать")),
@@ -2409,7 +2728,8 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
     }
     let content = crate::templates::render_page("governance", &context)
         .expect("embedded governance template must render");
-    let (boards, pow, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, pow, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let full = layout_html(
         &ui("Governance", "治理", "Модерация"),
         &get_site_name(&s.store).await,
@@ -2421,11 +2741,14 @@ async fn governance(State(s): State<AppState>, headers: HeaderMap) -> impl IntoR
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -2680,33 +3003,36 @@ async fn admin_hub(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
             "Выберите рабочее пространство.",
         ),
     );
+    context.insert("version_label", &ui("Version", "版本", "Версия"));
+    context.insert("version", env!("CARGO_PKG_VERSION"));
     context.insert(
         "governance_label",
-        &ui("Governance", "治理后台", "Модерация"),
+        &ui("Moderation & access", "内容与权限", "Модерация и доступ"),
     );
     context.insert(
         "governance_help",
         &ui(
             "Reports, content actions, roles, sessions, and audit history.",
-            "举报、内容处置、角色、会话与审计历史。",
+            "处理举报、内容、角色、会话和审计记录。",
             "Жалобы, действия с контентом, роли, сессии и аудит.",
         ),
     );
     context.insert(
         "system_settings_label",
-        &ui("Forum settings", "论坛设置", "Настройки форума"),
+        &ui("System configuration", "系统配置", "Конфигурация системы"),
     );
     context.insert(
         "system_settings_help",
         &ui(
             "Site configuration, board structure, registration, invitations, and account settings.",
-            "站点配置、版块结构、注册、邀请码与账户设置。",
+            "站点策略、版块结构、注册访问和账户设置。",
             "Конфигурация сайта, разделы, регистрация, приглашения и настройки аккаунта.",
         ),
     );
     let content = crate::templates::render_page("admin", &context)
         .expect("embedded admin hub template must render");
-    let (boards, pow, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (boards, pow, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let full = layout_html(
         &ui("Administration", "后台", "Администрирование"),
         &get_site_name(&s.store).await,
@@ -2718,11 +3044,14 @@ async fn admin_hub(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRe
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -2741,8 +3070,11 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
     let site = get_site_name(&s.store).await;
     let locale = site_locale(&s.store).await;
     let ui = |en, zh, ru| crate::i18n::ui(&locale, en, zh, ru);
-    let (sboards, pow_min, st, sp, su, recent, announcement) = sidebar_data(&s.store).await;
+    let (sboards, pow_min, st, sp, su, recent, announcement, friend_links, sidebar_settings) =
+        sidebar_data(&s.store).await;
     let mut context = Context::new();
+    context.insert("version_label", &ui("Version", "版本", "Версия"));
+    context.insert("version", env!("CARGO_PKG_VERSION"));
     context.insert("csrf_field", &csrf_field(&headers));
     context.insert("username", &user.username);
     context.insert(
@@ -2810,6 +3142,74 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
         "footer_text_value",
         configs.get("footer_text").map(String::as_str).unwrap_or(""),
     );
+    context.insert(
+        "theme_palette",
+        configs
+            .get("theme_palette")
+            .map(String::as_str)
+            .unwrap_or("veil"),
+    );
+    context.insert(
+        "maintenance_enabled",
+        &(configs
+            .get("maintenance_enabled")
+            .map(String::as_str)
+            .unwrap_or("0")
+            == "1"),
+    );
+    context.insert(
+        "maintenance_title",
+        configs
+            .get("maintenance_title")
+            .map(String::as_str)
+            .unwrap_or("Under maintenance"),
+    );
+    context.insert(
+        "maintenance_message",
+        configs
+            .get("maintenance_message")
+            .map(String::as_str)
+            .unwrap_or("The forum is temporarily unavailable."),
+    );
+    context.insert(
+        "maintenance_eta",
+        configs
+            .get("maintenance_eta")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    context.insert(
+        "post_cooldown_seconds",
+        configs
+            .get("post_cooldown_seconds")
+            .map(String::as_str)
+            .unwrap_or("0"),
+    );
+    context.insert(
+        "friend_links_value",
+        configs
+            .get("friend_links")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    context.insert(
+        "sidebar_ads_value",
+        configs.get("sidebar_ads").map(String::as_str).unwrap_or(""),
+    );
+    context.insert(
+        "sidebar_order_value",
+        configs
+            .get("sidebar_order")
+            .map(String::as_str)
+            .unwrap_or("announcement,display,stats,recent,links,ads"),
+    );
+    for panel in ["announcement", "display", "stats", "recent", "ads"] {
+        let key = format!("sidebar_{panel}_enabled");
+        context.insert(
+            &key,
+            &(configs.get(&key).map(String::as_str).unwrap_or("1") == "1"),
+        );
+    }
     context.insert(
         "pow_register_minutes",
         configs
@@ -2885,7 +3285,7 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
     context.insert("captcha_difficulty", &difficulty);
     let rendered_invites: Vec<_> = invites
         .iter()
-        .map(|invite| serde_json::json!({"code": invite.code, "used_by": invite.used_by}))
+        .map(|invite| serde_json::json!({"code": invite.code, "used_by": invite.used_by, "use_count": invite.use_count, "max_uses": invite.max_uses, "expires_at": invite.expires_at.map(|v| v.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "never".into()), "revoked": invite.revoked_at.is_some(), "note": invite.note}))
         .collect();
     let rendered_users: Vec<_> = users
         .iter()
@@ -2904,6 +3304,10 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
             "settings_sections_label",
             ui("Settings sections", "设置栏目", "Разделы настроек"),
         ),
+        ("sidebar_settings_label", ui("Sidebar", "右侧栏", "Боковая панель")),
+        ("friend_links_help", ui("One per line: name | https://example.org", "每行一条：名称 | https://example.org", "По одной строке: название | https://example.org")),
+        ("sidebar_order_help", ui("Order: announcement, display, stats, recent, links, ads", "顺序：announcement, display, stats, recent, links, ads", "Порядок: announcement, display, stats, recent, links, ads")),
+        ("ads_label", ui("Advertisements", "广告", "Реклама")),
         (
             "verification_policy_label",
             ui("Verification policy", "验证策略", "Политика проверки"),
@@ -2977,6 +3381,9 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
             "announcement_label",
             ui("Announcement", "公告", "Объявление"),
         ),
+        ("display_label", ui("Display", "显示设置", "Отображение")),
+        ("stats_label", ui("Stats", "统计", "Статистика")),
+        ("recent_label", ui("Recent", "最新", "Последнее")),
         (
             "footer_text_label",
             ui("Footer text", "底栏文本", "Текст нижнего колонтитула"),
@@ -3126,11 +3533,14 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
         su,
         &recent,
         &announcement,
+        &friend_links,
+        &sidebar_settings,
         &get_footer_text(&s.store, &locale).await,
         &content,
         false,
         None,
         get_theme(&headers),
+        &get_palette(&s.store).await,
         &locale,
         &headers,
     );
@@ -3162,6 +3572,113 @@ async fn admin_site(
     audit_admin(&s, &headers, "config.site", Some("config"), None, ok).await;
     let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
+}
+async fn admin_theme(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    if require_admin_state(&s, &headers).await.is_none() {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let allowed = [
+        "veil", "ocean", "forest", "sunset", "lavender", "amber", "rose", "slate", "terminal",
+    ];
+    let palette = form
+        .get("theme_palette")
+        .map(String::as_str)
+        .filter(|p| allowed.contains(p))
+        .unwrap_or("veil");
+    let ok = s.store.set_config("theme_palette", palette).await.is_ok();
+    audit_admin(&s, &headers, "config.theme", Some("config"), None, ok).await;
+    apply_sec(Redirect::to("/admin/settings").into_response())
+}
+async fn admin_maintenance(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    if require_admin_state(&s, &headers).await.is_none() {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let enabled = if form.contains_key("maintenance_enabled") {
+        "1"
+    } else {
+        "0"
+    };
+    let clean = |key: &str, max: usize, fallback: &str| {
+        form.get(key)
+            .map(|v| v.trim().chars().take(max).collect::<String>())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let ok = s
+        .store
+        .set_config("maintenance_enabled", enabled)
+        .await
+        .is_ok()
+        && s.store
+            .set_config(
+                "maintenance_title",
+                &clean("maintenance_title", 120, "Under maintenance"),
+            )
+            .await
+            .is_ok()
+        && s.store
+            .set_config(
+                "maintenance_message",
+                &clean(
+                    "maintenance_message",
+                    2000,
+                    "The forum is temporarily unavailable.",
+                ),
+            )
+            .await
+            .is_ok()
+        && s.store
+            .set_config("maintenance_eta", &clean("maintenance_eta", 120, ""))
+            .await
+            .is_ok();
+    audit_admin(&s, &headers, "config.maintenance", Some("config"), None, ok).await;
+    apply_sec(Redirect::to("/admin/settings").into_response())
+}
+async fn admin_post_cooldown(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    if require_admin_state(&s, &headers).await.is_none() {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let seconds = form
+        .get("post_cooldown_seconds")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, 86400);
+    let ok = s
+        .store
+        .set_config("post_cooldown_seconds", &seconds.to_string())
+        .await
+        .is_ok();
+    audit_admin(
+        &s,
+        &headers,
+        "config.post_cooldown",
+        Some("config"),
+        None,
+        ok,
+    )
+    .await;
+    apply_sec(Redirect::to("/admin/settings").into_response())
 }
 async fn admin_announcement(
     State(s): State<AppState>,
@@ -3223,6 +3740,58 @@ async fn admin_footer(
         .await
         .is_ok();
     audit_admin(&s, &headers, "config.footer", Some("config"), None, ok).await;
+    apply_sec(Redirect::to("/admin/settings").into_response())
+}
+async fn admin_sidebar(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !require_form_security(&headers, &form) {
+        return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
+    }
+    if require_admin_state(&s, &headers).await.is_none() {
+        return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let links = form
+        .get("friend_links")
+        .map(String::as_str)
+        .unwrap_or("")
+        .lines()
+        .take(20)
+        .map(str::trim)
+        .filter(|line| line.len() <= 600)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ads = form
+        .get("sidebar_ads")
+        .map(String::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(1000)
+        .collect::<String>();
+    let allowed = ["announcement", "display", "stats", "recent", "links", "ads"];
+    let order = form
+        .get("sidebar_order")
+        .map(String::as_str)
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|panel| allowed.contains(panel))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut ok = s.store.set_config("friend_links", &links).await.is_ok()
+        && s.store.set_config("sidebar_ads", &ads).await.is_ok()
+        && s.store.set_config("sidebar_order", &order).await.is_ok();
+    for panel in ["announcement", "display", "stats", "recent", "ads"] {
+        let key = format!("sidebar_{panel}_enabled");
+        ok &= s
+            .store
+            .set_config(&key, if form.contains_key(&key) { "1" } else { "0" })
+            .await
+            .is_ok();
+    }
+    audit_admin(&s, &headers, "config.sidebar", Some("config"), None, ok).await;
     apply_sec(Redirect::to("/admin/settings").into_response())
 }
 async fn admin_pow(
@@ -3484,8 +4053,42 @@ async fn invite_create(
             return apply_sec(resp);
         }
     };
-    let code = random_code(12);
-    let ok = s.store.create_invite(&code, user.id).await.is_ok();
+    let count = form
+        .get("count")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100);
+    let max_uses = form
+        .get("max_uses")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100000);
+    let days = form
+        .get("expires_days")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, 3650);
+    let note = form
+        .get("note")
+        .map(|v| v.trim())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let expires_at =
+        (days > 0).then(|| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
+    let mut ok = true;
+    for _ in 0..count {
+        let code = random_code(12);
+        if s.store
+            .create_invite_with_options(&code, user.id, max_uses, expires_at.as_deref(), &note)
+            .await
+            .is_err()
+        {
+            ok = false;
+            break;
+        }
+    }
     audit_admin(&s, &headers, "invite.create", Some("invite"), None, ok).await;
     let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
@@ -3499,12 +4102,15 @@ async fn invite_delete(
     if !require_form_security(&headers, &form) {
         return apply_sec((StatusCode::FORBIDDEN, "csrf check failed").into_response());
     }
-    if require_admin_state(&s, &headers).await.is_none() {
-        let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
-        return apply_sec(resp);
-    }
-    let ok = s.store.delete_invite(&code).await.is_ok();
-    audit_admin(&s, &headers, "invite.delete", Some("invite"), None, ok).await;
+    let user = match require_admin_state(&s, &headers).await {
+        Some(user) => user,
+        None => {
+            let resp = (StatusCode::FORBIDDEN, "forbidden").into_response();
+            return apply_sec(resp);
+        }
+    };
+    let ok = s.store.revoke_invite(&code, user.id).await.is_ok();
+    audit_admin(&s, &headers, "invite.revoke", Some("invite"), None, ok).await;
     let resp = Redirect::to("/admin/settings").into_response();
     apply_sec(resp)
 }

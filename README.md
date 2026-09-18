@@ -1,31 +1,28 @@
 # veil-forum
 
 An experimental, self-hosted forum for Tor Onion Service and I2P deployments.
+Written in Rust with Axum and PostgreSQL, it serves HTML without requiring
+JavaScript and listens on loopback by default.
 
-**Alpha software. Licensed under [AGPL-3.0-only](LICENSE).**
+**Alpha software. [AGPL-3.0-only](LICENSE).** It is intended for review and
+experimental deployment, not as a guarantee of anonymity or production security.
 
-veil-forum is written in Rust with Axum and SQLite. It uses server-rendered
-HTML and keeps its HTTP listener on loopback by default, so a local Tor Onion
-Service or I2P HTTP tunnel can be the only network-facing component.
+## What it includes
 
-This project is for review and experimental deployment. It is not production
-ready and does not provide absolute anonymity. It cannot protect against host
-compromise, malicious administrators, endpoint fingerprinting, or global
-traffic analysis.
-
-## Features
-
-- Boards, threads, nested replies, and full-text search
-- Per-board anonymous posting controls
-- Markdown with sanitized HTML and no remote images
-- Open, invite-only, and closed registration modes
-- Invite-only registration by default on new installations
-- Argon2id passwords, expiring sessions, CSRF and Origin checks
-- Proof of work for registration and posting
-- Administrator controls for boards, invites, users, moderation, and notices
-- Administrator audit log
-- SQLite persistence with migrations and restrictive data-directory permissions
-- Core posting and administration workflows work without JavaScript
+- **Forum:** boards, threads, nested replies, full-text search, and optional
+  anonymous posts per board.
+- **Safe content:** sanitized Markdown, no remote images, and restrictive CSP.
+- **Accounts:** open, invite-only, or closed registration, Argon2id passwords,
+  expiring sessions, CSRF and Origin checks.
+- **Abuse controls:** independently configurable PoW and self-hosted image
+  CAPTCHA for registration, login, and posting.
+- **Administration:** board and invite management, configurable site/footer
+  text, announcements, locale, registration policy, and audit logs.
+- **Governance:** reports, moderation actions, soft-delete recovery, scoped
+  roles, and session revocation.
+- **Deployment:** embedded PostgreSQL migrations, `pg_dump` backups, a local
+  Unix-socket connection with peer authentication, and loopback-only-by-default
+  operation for a local Tor or I2P gateway.
 
 ## Screenshots
 
@@ -59,8 +56,18 @@ or install it at `/usr/local/static` when using the service templates.
 
 ### From source
 
-Requirements: Rust 1.88 or newer and SQLite. The repository pins the CI and
+Requirements: Rust 1.88 or newer and PostgreSQL 15 or newer (with the
+`pg_trgm` extension from the contrib modules). The repository pins the CI and
 local development toolchain through `rust-toolchain.toml`.
+
+Create the role and database once. The role name matches the operating system
+user so peer authentication works over the local socket, and no password is
+stored anywhere:
+
+```bash
+sudo -u postgres createuser --no-createdb --no-superuser "$USER"
+sudo -u postgres createdb -O "$USER" veil_forum
+```
 
 ```bash
 cargo build --release
@@ -74,8 +81,12 @@ Set a unique 12-128 character administrator password only for the first start:
 VEIL_ADMIN_PASSWORD='replace-with-a-long-random-password' \
   ./target/release/veil-forum \
   --addr 127.0.0.1:8001 \
-  --data ./data/forum.db
+  --database-url 'postgres:///veil_forum?host=/var/run/postgresql'
 ```
+
+`--database-url` defaults to that local socket URL and can also be supplied
+through `DATABASE_URL`. The password in a connection string is never printed;
+startup errors show it replaced with `***`.
 
 For a release archive, run `./veil-forum` instead. Open
 `http://127.0.0.1:8001` locally. Remove `VEIL_ADMIN_PASSWORD` from the service
@@ -89,7 +100,7 @@ Tor or I2P gateway.
 
 ```text
 Tor Onion Service ─┐
-                   ├── 127.0.0.1:8001 ── veil-forum ── SQLite
+                   ├── 127.0.0.1:8001 ── veil-forum ── PostgreSQL (Unix socket)
 I2P HTTP Server ───┘
 ```
 
@@ -100,8 +111,8 @@ party authentication, analytics, CDNs, remote fonts, or external images. It
 uses restrictive response headers, sanitized Markdown, CSRF protection, and
 absolute plus idle session expiry.
 
-Deployment remains the operator's responsibility. Protect the database,
-`-wal`, and `-shm` files, gateway private keys, backups, operating system, and
+Deployment remains the operator's responsibility. Protect the database and its
+server, gateway private keys, backups, operating system, and
 service egress. Anonymous display names are not a guarantee of anonymity.
 
 ## Documentation
