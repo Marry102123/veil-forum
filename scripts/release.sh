@@ -15,6 +15,17 @@ VERSION="${1:-}"
 if [ -z "${VERSION}" ]; then
     VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
 fi
+# The tag, Cargo.toml, and CHANGELOG must agree, or the published archive
+# carries a binary whose --version disagrees with its name.
+CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+if [ "${VERSION}" != "${CARGO_VERSION}" ]; then
+    echo "error: VERSION ${VERSION} disagrees with Cargo.toml (${CARGO_VERSION}); bump Cargo.toml first" >&2
+    exit 1
+fi
+grep -q "^## ${VERSION}\$" CHANGELOG.md || {
+    echo "error: CHANGELOG.md has no '## ${VERSION}' entry" >&2
+    exit 1
+}
 TARGET="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' || true)"
 [ -n "${TARGET}" ] || TARGET="x86_64-unknown-linux-gnu"
 

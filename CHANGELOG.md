@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.19
 
 **Breaking for operators:** the PostgreSQL connection string must now carry a
 user and a non-empty host. The Unix-socket form changed from
@@ -10,6 +10,24 @@ the OpenRC script, the maintenance and backup scripts, the defaults and the docs
 all use the new form. Password hashes are unaffected: the PHC string that argon2
 writes is unchanged, so existing accounts keep working.
 
+- Add `--help`/`--version` and `--db-socket`/`--db-name`/`--db-user`: the
+  socket connection string is now composed by the binary, so operators no
+  longer hand-encode the `%2F` URL. An explicit `--database-url` (or
+  `DATABASE_URL`) still wins and is rejected when mixed with the socket parts.
+  The startup banner prints the version.
+- Add `scripts/install.sh`: an idempotent installer (system user, PostgreSQL
+  role and database with peer authentication, binary plus `static/`, systemd or
+  OpenRC unit, first-run seeding, `/healthz` verification) with `--dry-run`.
+- Add `scripts/upgrade.sh`: checksum verification, a pre-upgrade database
+  backup, a versioned snapshot of the running binary and `static/`, a
+  `/healthz` gate, and an automatic rollback on failure.
+- Add `scripts/rollback.sh`: restore a snapshot without touching the database,
+  or additionally restore a pre-upgrade dump into a fresh database with
+  `--restore-db` (required when the failed release already applied a
+  migration).
+- Document that only `static/` travels with the binary: templates, locales
+  and migrations are embedded. `scripts/release.sh` now refuses to package a
+  version that disagrees with `Cargo.toml` or has no CHANGELOG entry.
 - Remove the one-shot SQLite importer (`veil-forum-import`) and the
   `sqlite-import` feature; the migration is done and the SQLite driver no longer
   belongs in the build. An installation still on SQLite should import once with

@@ -186,6 +186,44 @@ const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50
 /// Per-attempt ceiling so startup cannot hang on an unreachable host.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Defaults for the recommended deployment: a local PostgreSQL reached over the
+/// Unix socket with peer authentication, so no password exists anywhere.
+pub const DEFAULT_DB_USER: &str = "veil-forum";
+pub const DEFAULT_DB_SOCKET_DIR: &str = "/var/run/postgresql";
+pub const DEFAULT_DB_NAME: &str = "veil_forum";
+
+/// Percent-encode a Unix socket directory for the authority part of a
+/// `postgres://` URL (`/` becomes `%2F`). Only RFC 3986 unreserved characters
+/// pass through; everything else is `%XX` in uppercase hex.
+pub fn encode_socket_host(socket_dir: &str) -> String {
+    let mut out = String::with_capacity(socket_dir.len());
+    for byte in socket_dir.trim_end_matches('/').bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Build the peer-authentication socket connection string from its parts, so
+/// operators never hand-encode the `%2F` URL themselves:
+///
+/// `socket_database_url("veil-forum", "/var/run/postgresql", "veil_forum")`
+/// is `postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum`.
+///
+/// Callers must reject empty parts; an empty user or database would silently
+/// produce a URL that connects somewhere unexpected.
+pub fn socket_database_url(user: &str, socket_dir: &str, db_name: &str) -> String {
+    format!(
+        "postgres://{}@{}/{}",
+        user,
+        encode_socket_host(socket_dir),
+        db_name
+    )
+}
+
 /// Remove any password from a database URL before it reaches logs or errors.
 ///
 /// Three forms reach this function: the URL form
@@ -1800,6 +1838,27 @@ mod tests {
             "password=***"
         );
         assert_eq!(redact_database_url("password="), "password=***");
+    }
+
+    /// The convenience builder must reproduce the documented default socket
+    /// URL exactly, and encode nothing beyond what URL authorities require.
+    #[test]
+    fn socket_url_builder_matches_the_default() {
+        assert_eq!(
+            socket_database_url(DEFAULT_DB_USER, DEFAULT_DB_SOCKET_DIR, DEFAULT_DB_NAME),
+            "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum"
+        );
+        assert_eq!(
+            encode_socket_host("/var/run/postgresql"),
+            "%2Fvar%2Frun%2Fpostgresql"
+        );
+        // Trailing slashes and unreserved characters need no encoding.
+        assert_eq!(encode_socket_host("/run/pg/"), "%2Frun%2Fpg");
+        assert_eq!(encode_socket_host("~sockets"), "~sockets");
+        assert_eq!(
+            socket_database_url("app", "/tmp/pg socket", "forum"),
+            "postgres://app@%2Ftmp%2Fpg%20socket/forum"
+        );
     }
 
     /// `sqlx::test` provisions a fresh database with `migrations/` applied.

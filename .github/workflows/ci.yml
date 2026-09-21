@@ -37,6 +37,8 @@ jobs:
       - run: cargo build --release
       - name: Run shell script smoke tests
         run: tests/scripts.sh
+      - name: Run deployment script tests
+        run: tests/deploy-scripts.sh
       - name: Run startup, health, and SIGTERM smoke test
         run: tests/startup-smoke.sh
       - run: cargo install cargo-audit --locked
