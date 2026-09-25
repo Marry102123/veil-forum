@@ -189,12 +189,17 @@ jobs:
     needs: stage-release
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # GitHub only serves draft releases to a token that can write contents, so
+      # a read-only token cannot verify the draft this job is gating. The job
+      # still never writes: `RELEASE_ID` pins the exact release, and publishing
+      # is a separate job with its own token. Without this the check would be
+      # structurally unable to run against a draft.
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ github.ref_name }}
-      # The exact draft created by stage-release. A read-only workflow token
-      # cannot enumerate drafts, so the id must be handed over explicitly.
+      # The exact draft created by stage-release, so the job never searches for
+      # a release and cannot be confused by drafts left by an earlier retry.
       RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
