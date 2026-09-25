@@ -445,13 +445,29 @@ file_arch_for_target() {
   case "$1" in
     x86_64-*) printf 'x86-64' ;;
     aarch64-*) printf 'ARM aarch64' ;;
-    i686-*) printf 'Intel i386' ;;
+    # `file` spells 32-bit x86 as "Intel i386" on some releases and
+    # "Intel 80386" on others. Both are valid descriptions of the same ELF
+    # machine, so accept either instead of pinning one release's wording.
+    i686-*) printf 'Intel i386\nIntel 80386' ;;
     armv7-*) printf 'ARM' ;;
     riscv64gc-*) printf 'RISC-V' ;;
     powerpc64le-*) printf 'PowerPC or cisco 7500' ;;
     s390x-*) printf 'IBM S/390' ;;
     *) return 1 ;;
   esac
+}
+
+# Some expectations above list alternative spellings, one per line. A newline in
+# the expected value is a version-tolerant match, not a literal substring. The
+# loop runs in the current shell (a pipeline would run it in a subshell and lose
+# the match) and takes the expected value on stdin.
+file_arch_matches() {
+  actual=$1
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    printf '%s' "$actual" | grep -F "$candidate" >/dev/null && return 0
+  done
+  return 1
 }
 
 STEP="inspect_archives_and_elf"
@@ -506,7 +522,7 @@ while IFS= read -r archive; do
   grep -F "Machine:" "$LOG_ROOT/readelf-$target.txt" | grep -F "$expected_machine" >/dev/null || fail "ELF machine does not match $target: $name"
   file_output=$(file -b "$binary")
   printf '%s\n' "$file_output" > "$LOG_ROOT/file-$target.txt"
-  printf '%s' "$file_output" | grep -F "$expected_file_arch" >/dev/null || fail "file architecture does not match $target: $name"
+  printf '%s\n' "$expected_file_arch" | file_arch_matches "$file_output" || fail "file architecture does not match $target: $name"
   record "archive_$target" passed 'members, ELF machine, and file architecture match the target triple'
 
   qemu_bin=""
