@@ -220,12 +220,26 @@ jobs:
 
   finalize-release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: release-package-e2e
+    needs: [stage-release, release-package-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      # Publish exactly the release that was validated, addressed by id.
+      RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
     steps:
       - name: Publish verified draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        run: |
+          set -eu
+          test -n "$RELEASE_ID"
+          # `gh release edit <tag>` resolves the tag through a local git
+          # checkout, which this job intentionally does not have. Patch the
+          # release by its numeric id instead, so publishing cannot depend on a
+          # clone or silently target a different release sharing the tag.
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" \
+            -f draft=false > /dev/null
+          draft=$(gh api "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" --jq '.draft')
+          test "$draft" = "false"
+          echo "published $RELEASE_TAG as release $RELEASE_ID"
