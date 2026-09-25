@@ -29,10 +29,13 @@ async fn main() -> anyhow::Result<()> {
             uid_map.insert(name, u.id);
             continue;
         }
-        let seed_password = std::env::var("VEIL_SEED_PASSWORD")
-            .expect("set VEIL_SEED_PASSWORD (12-128 chars) before running this demo seed");
-        if seed_password.chars().count() < 12 || seed_password.chars().count() > 128 {
-            anyhow::bail!("VEIL_SEED_PASSWORD must contain 12-128 characters");
+        let seed_password = std::env::var("VEIL_SEED_PASSWORD").expect(
+            "set VEIL_SEED_PASSWORD (15-128 strong characters) before running this demo seed",
+        );
+        if !auth::validate_password(&seed_password, &[name, "veil-forum", "seed"]) {
+            anyhow::bail!(
+                "VEIL_SEED_PASSWORD must contain 15-128 characters and pass the strength check"
+            );
         }
         let hash = auth::hash_password(&seed_password)?;
         let id = store.create_user(name, &hash, is_admin).await?;

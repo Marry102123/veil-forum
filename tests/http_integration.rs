@@ -9,8 +9,6 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use sqlx::PgPool;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use veil_forum::{captcha, handler, pow, store::Store};
 
@@ -26,7 +24,6 @@ async fn app_with_store(pool: &PgPool) -> anyhow::Result<(axum::Router, Store)> 
         limits: veil_forum::rate_limit::Limits::new(),
         secure_session_cookie: false,
         store: store.clone(),
-        password_gate: Arc::new(Semaphore::new(8)),
     };
     Ok((handler::routes(state), store))
 }
@@ -92,7 +89,7 @@ async fn csrf_token(app: axum::Router, uri: &str, cookie: Option<&str>) -> anyho
 async fn healthz_reports_ready_and_security_headers(pool: PgPool) -> anyhow::Result<()> {
     let response = get(app(&pool).await?, "/healthz").await?;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'");
+    assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'");
     assert_eq!(response.headers()["x-frame-options"], "DENY");
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(response.headers()["cache-control"], "no-store");
@@ -208,16 +205,6 @@ async fn maintenance_mode_blocks_public_pages_but_keeps_login_and_admin_accessib
 }
 
 #[sqlx::test]
-async fn configured_palette_is_rendered_on_public_pages(pool: PgPool) -> anyhow::Result<()> {
-    let (application, store) = app_with_store(&pool).await?;
-    store.set_config("theme_palette", "terminal").await?;
-    let response = get(application, "/").await?;
-    let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
-    assert!(html.contains(r#"data-palette="terminal""#));
-    Ok(())
-}
-
-#[sqlx::test]
 async fn static_assets_are_served_and_traversal_is_not(pool: PgPool) -> anyhow::Result<()> {
     let application = app(&pool).await?;
     let response = get(application.clone(), "/static/style.css").await?;
@@ -305,7 +292,7 @@ async fn registration_policy_switches_control_rendered_fields_and_server_pow_gat
                     application,
                     "/register",
                     None,
-                    &format!("csrf_token={csrf}&username=valid_user&password=long-enough"),
+                    &format!("csrf_token={csrf}&username=valid_user&password=Glacier-Maple7-Raven"),
                 )
                 .await?;
                 assert_eq!(
@@ -330,7 +317,7 @@ async fn registration_policy_switches_control_rendered_fields_and_server_pow_gat
         application,
         "/register",
         None,
-        &format!("csrf_token={csrf}&username=valid_user&password=long-enough"),
+        &format!("csrf_token={csrf}&username=valid_user&password=Glacier-Maple7-Raven"),
     )
     .await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);

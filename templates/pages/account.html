@@ -75,8 +75,8 @@
 <form method="POST" action="/account/password" style="max-width:420px">
 {{ csrf_field | safe }}
 <input name="old_password" type="password" placeholder="{{ old_password_label }}" aria-label="{{ old_password_label }}" required autocomplete="current-password" style="width:100%;margin:5px 0">
-<input name="new_password" type="password" placeholder="{{ new_password_label }}" aria-label="{{ new_password_label }}" required minlength="6" maxlength="72" autocomplete="new-password" style="width:100%;margin:5px 0">
-<input name="repeat_password" type="password" placeholder="{{ repeat_password_label }}" aria-label="{{ repeat_password_label }}" required minlength="6" maxlength="72" autocomplete="new-password" style="width:100%;margin:5px 0">
+<input name="new_password" type="password" placeholder="{{ new_password_label }}" aria-label="{{ new_password_label }}" required minlength="15" maxlength="128" autocomplete="new-password" style="width:100%;margin:5px 0">
+<input name="repeat_password" type="password" placeholder="{{ repeat_password_label }}" aria-label="{{ repeat_password_label }}" required minlength="15" maxlength="128" autocomplete="new-password" style="width:100%;margin:5px 0">
 <button class="btn-primary" style="width:100%">{{ save_label }}</button>
 </form>
 </section>

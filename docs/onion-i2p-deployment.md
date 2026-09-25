@@ -50,4 +50,5 @@ as `***` in every error message and startup banner.
 
 For first initialization, set `VEIL_ADMIN_PASSWORD` only in the service
 manager environment and remove it after the first successful startup. The
-value must be 12-128 characters and must never be logged.
+value must be 15-128 characters, pass the application's strength check, and
+must never be logged.

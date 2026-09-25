@@ -7,7 +7,9 @@
 # Options:
 #   --snapshot DIR     snapshot to restore (default: the newest in
 #                      /var/lib/veil-forum/rollback)
-#   --restore-db DUMP  also restore a database backup into a fresh database.
+#   --restore-db DUMP  restore a custom-format database backup. `.age` inputs
+#                      require --backup-identity (file path only).
+#   --backup-identity FILE age identity file for --restore-db
 #                      Needed only when the failed release already applied a
 #                      migration; an older binary cannot read a newer schema.
 #                      Asks for confirmation unless --yes is given.
@@ -34,6 +36,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 SNAP=""
 RESTORE_DB=""
+BACKUP_IDENTITY=""
 YES=0
 EXPLICIT_URL=""
 EXPLICIT_ADDR=""
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --snapshot) SNAP=${2:?--snapshot needs a directory}; shift 2 ;;
         --restore-db) RESTORE_DB=${2:?--restore-db needs a dump file}; shift 2 ;;
+        --backup-identity) BACKUP_IDENTITY=${2:?--backup-identity needs a file path}; shift 2 ;;
         --yes) YES=1; shift ;;
         --database-url) EXPLICIT_URL=${2:?--database-url needs a URL}; shift 2 ;;
         --addr) EXPLICIT_ADDR=${2:?--addr needs HOST:PORT}; shift 2 ;;
@@ -127,8 +131,18 @@ veil_log "  static: $SNAP/static -> $VEIL_STATIC_DIR"
 veil_log "  listen: $ADDR"
 if [ -n "$RESTORE_DB" ]; then
     [ -f "$RESTORE_DB" ] || veil_die "database backup not found: $RESTORE_DB"
+    case "$RESTORE_DB" in
+        *.dump.age)
+            [ -n "$BACKUP_IDENTITY" ] || veil_die ".age backups require --backup-identity"
+            veil_valid_path "$BACKUP_IDENTITY" || veil_die "--backup-identity must be a plain file path"
+            [ -f "$BACKUP_IDENTITY" ] || veil_die "age identity file not found"
+            veil_root_private_file "$BACKUP_IDENTITY" || veil_die "age identity file must be root-owned and not group/world accessible"
+            veil_need age ;;
+        *.dump) ;;
+        *) veil_die "--restore-db requires a custom-format .dump or .dump.age" ;;
+    esac
     veil_log "  database: DROP and recreate from $RESTORE_DB"
-    veil_log "  dsn: $DSN"
+    veil_log "  dsn: [redacted PostgreSQL connection string]"
 else
     veil_log "  database: untouched"
 fi
@@ -146,16 +160,20 @@ fi
 # the same strict validation as install.sh inputs.
 if [ -n "$RESTORE_DB" ]; then
     case "$DSN" in
+        postgres://*:*@%2F*/*)
+            veil_die "--restore-db refuses credential-bearing DSNs; use a passwordless peer-authentication socket DSN"
+            ;;
         postgres://*@%2F*/*)
             RESTORE_USER=${DSN#postgres://}
             RESTORE_USER=${RESTORE_USER%%@*}
             RESTORE_DBNAME=${DSN##*/}
-            veil_valid_name "$RESTORE_USER" || veil_die "cannot split $DSN into role and database; use a plain socket DSN"
-            veil_valid_name "$RESTORE_DBNAME" || veil_die "cannot split $DSN into role and database; use a plain socket DSN"
-            veil_valid_path "$DSN" || veil_die "cannot use $DSN for --restore-db; use a plain socket DSN"
+            veil_valid_name "$RESTORE_USER" || veil_die "cannot parse the database role from the supplied DSN; use a plain socket DSN without credentials"
+            veil_valid_name "$RESTORE_DBNAME" || veil_die "cannot parse the database name from the supplied DSN; use a plain socket DSN without credentials"
+            veil_valid_path "$DSN" || veil_die "the supplied database DSN contains unsupported characters; use a plain socket DSN without credentials"
             ;;
-        *) veil_die "--restore-db needs the socket DSN form (postgres://role@%2F.../dbname); pass --database-url explicitly" ;;
+        *) veil_die "--restore-db needs a passwordless socket DSN (postgres://role@%2F.../dbname); pass --database-url explicitly" ;;
     esac
+    [ "$RESTORE_USER" = "$VEIL_USER" ] || veil_die "--restore-db requires the database role to match --user/VEIL_USER for peer authentication"
     if [ "$YES" -ne 1 ]; then
         printf 'This DROPS the database %s and recreates it from %s. Continue? [y/N] ' "$RESTORE_DBNAME" "$RESTORE_DB"
         if ! read -r _answer; then
@@ -168,16 +186,32 @@ if [ -n "$RESTORE_DB" ]; then
         unset _answer
     fi
     veil_need su pg_restore psql
+    # Stream the validated plaintext straight into pg_restore. In particular,
+    # never materialize a decrypted database dump in /tmp, where a crash could
+    # leave it behind for another process in the same security domain.
+    restore_dump() {
+        case "$RESTORE_DB" in
+            *.dump.age) age --decrypt -i "$BACKUP_IDENTITY" "$RESTORE_DB" ;;
+            *) cat "$RESTORE_DB" ;;
+        esac
+    }
+    if ! restore_dump | pg_restore --list >/dev/null 2>&1; then
+        veil_die "decrypted database backup is invalid or the supplied age identity is wrong"
+    fi
     # A failed restore must still leave the service running if at all
     # possible: start it best-effort before reporting the failure.
     veil_service_stop || veil_die "could not stop $VEIL_SERVICE"
     if ! su -s /bin/sh postgres -c "psql -v ON_ERROR_STOP=1 -c \"DROP DATABASE \\\"$RESTORE_DBNAME\\\";\" -c \"CREATE DATABASE \\\"$RESTORE_DBNAME\\\" OWNER \\\"$RESTORE_USER\\\";\""; then
-        veil_service_start || true
-        veil_die "database restore failed while recreating $RESTORE_DBNAME"
+        if veil_service_start; then
+            veil_die "database restore failed while recreating $RESTORE_DBNAME; the previous service was restarted"
+        fi
+        veil_die "database restore failed while recreating $RESTORE_DBNAME, and the service could not be restarted"
     fi
-    if ! su -s /bin/sh "$VEIL_USER" -c "pg_restore --dbname '$DSN' --no-owner --exit-on-error '$RESTORE_DB'"; then
-        veil_service_start || true
-        veil_die "database restore failed while loading $RESTORE_DB"
+    if ! restore_dump | su -s /bin/sh "$VEIL_USER" -c "pg_restore --dbname '$DSN' --no-owner --exit-on-error"; then
+        if veil_service_start; then
+            veil_die "database restore failed while loading $RESTORE_DB; the previous service was restarted against the partial database"
+        fi
+        veil_die "database restore failed while loading $RESTORE_DB, and the service could not be restarted"
     fi
     veil_log "Database restored from $RESTORE_DB"
     unset RESTORE_USER RESTORE_DBNAME
@@ -217,8 +251,10 @@ if [ "$_restore_ok" -eq 1 ]; then
 fi
 if [ "$_restore_ok" -eq 0 ]; then
     veil_warn "file restore failed; starting the service best-effort"
-    veil_service_start || true
-    veil_die "rollback failed; snapshot at $SNAP"
+    if veil_service_start; then
+        veil_die "rollback failed, but the previous service was restarted; snapshot at $SNAP"
+    fi
+    veil_die "rollback failed and the service could not be restarted; snapshot at $SNAP"
 fi
 veil_service_start
 

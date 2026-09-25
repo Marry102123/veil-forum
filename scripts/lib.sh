@@ -22,7 +22,7 @@
 #   VEIL_ADDR           listener address          (default 127.0.0.1:$VEIL_PORT)
 #   VEIL_BACKUP_DIR     database backup directory (default /srv/veil-forum-backups)
 #   VEIL_SERVICE_MANAGER systemd|openrc|none      (default: auto-detect)
-#   VEIL_ALLOW_NONROOT=1 skips the root check (used by the test suite)
+#   VEIL_ALLOW_NONROOT=1 plus VEIL_TEST_HARNESS=1 skips the root check in tests
 #
 # Callers own `set -eu`; this file must stay compatible with POSIX sh.
 
@@ -56,6 +56,25 @@ veil_die() {
     exit 1
 }
 
+# Return success only when a regular file's symbolic mode has no group/world
+# permission bits. This avoids GNU/BSD stat octal differences and shell-specific
+# base-prefix arithmetic while keeping the check usable under dash and BusyBox.
+veil_private_file() {
+    _vf_mode=$(stat -c '%A' "$1" 2>/dev/null || stat -f '%Sp' "$1" 2>/dev/null) || return 1
+    case "$_vf_mode" in
+        ????------) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A root-run recovery must not accept a private age identity owned by an
+# unprivileged account, even when its mode is 0600.
+veil_root_private_file() {
+    _vrp_uid=$(stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null) || return 1
+    [ "$_vrp_uid" = "0" ] || return 1
+    veil_private_file "$1"
+}
+
 veil_need() {
     for _cmd in "$@"; do
         command -v "$_cmd" >/dev/null 2>&1 || veil_die "'$_cmd' is required but not installed"
@@ -66,7 +85,7 @@ veil_need() {
 # Refuse to run privileged work as a normal user, unless the test suite says
 # it is driving stubs.
 veil_need_root() {
-    if [ "${VEIL_ALLOW_NONROOT:-0}" = "1" ]; then
+    if [ "${VEIL_ALLOW_NONROOT:-0}" = "1" ] && [ "${VEIL_TEST_HARNESS:-0}" = "1" ]; then
         return 0
     fi
     if [ "$(id -u)" -ne 0 ]; then

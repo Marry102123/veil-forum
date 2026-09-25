@@ -72,6 +72,18 @@ async fn main() -> anyhow::Result<()> {
             other => anyhow::bail!("unknown argument {other:?}; {USAGE}"),
         }
     }
+    tracing_subscriber::fmt()
+        .json()
+        // Keep structured events on stderr, which is what systemd/OpenRC
+        // journal capture and the real-process E2E inspect. Diagnostics must
+        // never share stdout with normal CLI output.
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init()
+        .ok();
     let socket_parts_given = db_socket.is_some() || db_name.is_some() || db_user.is_some();
     let env_database_url = std::env::var("DATABASE_URL")
         .ok()
@@ -155,7 +167,6 @@ async fn main() -> anyhow::Result<()> {
         captcha: veil_forum::captcha::Manager::new(),
         limits: rate_limit::Limits::new(),
         secure_session_cookie,
-        password_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let app = handler::routes(state).layer(ConcurrencyLimitLayer::new(64));
     let listener = tokio::net::TcpListener::bind(&addr)

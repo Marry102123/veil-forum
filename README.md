@@ -24,9 +24,9 @@ experimental deployment, not as a guarantee of anonymity or production security.
 - **Governance:** reports, moderation actions, soft-delete recovery, scoped
   roles, and session revocation.
 - **Deployment:** one binary plus `static/`, embedded PostgreSQL migrations,
-  scripted install/upgrade/rollback, `pg_dump` backups, a local Unix-socket
-  connection with peer authentication, and loopback-only-by-default operation
-  for a local Tor or I2P gateway.
+  scripted install/upgrade/rollback, age-encrypted `pg_dump` backups, a local
+  Unix-socket connection with peer authentication, and
+  loopback-only-by-default operation for a local Tor or I2P gateway.
 
 ## Quick start
 
@@ -97,13 +97,13 @@ explicitly set.
 
 | Setting | Flag | Environment | Default |
 |---|---|---|---|
-| Listener | `--addr HOST:PORT` | — | `127.0.0.1:8001` |
-| Database (socket parts) | `--db-user/--db-name/--db-socket` | — | `veil-forum` / `veil_forum` / `/var/run/postgresql` |
+| Listener | `--addr HOST:PORT` | none | `127.0.0.1:8001` |
+| Database (socket parts) | `--db-user/--db-name/--db-socket` | none | `veil-forum` / `veil_forum` / `/var/run/postgresql` |
 | Database (full URL) | `--database-url URL` | `DATABASE_URL` | socket DSN above |
-| First admin (first run only) | — | `VEIL_ADMIN_PASSWORD` (12-128 chars) | required when the DB is empty |
-| Allow non-loopback | — | `VEIL_ALLOW_NONLOOPBACK=1` | refused |
-| Force secure cookies | — | `VEIL_SESSION_COOKIE_SECURE=0/1` | `Secure` off on loopback, on otherwise |
-| Backup retention | — | `VEIL_BACKUP_RETAIN` | `30` |
+| First admin (first run only) | none | `VEIL_ADMIN_PASSWORD` (15-128 chars, strong) | required when the DB is empty |
+| Allow non-loopback | none | `VEIL_ALLOW_NONLOOPBACK=1` | refused |
+| Force secure cookies | none | `VEIL_SESSION_COOKIE_SECURE=0/1` | `Secure` off on loopback, on otherwise |
+| Backup retention | none | `VEIL_BACKUP_RETAIN` | `30` |
 
 `--database-url` and the `--db-*` parts cannot be combined. Passwords in a
 connection string are never printed; startup errors show them as `***`.
@@ -113,12 +113,17 @@ start.
 ## Operating it
 
 ```bash
-# Back up the database (verified, mode 600, keeps 30 archives)
-sudo scripts/db-maintenance.sh backup
+# Back up the database (verified .dump.age, mode 600, keeps 30 archives).
+# Do not rely on sudo inheriting this variable from the ordinary shell.
+sudo env VEIL_BACKUP_RECIPIENT_FILE=/etc/veil-forum/backup-recipients \
+  scripts/db-maintenance.sh backup
 
-# Upgrade from a release archive (verifies checksums, backs up first,
-# snapshots the running release, health-checks, rolls back on failure)
-sudo scripts/upgrade.sh veil-forum-*.tar.gz --checksums veil-forum-*-checksums.txt
+# Upgrade one release archive (verifies checksums and signatures, backs up
+# first, snapshots the running release, health-checks, rolls back on failure)
+sudo env VEIL_BACKUP_RECIPIENT_FILE=/etc/veil-forum/backup-recipients \
+  scripts/upgrade.sh /srv/releases/veil-forum-vVERSION-x86_64-unknown-linux-musl.tar.gz \
+  --checksums /srv/releases/veil-forum-vVERSION-checksums.txt \
+  --signatures /srv/releases/signatures
 
 # Roll back to the previous snapshot (database untouched)
 sudo scripts/rollback.sh
@@ -143,7 +148,7 @@ The following screenshots show the English demo instance and its server-rendered
 
 ```text
 Tor Onion Service ─┐
-                   ├── 127.0.0.1:8001 ── veil-forum ── PostgreSQL (Unix socket)
+                   ├─ 127.0.0.1:8001 ─ veil-forum ─ PostgreSQL (Unix socket)
 I2P HTTP Server ───┘
 ```
 
@@ -171,13 +176,51 @@ service egress. Anonymous display names are not a guarantee of anonymity.
 
 ```bash
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets
+DATABASE_URL=postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test \
+  cargo test --all-targets
+cargo clippy --all-targets --all-features
 tests/scripts.sh
 tests/deploy-scripts.sh
+sh tests/backup_upgrade_e2e.sh
 cargo build --release
 cargo audit --ignore RUSTSEC-2023-0071
 ```
+
+`cargo test --all-targets` automatically compiles and runs Rust integration
+targets under `tests/`, including the `*_e2e.rs` suites. The `#[sqlx::test]`
+suites require `DATABASE_URL` to point at a PostgreSQL database for which the
+current user can create disposable test databases. This command does not run
+shell E2E scripts. Each Rust E2E writes a credential-free JSON report under
+`target/` on success, error, and panic paths. CI uploads the authentication,
+configuration, forum lifecycle, governance, and search reports together with the
+backup/upgrade report and the sanitized application JSON log.
+
+The backup/upgrade E2E uses a real PostgreSQL server, a temporary age identity,
+and passwordless `sudo -n -u postgres`; it does not rely on sudo inheriting
+ordinary shell variables. Every run writes the credential-free report
+`target/backup-upgrade-e2e-report.json`, including the exact regeneration
+command. Per-phase seed, backup, upgrade, rollback, restore, and service logs
+remain under its private temporary directory for the run and are deleted by its
+cleanup trap on both success and failure. The same cleanup stops the service
+process, drops the temporary database, drops a role it created or restores the
+original attributes of a role it narrowed, and removes identity keys, backups,
+snapshots, and PID files. CI retains the credential-free JSON reports and the
+sanitized application JSON log, but not raw temporary logs or key material.
+
+Published tag assets are verified by CI before the draft release becomes
+public. The same command can be rerun against a published tag:
+
+```bash
+GH_TOKEN=... RELEASE_TAG=vVERSION RELEASE_REPO=OWNER/REPO sh tests/release_packages_e2e.sh
+```
+
+This downloads every asset, verifies checksums, archive paths and ELF target
+metadata, and runs a native archive against a temporary PostgreSQL cluster.
+Its report is `target/release-packages-e2e-report.json` and sanitized logs are
+under `target/release-packages-e2e-logs/`. Failures include missing or
+unauthenticated GitHub access, absent or mismatched release assets, corrupt
+archives, wrong executable architecture, failed migrations/health/SIGTERM, and
+leftover temporary resources.
 
 The optional `external-go-interop` feature requires a separate Go compatibility
 project. Set `VEIL_GO_PROJECT` and optionally `VEIL_GO_BIN` before enabling it.

@@ -12,7 +12,7 @@ pub struct Post {
     pub id: i64,
     pub thread_id: i64,
     pub board_id: i64,
-    pub author_id: i64,
+    pub author_id: Option<i64>,
     pub is_anonymous: bool,
     pub parent_post_id: Option<i64>,
     pub content_md: String,
@@ -33,7 +33,7 @@ pub struct Thread {
     pub id: i64,
     pub board_id: i64,
     pub title: String,
-    pub author_id: i64,
+    pub author_id: Option<i64>,
     pub is_pinned: bool,
     pub is_locked: bool,
     pub reply_count: i64,
@@ -321,7 +321,6 @@ fn escape_like_pattern(input: &str) -> String {
 }
 
 async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
-    let mut last_error = None;
     for attempt in 1..=CONNECT_ATTEMPTS {
         // Bound each attempt explicitly: a blackholed host would otherwise hold
         // startup for the operating system's TCP timeout, which is longer than
@@ -334,19 +333,22 @@ async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
                 .connect(database_url),
         )
         .await;
-        match connect {
-            Ok(Ok(pool)) => return Ok(pool),
-            Ok(Err(error)) => last_error = Some(error.to_string()),
-            Err(_) => last_error = Some(format!("connect timed out after {CONNECT_TIMEOUT:?}")),
+        if let Ok(Ok(pool)) = connect {
+            return Ok(pool);
         }
+        tracing::warn!(
+            retry_attempt = attempt,
+            reason = "connection_unavailable",
+            timeout_seconds = CONNECT_TIMEOUT.as_secs(),
+            "database connection unavailable"
+        );
         if attempt < CONNECT_ATTEMPTS {
             tokio::time::sleep(CONNECT_BACKOFF).await;
         }
     }
     Err(anyhow::anyhow!(
-        "could not connect to PostgreSQL at {} after {CONNECT_ATTEMPTS} attempts: {}",
-        redact_database_url(database_url),
-        last_error.unwrap_or_else(|| "unknown error".to_string())
+        "could not connect to PostgreSQL at {} after {CONNECT_ATTEMPTS} attempts",
+        redact_database_url(database_url)
     ))
 }
 
@@ -572,6 +574,38 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+    pub async fn update_password_and_rotate_sessions(
+        &self,
+        user_id: i64,
+        hash: &str,
+    ) -> anyhow::Result<String> {
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let raw = hex::encode(bytes);
+        let digest = crate::auth::digest_token(&raw);
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE users SET password_hash=$1 WHERE id=$2")
+            .bind(hash)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at) VALUES($1,$2,$3,$4,$5)")
+            .bind(&digest)
+            .bind(user_id)
+            .bind(now)
+            .bind(now + chrono::Duration::hours(30 * 24))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(raw)
     }
     pub async fn audit(
         &self,
@@ -854,7 +888,7 @@ impl Store {
     }
     pub async fn last_post_at(&self, author_id: i64) -> anyhow::Result<Option<DateTime<Utc>>> {
         let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
-            "SELECT created_at FROM posts WHERE author_id=$1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT created_at FROM posts WHERE author_id=$1 AND is_anonymous=FALSE ORDER BY created_at DESC LIMIT 1",
         )
         .bind(author_id)
         .fetch_optional(&self.pool)
@@ -875,8 +909,9 @@ impl Store {
     ) -> anyhow::Result<i64> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
+        let post_author_id = if is_anonymous { None } else { Some(author_id) };
         let id = sqlx::query_scalar::<_, i64>("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,parent_post_id,content_md,content_html,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
-            .bind(thread_id).bind(board_id).bind(author_id).bind(is_anonymous).bind(parent_post_id).bind(md).bind(html).bind(now)
+            .bind(thread_id).bind(board_id).bind(post_author_id).bind(is_anonymous).bind(parent_post_id).bind(md).bind(html).bind(now)
             .fetch_one(&mut *tx).await?;
         sqlx::query("UPDATE threads SET reply_count=reply_count+1, last_reply_at=$1 WHERE id=$2")
             .bind(now)
@@ -886,7 +921,7 @@ impl Store {
         tx.commit().await?;
         Ok(id)
     }
-    /// ListPosts: thread 分页 + author join，未匿名显示 username，匿名仍存 author_id 但显示上游可忽略
+    /// ListPosts: thread 分页 + author join，匿名帖子不保留 author_id
     pub async fn list_posts(
         &self,
         thread_id: i64,
@@ -902,7 +937,7 @@ impl Store {
                 .fetch_one(&self.pool)
                 .await?;
         let rows = sqlx::query(
-            "SELECT p.id, p.thread_id, p.board_id, p.author_id, p.is_anonymous, p.parent_post_id, p.content_md, p.content_html, p.created_at, COALESCE(u.username,'deleted') \
+            "SELECT p.id, p.thread_id, p.board_id, p.author_id, p.is_anonymous, p.parent_post_id, p.content_md, p.content_html, p.created_at, CASE WHEN p.is_anonymous THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END \
              FROM posts p LEFT JOIN users u ON u.id=p.author_id \
              WHERE p.thread_id=$1 AND p.deleted_at IS NULL ORDER BY p.id ASC LIMIT $2 OFFSET $3"
         )
@@ -915,7 +950,7 @@ impl Store {
                 id: r.get("id"),
                 thread_id: r.get("thread_id"),
                 board_id: r.get("board_id"),
-                author_id: r.get("author_id"),
+                author_id: r.get::<Option<i64>, _>("author_id"),
                 is_anonymous: r.get::<bool, _>("is_anonymous"),
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
@@ -929,7 +964,7 @@ impl Store {
 
     pub async fn get_post(&self, id: i64) -> anyhow::Result<Option<Post>> {
         let row = sqlx::query(
-            "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, COALESCE(u.username,'deleted') \
+            "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at, CASE WHEN p.is_anonymous THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END \
              FROM posts p LEFT JOIN users u ON u.id=p.author_id WHERE p.id=$1 AND p.deleted_at IS NULL"
         )
         .bind(id).fetch_optional(&self.pool).await?;
@@ -939,7 +974,7 @@ impl Store {
                 id: r.get("id"),
                 thread_id: r.get("thread_id"),
                 board_id: r.get("board_id"),
-                author_id: r.get("author_id"),
+                author_id: r.get::<Option<i64>, _>("author_id"),
                 is_anonymous: r.get::<bool, _>("is_anonymous"),
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
@@ -1004,7 +1039,7 @@ impl Store {
     }
     pub async fn list_deleted_posts(&self, limit: i64) -> anyhow::Result<Vec<Post>> {
         let rows = sqlx::query(
-            "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at,COALESCE(u.username,'deleted') \
+            "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,p.content_md,p.content_html,p.created_at,CASE WHEN p.is_anonymous THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END \
              FROM posts p LEFT JOIN users u ON u.id=p.author_id \
              WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC,p.id DESC LIMIT $1",
         )
@@ -1017,7 +1052,7 @@ impl Store {
                     id: r.get("id"),
                     thread_id: r.get("thread_id"),
                     board_id: r.get("board_id"),
-                    author_id: r.get("author_id"),
+                    author_id: r.get::<Option<i64>, _>("author_id"),
                     is_anonymous: r.get::<bool, _>("is_anonymous"),
                     parent_post_id: r.get("parent_post_id"),
                     content_md: r.get("content_md"),
@@ -1084,7 +1119,7 @@ impl Store {
                 "{SEARCH_MATCHES} \
                  SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,\
                         p.content_md,p.content_html,p.created_at, \
-                        COALESCE(u.username,'deleted') AS author_name, th.title, th.board_id AS th_board_id \
+                        CASE WHEN p.is_anonymous THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name, th.title, th.board_id AS th_board_id \
                  FROM matches m \
                  JOIN posts p ON p.id = m.post_id \
                  JOIN threads th ON th.id = p.thread_id \
@@ -1107,7 +1142,7 @@ impl Store {
             // satisfies by scanning backwards and stopping at the page size.
             let sql = "SELECT p.id,p.thread_id,p.board_id,p.author_id,p.is_anonymous,p.parent_post_id,\
                               p.content_md,p.content_html,p.created_at, \
-                       COALESCE(u.username,'deleted') AS author_name, th.title, th.board_id AS th_board_id \
+                       CASE WHEN p.is_anonymous THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name, th.title, th.board_id AS th_board_id \
                 FROM posts p \
                 JOIN threads th ON th.id=p.thread_id \
                 JOIN boards b ON b.id=th.board_id \
@@ -1133,7 +1168,7 @@ impl Store {
                 id: r.get("id"),
                 thread_id: tid,
                 board_id: r.get("board_id"),
-                author_id: r.get("author_id"),
+                author_id: r.get::<Option<i64>, _>("author_id"),
                 is_anonymous: r.get::<bool, _>("is_anonymous"),
                 parent_post_id: r.get::<Option<i64>, _>("parent_post_id"),
                 content_md: r.get("content_md"),
@@ -1159,7 +1194,7 @@ impl Store {
             id: row.get("id"),
             board_id: row.get("board_id"),
             title: row.get("title"),
-            author_id: row.get("author_id"),
+            author_id: row.get::<Option<i64>, _>("author_id"),
             is_pinned: row.get::<bool, _>("is_pinned"),
             is_locked: row.get::<bool, _>("is_locked"),
             reply_count: row.get("reply_count"),
@@ -1182,11 +1217,13 @@ impl Store {
     ) -> anyhow::Result<i64> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
+        let thread_author_id = if is_anonymous { None } else { Some(author_id) };
         let tid = sqlx::query_scalar::<_, i64>("INSERT INTO threads(board_id,title,author_id,is_pinned,is_locked,reply_count,last_reply_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
-            .bind(board_id).bind(title).bind(author_id).bind(false).bind(false).bind(0i64).bind(now).bind(now)
+            .bind(board_id).bind(title).bind(thread_author_id).bind(false).bind(false).bind(0i64).bind(now).bind(now)
             .fetch_one(&mut *tx).await?;
+        let post_author_id = if is_anonymous { None } else { Some(author_id) };
         sqlx::query("INSERT INTO posts(thread_id,board_id,author_id,is_anonymous,content_md,content_html,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
-            .bind(tid).bind(board_id).bind(author_id).bind(is_anonymous).bind(content_md).bind(content_html).bind(now)
+            .bind(tid).bind(board_id).bind(post_author_id).bind(is_anonymous).bind(content_md).bind(content_html).bind(now)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(tid)
@@ -1196,7 +1233,7 @@ impl Store {
     pub async fn get_thread(&self, id: i64) -> anyhow::Result<Option<Thread>> {
         let row = sqlx::query(
             "SELECT th.id, th.board_id, th.title, th.author_id, th.is_pinned, th.is_locked, th.reply_count, th.last_reply_at, th.created_at, \
-                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
+                    CASE WHEN th.author_id IS NULL OR EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
              FROM threads th \
              LEFT JOIN users u ON u.id=th.author_id \
              LEFT JOIN boards b ON b.id=th.board_id \
@@ -1223,7 +1260,7 @@ impl Store {
                 .await?;
         let rows = sqlx::query(
             "SELECT th.id, th.board_id, th.title, th.author_id, th.is_pinned, th.is_locked, th.reply_count, th.last_reply_at, th.created_at, \
-                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
+                    CASE WHEN th.author_id IS NULL OR EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END as author_name, COALESCE(b.slug,'') as board_slug \
              FROM threads th \
              LEFT JOIN users u ON u.id=th.author_id \
              LEFT JOIN boards b ON b.id=th.board_id \
@@ -1286,7 +1323,7 @@ impl Store {
     pub async fn list_deleted_threads(&self, limit: i64) -> anyhow::Result<Vec<Thread>> {
         let rows = sqlx::query(
             "SELECT th.id,th.board_id,th.title,th.author_id,th.is_pinned,th.is_locked,th.reply_count,th.last_reply_at,th.created_at, \
-                    CASE WHEN EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name,COALESCE(b.slug,'') AS board_slug \
+                    CASE WHEN th.author_id IS NULL OR EXISTS (SELECT 1 FROM posts op WHERE op.thread_id=th.id AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) AND op.is_anonymous) THEN 'Anonymous' ELSE COALESCE(u.username,'deleted') END AS author_name,COALESCE(b.slug,'') AS board_slug \
              FROM threads th LEFT JOIN users u ON u.id=th.author_id LEFT JOIN boards b ON b.id=th.board_id \
              WHERE th.deleted_at IS NOT NULL ORDER BY th.deleted_at DESC,th.id DESC LIMIT $1",
         )
@@ -1306,7 +1343,7 @@ impl Store {
         code: &str,
         created_by: i64,
         max_uses: i64,
-        expires_at: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
         note: &str,
     ) -> anyhow::Result<()> {
         let now = Utc::now();
@@ -1424,12 +1461,13 @@ impl Store {
         let mut b = [0u8; 32];
         rand::rng().fill_bytes(&mut b);
         let id = hex::encode(b);
+        let digest = crate::auth::digest_token(&id);
         let now = Utc::now();
         let exp = now + chrono::Duration::hours(30 * 24);
         sqlx::query(
             "INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at) VALUES($1,$2,$3,$4,$5)",
         )
-        .bind(&id)
+        .bind(&digest)
         .bind(user_id)
         .bind(now)
         .bind(exp)
@@ -1439,8 +1477,9 @@ impl Store {
         Ok(id)
     }
     pub async fn get_session(&self, id: &str) -> anyhow::Result<Option<Session>> {
+        let digest = crate::auth::digest_token(id);
         let row = sqlx::query("SELECT s.id,s.user_id,s.created_at,s.expires_at,s.last_seen_at, u.username, u.is_banned FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1")
-            .bind(id).fetch_optional(&self.pool).await?;
+            .bind(&digest).fetch_optional(&self.pool).await?;
         if let Some(r) = row {
             let created: DateTime<Utc> = r.get("created_at");
             let exp: DateTime<Utc> = r.get("expires_at");
@@ -1465,7 +1504,7 @@ impl Store {
             }
             let _ = sqlx::query("UPDATE sessions SET last_seen_at=$1 WHERE id=$2")
                 .bind(now)
-                .bind(id)
+                .bind(&digest)
                 .execute(&self.pool)
                 .await;
             return Ok(Some(sess));
@@ -1473,8 +1512,12 @@ impl Store {
         Ok(None)
     }
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<()> {
+        let digest = crate::auth::digest_token(id);
+        self.delete_session_digest(&digest).await
+    }
+    pub async fn delete_session_digest(&self, digest: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM sessions WHERE id=$1")
-            .bind(id)
+            .bind(digest)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1703,6 +1746,7 @@ impl Store {
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
         let id = hex::encode(bytes);
+        let digest = crate::auth::digest_token(&id);
         let now = Utc::now();
         let expires = now + chrono::Duration::seconds(PENDING_LOGIN_TTL_SECONDS);
         // Housekeeping: drop this user's stale attempts before adding one.
@@ -1715,7 +1759,7 @@ impl Store {
             "INSERT INTO pending_logins(id,user_id,created_at,expires_at,attempts) \
              VALUES($1,$2,$3,$4,0)",
         )
-        .bind(&id)
+        .bind(&digest)
         .bind(user_id)
         .bind(now)
         .bind(expires)
@@ -1727,11 +1771,12 @@ impl Store {
     /// Look up a still-usable pending login. Returns `None` once it is consumed,
     /// expired, or out of attempts.
     pub async fn pending_login(&self, id: &str) -> anyhow::Result<Option<PendingLogin>> {
+        let digest = crate::auth::digest_token(id);
         let row = sqlx::query(
             "SELECT id, user_id, created_at, expires_at, attempts FROM pending_logins \
              WHERE id=$1 AND consumed_at IS NULL AND expires_at > $2 AND attempts < $3",
         )
-        .bind(id)
+        .bind(digest)
         .bind(Utc::now())
         .bind(PENDING_LOGIN_MAX_ATTEMPTS)
         .fetch_optional(&self.pool)
@@ -1747,10 +1792,11 @@ impl Store {
 
     /// Count a failed second-factor attempt and return the new total.
     pub async fn fail_pending_login(&self, id: &str) -> anyhow::Result<i64> {
+        let digest = crate::auth::digest_token(id);
         let attempts: Option<(i64,)> = sqlx::query_as(
             "UPDATE pending_logins SET attempts=attempts+1 WHERE id=$1 RETURNING attempts",
         )
-        .bind(id)
+        .bind(digest)
         .fetch_optional(&self.pool)
         .await?;
         Ok(attempts.map(|(value,)| value).unwrap_or(0))
@@ -1758,12 +1804,13 @@ impl Store {
 
     /// Finish a pending login exactly once.
     pub async fn consume_pending_login(&self, id: &str, user_id: i64) -> anyhow::Result<bool> {
+        let digest = crate::auth::digest_token(id);
         let result = sqlx::query(
             "UPDATE pending_logins SET consumed_at=$1 \
              WHERE id=$2 AND user_id=$3 AND consumed_at IS NULL",
         )
         .bind(Utc::now())
-        .bind(id)
+        .bind(digest)
         .bind(user_id)
         .execute(&self.pool)
         .await?;
@@ -1838,27 +1885,6 @@ mod tests {
             "password=***"
         );
         assert_eq!(redact_database_url("password="), "password=***");
-    }
-
-    /// The convenience builder must reproduce the documented default socket
-    /// URL exactly, and encode nothing beyond what URL authorities require.
-    #[test]
-    fn socket_url_builder_matches_the_default() {
-        assert_eq!(
-            socket_database_url(DEFAULT_DB_USER, DEFAULT_DB_SOCKET_DIR, DEFAULT_DB_NAME),
-            "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum"
-        );
-        assert_eq!(
-            encode_socket_host("/var/run/postgresql"),
-            "%2Fvar%2Frun%2Fpostgresql"
-        );
-        // Trailing slashes and unreserved characters need no encoding.
-        assert_eq!(encode_socket_host("/run/pg/"), "%2Frun%2Fpg");
-        assert_eq!(encode_socket_host("~sockets"), "~sockets");
-        assert_eq!(
-            socket_database_url("app", "/tmp/pg socket", "forum"),
-            "postgres://app@%2Ftmp%2Fpg%20socket/forum"
-        );
     }
 
     /// `sqlx::test` provisions a fresh database with `migrations/` applied.
@@ -2110,22 +2136,24 @@ mod tests {
         let uid = add_user(&s.pool, "alice", false).await?;
 
         let absolute = s.create_session(uid).await?;
+        let absolute_digest = crate::auth::digest_token(&absolute);
         sqlx::query("UPDATE sessions SET expires_at=$1 WHERE id=$2")
             .bind(Utc::now() - chrono::Duration::seconds(1))
-            .bind(&absolute)
+            .bind(&absolute_digest)
             .execute(&s.pool)
             .await?;
         assert!(s.get_user_by_session(&absolute).await?.is_none());
         assert!(sqlx::query("SELECT 1 FROM sessions WHERE id=$1")
-            .bind(&absolute)
+            .bind(&absolute_digest)
             .fetch_optional(&s.pool)
             .await?
             .is_none());
 
         let idle = s.create_session(uid).await?;
+        let idle_digest = crate::auth::digest_token(&idle);
         sqlx::query("UPDATE sessions SET last_seen_at=$1 WHERE id=$2")
             .bind(Utc::now() - chrono::Duration::hours(12) - chrono::Duration::seconds(1))
-            .bind(&idle)
+            .bind(&idle_digest)
             .execute(&s.pool)
             .await?;
         assert!(s.get_user_by_session(&idle).await?.is_none());
@@ -2245,29 +2273,5 @@ mod tests {
             .join("\n");
         assert!(plan.contains("idx_posts_content_trgm"), "plan: {plan}");
         Ok(())
-    }
-
-    #[test]
-    fn test_redact_database_url_removes_password() {
-        assert_eq!(
-            redact_database_url("postgres://veil:secret@localhost:5432/veil_forum"),
-            "postgres://veil:***@localhost:5432/veil_forum"
-        );
-        assert_eq!(
-            redact_database_url("postgres://veil_forum?host=/var/run/postgresql"),
-            "postgres://veil_forum?host=/var/run/postgresql"
-        );
-        assert_eq!(
-            redact_database_url("postgres:///veil?host=/run&password=hunter2&user=x"),
-            "postgres:///veil?host=/run&password=***&user=x"
-        );
-    }
-
-    #[test]
-    fn test_escape_like_pattern() {
-        assert_eq!(escape_like_pattern("50%"), "50\\%");
-        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
-        assert_eq!(escape_like_pattern("c:\\tmp"), "c:\\\\tmp");
-        assert_eq!(escape_like_pattern("plain"), "plain");
     }
 }

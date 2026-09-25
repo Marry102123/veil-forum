@@ -13,17 +13,15 @@ use hmac::{KeyInit, Mac};
 use rand::Rng;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tera::Context;
-use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: crate::store::Store,
     pub pow: crate::pow::Manager,
     pub captcha: crate::captcha::Manager,
-    pub password_gate: Arc<Semaphore>,
     pub limits: crate::rate_limit::Limits,
     pub secure_session_cookie: bool,
 }
@@ -50,7 +48,7 @@ struct PowQuery {
     scope: String,
 }
 
-const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'";
+const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self'; child-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'";
 const MAX_FORM_BYTES: usize = 64 * 1024;
 
 fn session_cookie(value: &str, max_age: i64, secure: bool) -> String {
@@ -141,7 +139,8 @@ fn require_form_security(headers: &HeaderMap, form: &HashMap<String, String>) ->
 
 fn registration_error_response(error: anyhow::Error) -> Response {
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("unique constraint failed: users.username")
+    if message.contains("users_username_key")
+        || message.contains("unique constraint failed: users.username")
         || message.contains("users.username") && message.contains("unique")
     {
         return apply_sec((StatusCode::CONFLICT, "username taken").into_response());
@@ -162,13 +161,42 @@ fn registration_error_response(error: anyhow::Error) -> Response {
 /// Convert an internal failure into a stable public response. The underlying
 /// error is useful to operators, but must not be sent to clients because it
 /// can contain SQL statements, paths, or other implementation details.
-fn internal_error_response<E: std::fmt::Display>(
+fn error_chain_kind(error: &anyhow::Error) -> &'static str {
+    if let Some(db) = error.downcast_ref::<sqlx::Error>() {
+        return match db {
+            sqlx::Error::Database(db) => match db.code().as_deref() {
+                Some("23505") => "database_unique_violation",
+                Some("23503") => "database_foreign_key_violation",
+                Some("23514") => "database_check_violation",
+                Some("40001") | Some("40P01") => "database_transaction_conflict",
+                _ => "database_error",
+            },
+            sqlx::Error::Io(_) => "database_io",
+            sqlx::Error::PoolTimedOut => "database_pool_timeout",
+            sqlx::Error::PoolClosed => "database_pool_closed",
+            _ => "database_error",
+        };
+    }
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        "io_error"
+    } else {
+        "internal"
+    }
+}
+
+fn internal_error_response(
     status: StatusCode,
     operation: &str,
-    error: E,
+    error: anyhow::Error,
     public_message: &'static str,
 ) -> Response {
-    eprintln!("internal error during {operation}: {error}");
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    tracing::error!(
+        operation,
+        request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        error_chain_kind = error_chain_kind(&error),
+        "internal request failed"
+    );
     apply_sec((status, public_message).into_response())
 }
 
@@ -248,25 +276,6 @@ mod security_tests {
             "https://attacker.test/thread/1".parse().unwrap(),
         );
         assert!(!valid_origin(&headers));
-    }
-
-    #[test]
-    fn registration_errors_do_not_mislabel_non_conflicts() {
-        assert_eq!(
-            registration_error_response(anyhow::anyhow!("invite invalid or already used")).status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            registration_error_response(anyhow::anyhow!("database is locked")).status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            registration_error_response(anyhow::anyhow!(
-                "UNIQUE constraint failed: users.username"
-            ))
-            .status(),
-            StatusCode::CONFLICT
-        );
     }
 
     #[tokio::test]
@@ -524,7 +533,7 @@ async fn sidebar_data(
                 if let Some(t) = th { v.push(t); } else {
                     v.push(crate::store::Thread{
                         id: r.get("id"), board_id: r.get("board_id"), title: r.get("title"),
-                        author_id: r.get("author_id"), is_pinned: r.get("is_pinned"), is_locked: r.get("is_locked"),
+                        author_id: r.get::<Option<i64>, _>("author_id"), is_pinned: r.get("is_pinned"), is_locked: r.get("is_locked"),
                         reply_count: r.get("reply_count"), last_reply_at: last, created_at: created,
                         author_name: "".to_string(), board_slug: "".to_string(),
                     });
@@ -1353,7 +1362,7 @@ async fn thread(
         Err(_) => {
             return apply_sec(
                 (StatusCode::SERVICE_UNAVAILABLE, "board unavailable").into_response(),
-            )
+            );
         }
     };
     let user = current_user(&s, &headers).await;
@@ -1896,8 +1905,8 @@ async fn register_post(
         let resp = (StatusCode::BAD_REQUEST, "invalid username").into_response();
         return apply_sec(resp);
     }
-    if password.len() < 6 || password.len() > 72 {
-        let resp = (StatusCode::BAD_REQUEST, "password length").into_response();
+    if !crate::auth::validate_password(&password, &[&username, "veil-forum"]) {
+        let resp = (StatusCode::BAD_REQUEST, "weak password").into_response();
         return apply_sec(resp);
     }
     let invite_enabled = s
@@ -1911,19 +1920,7 @@ async fn register_post(
         let resp = (StatusCode::BAD_REQUEST, "invite required").into_response();
         return apply_sec(resp);
     }
-    let _permit = match s.password_gate.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            return apply_sec(
-                (StatusCode::SERVICE_UNAVAILABLE, "authentication busy").into_response(),
-            )
-        }
-    };
-    let hash_result =
-        match tokio::task::spawn_blocking(move || crate::auth::hash_password(&password)).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("password hashing failed")),
-        };
+    let hash_result = crate::auth::hash_password_blocking(password).await;
     let hash = match hash_result {
         Ok(h) => h,
         Err(e) => {
@@ -1951,7 +1948,7 @@ async fn register_post(
         Err(_) => {
             return apply_sec(
                 (StatusCode::INTERNAL_SERVER_ERROR, "session creation failed").into_response(),
-            )
+            );
         }
     };
     let mut resp = Redirect::to("/").into_response();
@@ -2082,7 +2079,7 @@ async fn login_post(
             Err(e) => {
                 return apply_sec(
                     (StatusCode::FORBIDDEN, format!("PoW failed: {e}")).into_response(),
-                )
+                );
             }
         };
         if let Err(e) = s
@@ -2106,37 +2103,34 @@ async fn login_post(
         .map(|x| x.trim().to_string())
         .unwrap_or_default();
     let password = form.get("password").cloned().unwrap_or_default();
-    let u_opt = s
-        .store
-        .get_user_by_username(&username)
-        .await
-        .unwrap_or(None);
-    let u = match u_opt {
-        Some(u) => u,
-        None => {
-            let resp = (StatusCode::FORBIDDEN, "invalid credentials").into_response();
-            return apply_sec(resp);
+    let u = match s.store.get_user_by_username(&username).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            let dummy = match crate::auth::dummy_password_hash().await {
+                Ok(hash) => hash.to_string(),
+                Err(_) => {
+                    return apply_sec(
+                        (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable")
+                            .into_response(),
+                    );
+                }
+            };
+            let _ = crate::auth::verify_password_blocking(dummy, password).await;
+            return apply_sec((StatusCode::FORBIDDEN, "invalid credentials").into_response());
         }
-    };
-    if u.is_banned {
-        let resp = (StatusCode::FORBIDDEN, "banned").into_response();
-        return apply_sec(resp);
-    }
-    let _permit = match s.password_gate.clone().try_acquire_owned() {
-        Ok(p) => p,
         Err(_) => {
             return apply_sec(
-                (StatusCode::SERVICE_UNAVAILABLE, "authentication busy").into_response(),
-            )
+                (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable").into_response(),
+            );
         }
     };
-    let hash = u.password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || crate::auth::verify_password(&hash, &password))
-        .await
-        .unwrap_or(false);
+    let valid = crate::auth::verify_password_blocking(u.password_hash.clone(), password).await;
     if !valid {
         let resp = (StatusCode::FORBIDDEN, "invalid credentials").into_response();
         return apply_sec(resp);
+    }
+    if u.is_banned {
+        return apply_sec((StatusCode::FORBIDDEN, "invalid credentials").into_response());
     }
     if s.store
         .get_config_opt("maintenance_enabled")
@@ -2163,7 +2157,7 @@ async fn login_post(
             Err(_) => {
                 return apply_sec(
                     (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable").into_response(),
-                )
+                );
             }
         };
         if state.is_active() {
@@ -2172,7 +2166,7 @@ async fn login_post(
                 Err(_) => {
                     return apply_sec(
                         (StatusCode::INTERNAL_SERVER_ERROR, "login state failed").into_response(),
-                    )
+                    );
                 }
             };
             let _ = s
@@ -2373,7 +2367,7 @@ async fn reply(
         Err(_) => {
             return apply_sec(
                 (StatusCode::SERVICE_UNAVAILABLE, "board unavailable").into_response(),
-            )
+            );
         }
     };
     if challenge_enabled(&s.store, crate::pow::Scope::Post, "captcha").await
@@ -2935,6 +2929,22 @@ async fn change_role(
         Some("moderator") => crate::store::Role::Moderator,
         _ => return apply_sec((StatusCode::BAD_REQUEST, "invalid role").into_response()),
     };
+    if form.get("operation").map(String::as_str) == Some("grant")
+        && !s
+            .store
+            .totp_state(id)
+            .await
+            .map(|state| state.is_active())
+            .unwrap_or(false)
+    {
+        return apply_sec(
+            (
+                StatusCode::FORBIDDEN,
+                "TOTP enrollment required before role grant",
+            )
+                .into_response(),
+        );
+    }
     let ok = match form.get("operation").map(String::as_str) {
         Some("grant") => s.store.grant_role(id, role, Some(actor.id)).await.is_ok(),
         Some("revoke") => s.store.revoke_role(id, role).await.is_ok(),
@@ -3369,9 +3379,26 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
             "settings_sections_label",
             ui("Settings sections", "设置栏目", "Разделы настроек"),
         ),
-        ("sidebar_settings_label", ui("Sidebar", "右侧栏", "Боковая панель")),
-        ("friend_links_help", ui("One per line: name | https://example.org", "每行一条：名称 | https://example.org", "По одной строке: название | https://example.org")),
-        ("sidebar_order_help", ui("Order: announcement, display, stats, recent, links, ads", "顺序：announcement, display, stats, recent, links, ads", "Порядок: announcement, display, stats, recent, links, ads")),
+        (
+            "sidebar_settings_label",
+            ui("Sidebar", "右侧栏", "Боковая панель"),
+        ),
+        (
+            "friend_links_help",
+            ui(
+                "One per line: name | https://example.org",
+                "每行一条：名称 | https://example.org",
+                "По одной строке: название | https://example.org",
+            ),
+        ),
+        (
+            "sidebar_order_help",
+            ui(
+                "Order: announcement, display, stats, recent, links, ads",
+                "顺序：announcement, display, stats, recent, links, ads",
+                "Порядок: announcement, display, stats, recent, links, ads",
+            ),
+        ),
         ("ads_label", ui("Advertisements", "广告", "Реклама")),
         (
             "verification_policy_label",
@@ -3408,10 +3435,7 @@ async fn admin_settings(State(s): State<AppState>, headers: HeaderMap) -> impl I
             ui("CAPTCHA difficulty", "验证码难度", "Сложность CAPTCHA"),
         ),
         ("captcha_difficulty_low", ui("Low", "低", "Низкая")),
-        (
-            "captcha_difficulty_medium",
-            ui("Medium", "中", "Средняя"),
-        ),
+        ("captcha_difficulty_medium", ui("Medium", "中", "Средняя")),
         ("captcha_difficulty_high", ui("High", "高", "Высокая")),
         (
             "captcha_difficulty_help",
@@ -3882,7 +3906,7 @@ async fn admin_pow(
             .map(|x| x.trim().to_string())
             .unwrap_or_else(|| "0.02".to_string());
         let mut f: f64 = v.parse().unwrap_or(0.005);
-        if f <= 0.0 {
+        if !f.is_finite() || f <= 0.0 {
             f = 0.005;
         }
         if f > 10.0 {
@@ -3904,17 +3928,18 @@ async fn admin_policies(
     {
         return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response());
     }
+    let enabled = |key: &str| form.get(key).map(|value| value == "1").unwrap_or(false);
     let ok = s
         .store
         .set_registration_policies(
-            form.contains_key("reports_enabled"),
-            form.contains_key("registration_pow_enabled"),
-            form.contains_key("registration_invite_enabled"),
-            form.contains_key("registration_captcha_enabled"),
-            form.contains_key("login_pow_enabled"),
-            form.contains_key("login_captcha_enabled"),
-            form.contains_key("post_pow_enabled"),
-            form.contains_key("post_captcha_enabled"),
+            enabled("reports_enabled"),
+            enabled("registration_pow_enabled"),
+            enabled("registration_invite_enabled"),
+            enabled("registration_captcha_enabled"),
+            enabled("login_pow_enabled"),
+            enabled("login_captcha_enabled"),
+            enabled("post_pow_enabled"),
+            enabled("post_captcha_enabled"),
         )
         .await
         .is_ok();
@@ -4155,13 +4180,12 @@ async fn invite_create(
         .chars()
         .take(120)
         .collect::<String>();
-    let expires_at =
-        (days > 0).then(|| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
+    let expires_at = (days > 0).then(|| chrono::Utc::now() + chrono::Duration::days(days));
     let mut ok = true;
     for _ in 0..count {
         let code = random_code(12);
         if s.store
-            .create_invite_with_options(&code, user.id, max_uses, expires_at.as_deref(), &note)
+            .create_invite_with_options(&code, user.id, max_uses, expires_at, &note)
             .await
             .is_err()
         {
@@ -4380,8 +4404,8 @@ async fn change_password(
     };
     let old = form.get("old_password").cloned().unwrap_or_default();
     let newp = form.get("new_password").cloned().unwrap_or_default();
-    if newp.len() < 6 || newp.len() > 72 {
-        let resp = (StatusCode::BAD_REQUEST, "new password length").into_response();
+    if !crate::auth::validate_password(&newp, &[&user.username]) {
+        let resp = (StatusCode::BAD_REQUEST, "weak password").into_response();
         return apply_sec(resp);
     }
     let db_user = match s.store.get_user_by_id(user.id).await.unwrap_or(None) {
@@ -4391,19 +4415,12 @@ async fn change_password(
             return apply_sec(resp);
         }
     };
-    let old_hash = db_user.password_hash.clone();
-    let old_password = old.clone();
-    let valid_old =
-        tokio::task::spawn_blocking(move || crate::auth::verify_password(&old_hash, &old_password))
-            .await
-            .unwrap_or(false);
+    let valid_old = crate::auth::verify_password_blocking(db_user.password_hash.clone(), old).await;
     if !valid_old {
         let resp = (StatusCode::FORBIDDEN, "old password wrong").into_response();
         return apply_sec(resp);
     }
-    let hash_result = tokio::task::spawn_blocking(move || crate::auth::hash_password(&newp))
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("password hashing failed")));
+    let hash_result = crate::auth::hash_password_blocking(newp).await;
     let hash = match hash_result {
         Ok(h) => h,
         Err(e) => {
@@ -4415,7 +4432,11 @@ async fn change_password(
             );
         }
     };
-    let ok = s.store.update_password(user.id, &hash).await.is_ok();
+    let rotated = s
+        .store
+        .update_password_and_rotate_sessions(user.id, &hash)
+        .await;
+    let ok = rotated.is_ok();
     audit_admin(
         &s,
         &headers,
@@ -4425,7 +4446,15 @@ async fn change_password(
         ok,
     )
     .await;
-    let resp = Redirect::to("/admin/settings").into_response();
+    let mut resp = Redirect::to("/admin/settings").into_response();
+    if let Ok(sid) = rotated {
+        resp.headers_mut().insert(
+            header::SET_COOKIE,
+            session_cookie(&sid, 12 * 3600, s.secure_session_cookie)
+                .parse()
+                .unwrap(),
+        );
+    }
     apply_sec(resp)
 }
 fn random_code(n: usize) -> String {

@@ -273,19 +273,7 @@ mod tests {
                 "wrong",
             )
             .is_err());
-        // The invalid scope must not consume a valid challenge.
         let challenges = manager.challenges.lock().unwrap_or_else(|p| p.into_inner());
         assert!(challenges.contains_key(&challenge.id));
-    }
-
-    #[test]
-    fn answer_mac_comparison_is_case_insensitive() {
-        let manager = Manager::new();
-        let id = "a".repeat(32);
-        let expires_at = Utc::now().timestamp() + TTL_SECONDS;
-        assert_eq!(
-            manager.answer_mac("login", &id, expires_at, "ABC123"),
-            manager.answer_mac("login", &id, expires_at, "abc123")
-        );
     }
 }

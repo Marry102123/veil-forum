@@ -17,7 +17,7 @@
 #   --binary PATH           binary to install (default: the source build or the
 #                           release archive binary next to this script)
 #   --static DIR            static assets to install (default: ./static)
-#   --admin-password-file F file holding the 12-128 character first-run admin
+#   --admin-password-file F file holding the 15-128 character first-run admin
 #                           password (or export VEIL_ADMIN_PASSWORD). Only needed
 #                           when the database is still empty.
 #   --no-service            install files and seed the database, but do not
@@ -137,7 +137,7 @@ veil_log "Install plan:"
 veil_log "  binary:  $BINARY -> $BIN"
 veil_log "  static:  $STATIC_SRC -> $STATIC_DIR"
 veil_log "  user:    $USER (home $VEIL_STATE_DIR)"
-veil_log "  database: $DSN"
+veil_log "  database: [redacted PostgreSQL connection string]"
 veil_log "  listen:  $ADDR"
 veil_log "  service: $([ "$NO_SERVICE" -eq 1 ] && printf 'none (--no-service)' || printf '%s/%s' "$MANAGER" "$VEIL_SERVICE")"
 
@@ -172,7 +172,11 @@ else
     if [ "$(as_postgres "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'\"")" = "1" ]; then
         veil_log "Role $DB_USER already exists"
     else
-        as_postgres "psql -v ON_ERROR_STOP=1 -c \"CREATE ROLE \\\"$DB_USER\\\" WITH LOGIN;\""
+        as_postgres "psql -v ON_ERROR_STOP=1 -c \"CREATE ROLE \\\"$DB_USER\\\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;\""
+    fi
+    role_flags=$(as_postgres "psql -tAc \"SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname='$DB_USER'\"")
+    if [ "$role_flags" != "f|f|f|f|f|t" ]; then
+        veil_die "role $DB_USER has excessive privileges or cannot log in. This installer will not change passwords or expand privileges. As a PostgreSQL administrator, review pg_roles and explicitly ALTER ROLE to LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, then re-run."
     fi
     if [ "$(as_postgres "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\"")" = "1" ]; then
         veil_log "Database $DB_NAME already exists"
@@ -248,14 +252,16 @@ if [ "$DRY_RUN" -eq 1 ]; then
     veil_log "(dry-run) would seed the database (migrations + initial admin) and start the service"
 else
     if fresh_database; then
-        [ -n "$ADMIN_PASSWORD" ] || veil_die "the database is empty: provide the first admin password via --admin-password-file or VEIL_ADMIN_PASSWORD (12-128 characters)"
+        [ -n "$ADMIN_PASSWORD" ] || veil_die "the database is empty: provide the first admin password via --admin-password-file or VEIL_ADMIN_PASSWORD (15-128 characters)"
         case "$ADMIN_PASSWORD" in
             *"
 "*) veil_die "the admin password must not contain a newline" ;;
         esac
-        if [ "$(printf '%s' "$ADMIN_PASSWORD" | wc -m)" -lt 12 ]; then
-            veil_die "VEIL_ADMIN_PASSWORD must contain 12-128 characters"
+        admin_password_chars=$(printf '%s' "$ADMIN_PASSWORD" | wc -m)
+        if [ "$admin_password_chars" -lt 15 ] || [ "$admin_password_chars" -gt 128 ]; then
+            veil_die "VEIL_ADMIN_PASSWORD must contain 15-128 characters and pass the application's strength check"
         fi
+        unset admin_password_chars
         _env=$(mktemp)
         chmod 600 "$_env"
         chown "$USER" "$_env"

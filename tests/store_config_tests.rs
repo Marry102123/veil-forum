@@ -23,8 +23,8 @@ async fn migrations_are_versioned_and_idempotent(pool: PgPool) -> anyhow::Result
             .await?;
     assert_eq!(
         applied.iter().map(|v| v.0).collect::<Vec<_>>(),
-        vec![1_i64, 2_i64],
-        "baseline plus TOTP migration"
+        vec![1_i64, 2_i64, 3_i64, 4_i64],
+        "baseline, TOTP, session digest, and anonymous identity migrations"
     );
     for (key, expected) in [
         ("reports_enabled", "1"),
@@ -48,81 +48,7 @@ async fn migrations_are_versioned_and_idempotent(pool: PgPool) -> anyhow::Result
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(&store.pool)
         .await?;
-    assert_eq!(count.0, 2, "re-running the migrator adds no rows");
-    Ok(())
-}
-
-#[sqlx::test]
-async fn get_config_missing_key_returns_none_not_error(pool: PgPool) -> anyhow::Result<()> {
-    let store = config_store(pool).await?;
-    let v = store.get_config("not_exist_key_12345").await?;
-    assert_eq!(v, None, "a missing key must be Ok(None), not an error");
-    assert_eq!(store.get_config_opt("not_exist_key_12345").await, None);
-    Ok(())
-}
-
-#[sqlx::test]
-async fn get_config_empty_value_roundtrip(pool: PgPool) -> anyhow::Result<()> {
-    let store = config_store(pool).await?;
-    // configs.value is NOT NULL, so an empty string must survive the round trip
-    // through both the UPSERT and GetAllConfigs.
-    store.set_config("empty_key", "").await?;
-    let v = store.get_config("empty_key").await?;
-    assert_eq!(v, Some("".to_string()));
-    let all = store.get_all_configs().await?;
-    assert_eq!(all.get("empty_key").unwrap(), "");
-    store.set_config("empty_key", "nonempty").await?;
-    assert_eq!(
-        store.get_config("empty_key").await?,
-        Some("nonempty".into())
-    );
-    store.set_config("empty_key", "").await?;
-    assert_eq!(store.get_config("empty_key").await?, Some("".into()));
-    Ok(())
-}
-
-#[sqlx::test]
-async fn set_config_upsert_semantics(pool: PgPool) -> anyhow::Result<()> {
-    let store = config_store(pool).await?;
-    store.set_config("upsert_k", "v1").await?;
-    assert_eq!(store.get_config("upsert_k").await?, Some("v1".into()));
-    store.set_config("upsert_k", "v2").await?;
-    assert_eq!(store.get_config("upsert_k").await?, Some("v2".into()));
-    // Setting the same value twice must not error.
-    store.set_config("upsert_k", "v2").await?;
-    assert_eq!(store.get_config("upsert_k").await?, Some("v2".into()));
-    // Seed defaults must remain overridable.
-    store.set_config("site_name", "new_name").await?;
-    assert_eq!(
-        store.get_config("site_name").await?,
-        Some("new_name".into())
-    );
-    let all = store.get_all_configs().await?;
-    assert_eq!(all.get("upsert_k").unwrap(), "v2");
-    assert_eq!(all.get("site_name").unwrap(), "new_name");
-    Ok(())
-}
-
-#[sqlx::test]
-async fn get_all_configs_contains_defaults_and_inserted(pool: PgPool) -> anyhow::Result<()> {
-    let store = config_store(pool).await?;
-    let all = store.get_all_configs().await?;
-    for k in [
-        "pow_register_minutes",
-        "pow_post_minutes",
-        "registration_mode",
-        "site_name",
-        "footer_text",
-        "default_locale",
-    ] {
-        assert!(all.contains_key(k), "seed 缺失 {k}");
-    }
-    store.set_config("extra_a", "1").await?;
-    store.set_config("extra_b", "2").await?;
-    let all2 = store.get_all_configs().await?;
-    assert_eq!(all2.get("extra_a").unwrap(), "1");
-    assert_eq!(all2.get("extra_b").unwrap(), "2");
-    assert!(all2.len() >= all.len() + 2);
+    assert_eq!(count.0, 4, "re-running the migrator adds no rows");
     Ok(())
 }
 

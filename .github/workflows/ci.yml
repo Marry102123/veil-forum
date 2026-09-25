@@ -7,20 +7,8 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    # Tests and the startup smoke test talk to a real PostgreSQL server.
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: veil_forum_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    permissions:
+      contents: read
     env:
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/veil_forum_test
     steps:
@@ -30,10 +18,18 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install and start PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-client binutils age
+          sudo systemctl start postgresql
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE postgres PASSWORD 'postgres'" \
+            -c "CREATE DATABASE veil_forum_test"
       - run: cargo fmt --all -- --check
       - name: Run tests against PostgreSQL
         run: cargo test --all-targets
-      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo build --release
       - name: Run shell script smoke tests
         run: tests/scripts.sh
@@ -41,6 +37,20 @@ jobs:
         run: tests/deploy-scripts.sh
       - name: Run startup, health, and SIGTERM smoke test
         run: tests/startup-smoke.sh
+      - name: Run real backup, upgrade, and rollback E2E
+        run: sh tests/backup_upgrade_e2e.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: rust-e2e-reports
+          path: |
+            target/auth-e2e-report.json
+            target/config-effects-e2e-report.json
+            target/forum-lifecycle-e2e-report.json
+            target/governance-e2e-report.json
+            target/search-privacy-e2e-report.json
+            target/config-effects-e2e-stderr.jsonl
+            target/backup-upgrade-e2e-report.json
       - run: cargo install cargo-audit --locked
       # rsa has no fixed upgrade; the limitation is documented in CHANGELOG.
       - run: cargo audit --ignore RUSTSEC-2023-0071
@@ -64,8 +74,7 @@ jobs:
           - target: powerpc64le-unknown-linux-gnu
           - target: s390x-unknown-linux-gnu
     permissions:
-      contents: write
-      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
@@ -86,8 +95,6 @@ jobs:
       - name: Build target binary
         run: |
           if [ "${{ matrix.target }}" = "powerpc64le-unknown-linux-gnu" ]; then
-            CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
-              cargo build --release --target ${{ matrix.target }}
             CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_GNU_LINKER=powerpc64le-linux-gnu-gcc \
               cargo build --release --target ${{ matrix.target }}
           else
@@ -123,12 +130,13 @@ jobs:
           name: release-${{ matrix.target }}
           path: veil-forum-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
-  publish-release:
+  stage-release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: release-build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -140,11 +148,63 @@ jobs:
           ls -l veil-forum-*.tar.gz
           sha256sum veil-forum-*.tar.gz > veil-forum-${GITHUB_REF_NAME}-checksums.txt
           sha256sum -c veil-forum-${GITHUB_REF_NAME}-checksums.txt
-      - name: Publish GitHub Release assets
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - name: Sign every release payload with keyless Sigstore identity
+        run: |
+          set -eu
+          for blob in veil-forum-*.tar.gz veil-forum-*-checksums.txt; do
+            test -s "$blob"
+            cosign sign-blob --yes \
+              --bundle "$blob.sig" \
+              --output-certificate "$blob.pem" \
+              "$blob"
+          done
+      - name: Stage draft GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -eu
           gh release create "$GITHUB_REF_NAME" \
+            --draft \
             --title "veil-forum $GITHUB_REF_NAME" \
             --generate-notes \
-            veil-forum-*.tar.gz veil-forum-*-checksums.txt
+            veil-forum-*.tar.gz veil-forum-*.tar.gz.sig veil-forum-*.tar.gz.pem \
+            veil-forum-*-checksums.txt veil-forum-*-checksums.txt.sig veil-forum-*-checksums.txt.pem
+
+  release-package-e2e:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: stage-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install release E2E prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-client binutils file age
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - name: Verify published GitHub Release packages
+        run: tests/release_packages_e2e.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: release-packages-e2e-report
+          path: |
+            target/release-packages-e2e-report.json
+            target/release-packages-e2e-logs/
+
+  finalize-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release-package-e2e
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish verified draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

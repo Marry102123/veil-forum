@@ -4,6 +4,8 @@ name="veil-forum"
 description="veil-forum experimental Tor/I2P forum"
 command="/usr/local/bin/veil-forum"
 command_args="--addr 127.0.0.1:8001 --database-url postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum"
+# The Tor/I2P gateway terminates TLS, so production cookies are always Secure.
+export VEIL_SESSION_COOKIE_SECURE=1
 command_user="veil-forum:veil-forum"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"

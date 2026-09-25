@@ -8,6 +8,11 @@
 # Options:
 #   --checksums FILE        sha256 checksum file listing the archive (required
 #                           unless --no-checksum-verify is given)
+#   --signatures DIR        directory containing <asset>.sig and <asset>.pem
+#                           bundles (required unless --no-attestation-verify)
+#   --no-attestation-verify LEGACY_TAG
+#                           EMERGENCY ONLY: skip Sigstore identity verification
+#                           for this exact historical unsigned tag
 #   --no-checksum-verify    skip checksum verification (not recommended)
 #   --backup-dir DIR        database backup directory (default /srv/veil-forum-backups)
 #   --no-backup             skip the pre-upgrade database backup (not recommended)
@@ -36,6 +41,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 ARCHIVE=""
 CHECKSUMS=""
+SIGNATURES=""
+NO_ATTESTATION_VERIFY=""
 NO_CHECKSUM_VERIFY=0
 BACKUP_DIR="$VEIL_BACKUP_DIR"
 NO_BACKUP=0
@@ -51,6 +58,8 @@ PREFIX_GIVEN=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --checksums) CHECKSUMS=${2:?--checksums needs a file}; shift 2 ;;
+        --signatures) SIGNATURES=${2:?--signatures needs a directory}; shift 2 ;;
+        --no-attestation-verify) NO_ATTESTATION_VERIFY=${2:?--no-attestation-verify needs a legacy tag}; shift 2 ;;
         --no-checksum-verify) NO_CHECKSUM_VERIFY=1; shift ;;
         --backup-dir) BACKUP_DIR=${2:?--backup-dir needs a directory}; shift 2 ;;
         --no-backup) NO_BACKUP=1; shift ;;
@@ -82,6 +91,10 @@ veil_valid_path "$ARCHIVE" || veil_die "archive path must be plain, without quot
 [ -f "$ARCHIVE" ] || veil_die "archive not found: $ARCHIVE"
 if [ -n "$CHECKSUMS" ]; then
     veil_valid_path "$CHECKSUMS" || veil_die "checksum path must be plain, without quoting or shell metacharacters"
+fi
+if [ -n "$SIGNATURES" ]; then
+    [ -d "$SIGNATURES" ] || veil_die "signature directory not found: $SIGNATURES"
+    veil_valid_path "$SIGNATURES" || veil_die "signature directory must be a plain path without shell metacharacters"
 fi
 veil_valid_path "$BACKUP_DIR" || veil_die "backup directory must be plain, without quoting or shell metacharacters"
 veil_valid_name "$VEIL_USER" || veil_die "--user must be a plain name ([A-Za-z0-9_.-], not starting with - or .)"
@@ -116,10 +129,45 @@ fi
 if [ -z "$CHECKSUMS" ] && [ "$NO_CHECKSUM_VERIFY" -eq 0 ]; then
     veil_die "refusing to install an unverified archive; pass --checksums FILE or --no-checksum-verify"
 fi
+if [ -z "$SIGNATURES" ] && [ -z "$NO_ATTESTATION_VERIFY" ]; then
+    veil_die "refusing to install an unsigned archive; pass --signatures DIR or the explicit legacy escape --no-attestation-verify TAG"
+fi
 
 # --- 1. Verify the archive ---------------------------------------------------
 ARCHIVE_BASE=$(basename "$ARCHIVE")
 ARCHIVE_DIR=$(CDPATH= cd -- "$(dirname -- "$ARCHIVE")" && pwd)
+RELEASE_TAG=$(printf '%s\n' "$ARCHIVE_BASE" | sed -n 's/^veil-forum-\(v.*\)-\(x86_64\|aarch64\|armv7\|riscv64gc\|i686\|powerpc64le\|s390x\)-.*\.tar\.gz$/\1/p')
+[ -n "$RELEASE_TAG" ] || veil_die "cannot determine release tag from archive name: $ARCHIVE_BASE"
+if [ -n "$NO_ATTESTATION_VERIFY" ] && [ "$NO_ATTESTATION_VERIFY" != "$RELEASE_TAG" ]; then
+    veil_die "legacy attestation bypass tag $NO_ATTESTATION_VERIFY does not match archive tag $RELEASE_TAG"
+fi
+if [ -n "$NO_ATTESTATION_VERIFY" ] && [ "$RELEASE_TAG" != "v0.1.0-alpha.19" ]; then
+    veil_die "unsigned legacy verification is allowed only for v0.1.0-alpha.19"
+fi
+verify_signature() {
+    _asset=$1
+    _name=${_asset##*/}
+    _bundle="$SIGNATURES/$_name.sig"
+    _certificate="$SIGNATURES/$_name.pem"
+    [ -s "$_bundle" ] || veil_die "missing signature bundle for $_name: $_bundle"
+    [ -s "$_certificate" ] || veil_die "missing signing certificate for $_name: $_certificate"
+    cosign verify-blob --bundle "$_bundle" --certificate "$_certificate" \
+        --certificate-identity-regexp "^https://github.com/Marry102123/veil-forum/\\.github/workflows/ci\\.yml@refs/tags/$RELEASE_TAG$" \
+        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+        "$_asset" || veil_die "Sigstore verification failed for $_name"
+}
+
+if [ -n "$SIGNATURES" ]; then
+    veil_need cosign
+    veil_log "Verifying Sigstore bundle and pinned repository identity for $ARCHIVE_BASE"
+    verify_signature "$ARCHIVE"
+    if [ -n "$CHECKSUMS" ]; then
+        veil_log "Verifying Sigstore bundle and pinned repository identity for $(basename "$CHECKSUMS")"
+        verify_signature "$CHECKSUMS"
+    fi
+else
+    printf '\n*** EMERGENCY SECURITY BYPASS: Sigstore verification is DISABLED for explicit legacy tag %s. Do not use this for new releases. ***\n\n' "$NO_ATTESTATION_VERIFY" >&2
+fi
 if [ -n "$CHECKSUMS" ]; then
     [ -f "$CHECKSUMS" ] || veil_die "checksum file not found: $CHECKSUMS"
     veil_log "Verifying $ARCHIVE_BASE against $CHECKSUMS"
@@ -175,7 +223,7 @@ unset _from_unit
 OLD_VERSION=$(veil_installed_version)
 
 veil_log "Upgrade plan: $OLD_VERSION -> ${NEW_VERSION:-unknown}"
-veil_log "  database: $DSN"
+veil_log "  database: [redacted PostgreSQL connection string]"
 veil_log "  listen:   $ADDR"
 
 # --- 3. Back up the database first -------------------------------------------
@@ -186,11 +234,17 @@ elif [ "$DRY_RUN" -eq 1 ]; then
     veil_log "(dry-run) would run: scripts/db-maintenance.sh backup [DSN] $BACKUP_DIR"
     DB_DUMP="(dry-run)"
 else
-    veil_run "$SCRIPT_DIR/db-maintenance.sh" backup "$DSN" "$BACKUP_DIR" ||
-        veil_die "pre-upgrade backup failed; refusing to continue"
-    # shellcheck disable=SC2012
-    DB_DUMP=$(ls -t "$BACKUP_DIR"/forum-*.dump 2>/dev/null | head -n 1) || DB_DUMP=""
-    [ -n "$DB_DUMP" ] || veil_die "backup produced no archive in $BACKUP_DIR"
+    # Do not use veil_run here: it prints command arguments and a full DSN may
+    # carry a password. The child process still receives the real value.
+    printf '+ %s backup [redacted PostgreSQL connection string] %s\n' "$SCRIPT_DIR/db-maintenance.sh" "$BACKUP_DIR"
+    "$SCRIPT_DIR/db-maintenance.sh" backup "$DSN" "$BACKUP_DIR" || veil_die "pre-upgrade backup failed; refusing to continue"
+    # Only encrypted archives are canonical. A legacy plaintext dump may be
+    # used only when no encrypted archive exists, and is never created here.
+    DB_DUMP=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'forum-*.dump.age' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-) || DB_DUMP=""
+    if [ -z "$DB_DUMP" ]; then
+        DB_DUMP=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'forum-*.dump' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-) || DB_DUMP=""
+    fi
+    [ -n "$DB_DUMP" ] || veil_die "backup produced no encrypted archive in $BACKUP_DIR"
     veil_log "Pre-upgrade backup: $DB_DUMP"
 fi
 
@@ -208,10 +262,34 @@ else
     veil_run mkdir -p "$SNAP/static" || veil_die "could not create $SNAP/static"
     veil_run cp -r "$VEIL_STATIC_DIR/." "$SNAP/static/" || veil_die "could not snapshot the static assets"
     printf '%s\n' "$OLD_VERSION" >"$SNAP/VERSION"
-    printf '%s\n' "$DSN" >"$SNAP/DSN"
+    # A rollback that does not restore the database does not need the original
+    # connection string. Persist it only for the passwordless peer-auth socket
+    # form, never a TCP/password URL supplied on the command line.
+    SNAPSHOT_DSN=""
+    case "$DSN" in
+        postgres://*@%2F*/*)
+            _dsn_authority=${DSN#postgres://}
+            _dsn_authority=${_dsn_authority%%@*}
+            _dsn_name=${DSN##*/}
+            _dsn_path=${DSN#postgres://}
+            _dsn_path=${_dsn_path#*@}
+            _dsn_path=${_dsn_path#*/}
+            if veil_valid_name "$_dsn_authority" && veil_valid_name "$_dsn_name" && veil_valid_path "$_dsn_path"; then
+                SNAPSHOT_DSN="$DSN"
+            fi
+            unset _dsn_authority _dsn_name _dsn_path
+            ;;
+    esac
+    if [ -n "$SNAPSHOT_DSN" ]; then
+        printf '%s\n' "$SNAPSHOT_DSN" >"$SNAP/DSN"
+    else
+        veil_warn "not persisting a non-peer or credential-bearing DSN in $SNAP/DSN"
+    fi
     printf '%s\n' "$ADDR" >"$SNAP/ADDR"
     printf '%s\n' "$DB_DUMP" >"$SNAP/DB_DUMP"
-    chmod 600 "$SNAP/VERSION" "$SNAP/DSN" "$SNAP/ADDR" "$SNAP/DB_DUMP"
+    chmod 600 "$SNAP/VERSION" "$SNAP/ADDR" "$SNAP/DB_DUMP"
+    if [ -f "$SNAP/DSN" ]; then chmod 600 "$SNAP/DSN"; fi
+    unset SNAPSHOT_DSN
     veil_log "Snapshot: $SNAP"
 fi
 

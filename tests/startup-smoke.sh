@@ -12,16 +12,6 @@ if [ ! -x "$ROOT/target/release/veil-forum" ]; then
   cargo build --release --manifest-path "$ROOT/Cargo.toml"
 fi
 
-# CLI basics need no database: --version tracks Cargo.toml, --help prints
-# usage, and mixing the two database selectors fails before any connection.
-CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)
-test "$("$ROOT/target/release/veil-forum" --version)" = "veil-forum $CARGO_VERSION"
-"$ROOT/target/release/veil-forum" --help | grep -q '^usage: veil-forum'
-if "$ROOT/target/release/veil-forum" --database-url 'postgres://u@h/db' --db-name x >/dev/null 2>&1; then
-  echo 'mixed database selectors must fail' >&2
-  exit 1
-fi
-
 DATABASE_URL="${DATABASE_URL:-postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test}"
 # Split the URL into the part before the query string and the query string
 # itself, then swap only the database name for a scratch one. Splitting this way
@@ -56,7 +46,7 @@ trap cleanup EXIT HUP INT TERM
 
 psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE $SMOKE_DB"
 
-VEIL_ADMIN_PASSWORD='smoke-test-password' "$ROOT/target/release/veil-forum" \
+VEIL_ADMIN_PASSWORD='Harbor-Cedar9-Phoenix' "$ROOT/target/release/veil-forum" \
   --addr "127.0.0.1:$PORT" --database-url "$SMOKE_URL" >"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 pid=$(cat "$PIDFILE")

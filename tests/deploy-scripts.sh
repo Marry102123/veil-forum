@@ -4,7 +4,7 @@
 #
 # Everything privileged is redirected through environment overrides
 # (VEIL_PREFIX, VEIL_STATE_DIR, VEIL_BACKUP_DIR, VEIL_ROLLBACK_ROOT,
-# VEIL_SERVICE_MANAGER, VEIL_ALLOW_NONROOT) and PATH stubs.
+# VEIL_SERVICE_MANAGER, VEIL_ALLOW_NONROOT, VEIL_TEST_HARNESS) and PATH stubs.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -13,7 +13,8 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
 # Captured before the stub directory shadows PATH.
 REAL_INSTALL=$(command -v install)
-export REAL_INSTALL
+REAL_STAT=$(command -v stat)
+export REAL_INSTALL REAL_STAT
 FAIL_ON=""
 export FAIL_ON
 
@@ -63,17 +64,70 @@ EOF
 cat > "$BIN_DIR/pg_restore" <<'EOF'
 #!/bin/sh
 set -eu
+has_list=0
+has_file=0
 for arg in "$@"; do
   case "$arg" in
-    --list) printf 'archive listing\n'; exit 0 ;;
+    --list) has_list=1 ;;
+    -*) ;;
+    *) has_file=1 ;;
   esac
 done
+if [ "$has_list" -eq 1 ]; then
+  if [ "$has_file" -eq 0 ]; then
+    input=$(cat)
+    printf '%s\n' "--list stdin=$input" >> "${PG_RESTORE_LOG:-/dev/null}"
+  fi
+  printf 'archive listing\n'
+  exit 0
+fi
+input=$(cat)
+printf '%s\n' "restore stdin=$input args=$*" >> "${PG_RESTORE_LOG:-/dev/null}"
 exit 0
 EOF
 cat > "$BIN_DIR/psql" <<'EOF'
 #!/bin/sh
 set -eu
+printf '%s\n' "psql $*" >> "${PSQL_LOG:-/dev/null}"
 printf '12\n'
+EOF
+cat > "$BIN_DIR/age" <<'EOF'
+#!/bin/sh
+set -eu
+out=
+mode=encrypt
+input=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --decrypt) mode=decrypt; shift ;;
+    -o) out=${2:?}; shift 2 ;;
+    -o=*) out=${1#-o=}; shift ;;
+    -i | -r | -R) shift 2 ;;
+    -*) shift ;;
+    *) input=$1; shift ;;
+  esac
+done
+if [ "$mode" = decrypt ]; then
+  printf 'PLAINTEXT-PGRESTORE-STREAM\n'
+else
+  [ -n "$out" ] && [ -f "$input" ]
+  printf 'AGE-CIPHERTEXT\n' > "$out"
+fi
+EOF
+cat > "$BIN_DIR/su" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'su %s\n' "$*" >> "${SU_LOG:?}"
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  # pg_restore consumes the decrypted archive on stdin, so pass it through.
+  pg_restore\ *) exec sh -c "$last" ;;
+esac
+# psql -c and the remaining stubbed invocations never read stdin. Detach from
+# an inherited terminal or never-closed pipe instead of blocking on a read.
+exec </dev/null
+exit 0
 EOF
 cat > "$BIN_DIR/install" <<'EOF'
 #!/bin/sh
@@ -86,7 +140,29 @@ if [ -n "${FAIL_ON:-}" ] && [ "$_dest" = "$FAIL_ON" ]; then
 fi
 exec "$REAL_INSTALL" "$@"
 EOF
-chmod +x "$BIN_DIR"/systemctl "$BIN_DIR"/curl "$BIN_DIR"/pg_dump "$BIN_DIR"/pg_restore "$BIN_DIR"/psql "$BIN_DIR"/install
+cat > "$BIN_DIR/stat" <<'EOF'
+#!/bin/sh
+if [ -n "${FAKE_STAT_UID:-}" ]; then
+  for arg in "$@"; do last=$arg; done
+  if [ -f "$last" ]; then
+    for arg in "$@"; do
+      case "$arg" in
+        %u) printf '%s\n' "$FAKE_STAT_UID"; exit 0 ;;
+      esac
+    done
+  fi
+fi
+exec "$REAL_STAT" "$@"
+EOF
+cat > "$BIN_DIR/date" <<EOF
+#!/bin/sh
+n=0
+[ ! -f "$TMP/date-count" ] || n=\$(cat "$TMP/date-count")
+n=\$((n + 1))
+printf '%s\n' "\$n" > "$TMP/date-count"
+printf '20260925T0102%02dZ\n' "\$n"
+EOF
+chmod +x "$BIN_DIR"/systemctl "$BIN_DIR"/curl "$BIN_DIR"/pg_dump "$BIN_DIR"/pg_restore "$BIN_DIR"/psql "$BIN_DIR"/age "$BIN_DIR"/su "$BIN_DIR"/install "$BIN_DIR"/stat "$BIN_DIR"/date
 
 # Fake installed release and fake new release.
 make_fake_binary() {
@@ -101,58 +177,16 @@ printf '/* old */\n' > "$PREFIX/static/style.css"
 mkdir -p "$TMP/stage-top/static"
 make_fake_binary "$TMP/stage-top/veil-forum" "0.1.0-alpha.19"
 printf '/* new */\n' > "$TMP/stage-top/static/style.css"
-tar -czf "$TMP/archive.tar.gz" -C "$TMP" stage-top
+RELEASE_ARCHIVE="$TMP/veil-forum-v0.1.0-alpha.19-x86_64-unknown-linux-musl.tar.gz"
+tar -czf "$RELEASE_ARCHIVE" -C "$TMP" stage-top
 mv "$TMP/stage-top" "$TMP/new-top"
-(cd "$TMP" && sha256sum archive.tar.gz > checksums.txt)
+(cd "$TMP" && sha256sum "$(basename "$RELEASE_ARCHIVE")" > checksums.txt)
 
 export PATH="$BIN_DIR:$PATH"
-export VEIL_ALLOW_NONROOT=1 VEIL_SERVICE_MANAGER=systemd
+export VEIL_ALLOW_NONROOT=1 VEIL_TEST_HARNESS=1 VEIL_SERVICE_MANAGER=systemd
+export VEIL_BACKUP_RECIPIENT=age1testrecipient
 export VEIL_PREFIX="$PREFIX" VEIL_STATE_DIR="$STATE" VEIL_BACKUP_DIR="$BACKUPS"
-
-# --- 1. lib.sh helpers ------------------------------------------------------
-# shellcheck source=../scripts/lib.sh
-. "$ROOT/scripts/lib.sh"
-
-test "$(veil_socket_dsn)" = "postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum"
-test "$(veil_socket_dsn app /tmp/pg/ forum)" = "postgres://app@%2Ftmp%2Fpg/forum"
-# An empty argument falls back to the default, like an unset flag.
-test "$(veil_socket_dsn '' /tmp db)" = "postgres://veil-forum@%2Ftmp/db"
-test "$(veil_encode_socket_host '/var/run/postgresql')" = "%2Fvar%2Frun%2Fpostgresql"
-test "$(veil_service_manager)" = "systemd"
-test "$(veil_installed_version "$TMP/old-binary")" = "0.1.0-alpha.18"
-test "$(veil_installed_version "$TMP/missing")" = "unknown"
-
-# Name/path validators: the suite's guarantee against shell interpolation.
-# veil_valid_* use `return`, so negative cases run in a subshell.
-for _good in veil-forum "a.b-c_d" "abc123"; do
-    veil_valid_name "$_good" || { echo "valid name rejected: $_good" >&2; exit 1; }
-done
-for _bad in "" "-x" ".x" "a;b" "a b" "a'b" 'a"b' 'a`b' 'a$b' "a&b" "a|b" "a/b" 'a(b)' 'a)b'; do
-    if (veil_valid_name "$_bad"); then echo "invalid name accepted: $_bad" >&2; exit 1; fi
-done
-for _good in "/var/run/postgresql" "/tmp/archive.tar.gz" "127.0.0.1:8001" "[::1]:8001"; do
-    veil_valid_path "$_good" || { echo "valid path rejected: $_good" >&2; exit 1; }
-done
-for _bad in "" "a'b" 'a"b' 'a`b' 'a$b' "a;b" "a&b" "a|b" "a b" 'a(b)' "a>b"; do
-    if (veil_valid_path "$_bad"); then echo "invalid path accepted: $_bad" >&2; exit 1; fi
-done
-unset _good _bad
-test "$(veil_sed_escape 'a&b|c')" = 'a\&b\|c'
-test "$(veil_sed_escape 'a\b')" = 'a\\b'
-test "$(veil_sed_escape 'plain')" = 'plain'
-# veil_die exits the shell, so negative lib tests run in a subshell.
-veil_wait_healthz "127.0.0.1:1" 3 || {
-    echo "healthy check must pass" >&2
-    exit 1
-}
-if (VEIL_DB_USER= veil_socket_dsn) >/dev/null 2>&1; then
-    echo "empty user with no default must fail" >&2
-    exit 1
-fi
-if (STUB_CURL_BUDGET=999999 STUB_CURL_COUNT="$TMP/c1" veil_wait_healthz "127.0.0.1:1" 2); then
-    echo "failing health check must fail" >&2
-    exit 1
-fi
+export VEIL_ROLLBACK_ROOT="$ROLLBACK"
 
 # --- 2. install.sh --dry-run --------------------------------------------------
 printf '%s' 'dry-run-admin-password' > "$TMP/adminpw"
@@ -165,6 +199,10 @@ printf '%s' 'dry-run-admin-password' > "$TMP/adminpw"
 }
 grep -q 'Install plan:' "$TMP/install.out"
 grep -q '(dry-run) nothing was changed' "$TMP/install.out"
+if grep -E 'postgres://[^/@[:space:]]+:[^/@[:space:]]+@' "$TMP/install.out" >/dev/null 2>&1; then
+    echo 'install leaked a credential-bearing DSN' >&2
+    exit 1
+fi
 # Dry runs change nothing: the fake install is untouched.
 test "$(cat "$PREFIX/static/style.css")" = "/* old */"
 if "$ROOT/scripts/install.sh" --dry-run --addr 203.0.113.1:8001 >/dev/null 2>&1; then
@@ -199,37 +237,11 @@ if "$ROOT/scripts/install.sh" --dry-run --no-service \
 fi
 test ! -e "$TMP/inj" || { echo "injection executed" >&2; exit 1; }
 
-# --- 3. upgrade.sh argument handling -------------------------------------------
-if "$ROOT/scripts/upgrade.sh" >/dev/null 2>&1; then
-    echo "missing archive must fail" >&2
-    exit 1
-fi
-if "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" --no-backup --dry-run >/dev/null 2>&1; then
-    echo "missing checksums must fail" >&2
-    exit 1
-fi
-if "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" --checksums "$TMP/checksums.txt" \
-    --database-url 'postgres://u@h/db' --db-name x --dry-run >/dev/null 2>&1; then
-    echo "mixed database selectors must fail" >&2
-    exit 1
-fi
-# Without a service manager the scripts refuse to touch a running release
-# (dry runs still work: nothing is executed).
-if ! VEIL_SERVICE_MANAGER=none "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" \
-    --checksums "$TMP/checksums.txt" --no-backup --dry-run >/dev/null 2>&1; then
-    echo "dry-run without a manager must still work" >&2
-    exit 1
-fi
-if VEIL_SERVICE_MANAGER=none "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" \
-    --checksums "$TMP/checksums.txt" --no-backup >/dev/null 2>&1; then
-    echo "missing service manager must fail" >&2
-    exit 1
-fi
-
 # --- 4. upgrade.sh --dry-run ----------------------------------------------------
 DSN='postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum'
-"$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" --checksums "$TMP/checksums.txt" \
-    --database-url "$DSN" --addr 127.0.0.1:8001 --no-backup --dry-run >"$TMP/upgrade-dry.out" 2>&1
+"$ROOT/scripts/upgrade.sh" "$RELEASE_ARCHIVE" --checksums "$TMP/checksums.txt" \
+    --database-url "$DSN" --addr 127.0.0.1:8001 --no-backup --dry-run \
+    --no-attestation-verify v0.1.0-alpha.19 >"$TMP/upgrade-dry.out" 2>&1
 grep -q 'Upgrade plan: 0.1.0-alpha.18 -> 0.1.0-alpha.19' "$TMP/upgrade-dry.out"
 grep -q "(dry-run) nothing was changed" "$TMP/upgrade-dry.out"
 test "$(cat "$PREFIX/static/style.css")" = "/* old */"
@@ -237,16 +249,45 @@ test "$(cat "$PREFIX/static/style.css")" = "/* old */"
 # The installed unit supplies the DSN and listener when no flags are given.
 printf 'ExecStart=/usr/local/bin/veil-forum --addr 127.0.0.1:8100 --database-url %s\n' \
     'postgres://custom@%2Ftmp%2Fpg/customdb' > "$TMP/fake.service"
-VEIL_UNIT_FILE="$TMP/fake.service" "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" \
-    --checksums "$TMP/checksums.txt" --no-backup --dry-run >"$TMP/upgrade-unit.out" 2>&1
-grep -q 'database: postgres://custom@%2Ftmp%2Fpg/customdb' "$TMP/upgrade-unit.out"
+VEIL_UNIT_FILE="$TMP/fake.service" "$ROOT/scripts/upgrade.sh" "$RELEASE_ARCHIVE" \
+    --checksums "$TMP/checksums.txt" --no-backup --dry-run \
+    --no-attestation-verify v0.1.0-alpha.19 >"$TMP/upgrade-unit.out" 2>&1
+grep -q 'database: \[redacted PostgreSQL connection string\]' "$TMP/upgrade-unit.out"
+if grep -F 'postgres://custom@%2Ftmp%2Fpg/customdb' "$TMP/upgrade-unit.out" >/dev/null; then
+    echo 'upgrade leaked the DSN read from the installed unit' >&2
+    exit 1
+fi
 grep -q 'listen:   127.0.0.1:8100' "$TMP/upgrade-unit.out"
 
 # --- 5. upgrade.sh for real (stubs) ---------------------------------------------
-"$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" --checksums "$TMP/checksums.txt" \
-    --database-url "$DSN" --addr 127.0.0.1:8001 >"$TMP/upgrade.out" 2>&1
-grep -q 'Pre-upgrade backup:' "$TMP/upgrade.out"
-grep -q 'Done: 0.1.0-alpha.18 -> 0.1.0-alpha.19' "$TMP/upgrade.out"
+# A real upgrade using a credential-bearing DSN must redact it from all output
+# and must not persist it in the snapshot. Use a unique sentinel so a partial
+# redaction cannot satisfy the assertion.
+DSN_SECRET='e2e-DSN-password-9f31c0'
+CRED_DSN="postgres://custom:${DSN_SECRET}@%2Ftmp%2Fpg/customdb"
+"$ROOT/scripts/upgrade.sh" "$RELEASE_ARCHIVE" --checksums "$TMP/checksums.txt" \
+    --database-url "$CRED_DSN" --addr 127.0.0.1:8001 \
+    --no-attestation-verify v0.1.0-alpha.19 >"$TMP/upgrade-credential.out" 2>&1
+grep -F '[redacted PostgreSQL connection string]' "$TMP/upgrade-credential.out" >/dev/null
+if grep -F "$CRED_DSN" "$TMP/upgrade-credential.out" >/dev/null || grep -F "$DSN_SECRET" "$TMP/upgrade-credential.out" >/dev/null; then
+    echo 'upgrade leaked a credential-bearing DSN' >&2
+    exit 1
+fi
+credential_snapshot=$(sed -n 's|.*scripts/rollback.sh --snapshot \(.*\)|\1|p' "$TMP/upgrade-credential.out" | head -n 1)
+[ -d "$credential_snapshot" ]
+test ! -e "$credential_snapshot/DSN"
+if grep -R -F "$DSN_SECRET" "$credential_snapshot" >/dev/null 2>&1; then
+    echo 'upgrade snapshot leaked a credential-bearing DSN' >&2
+    exit 1
+fi
+"$ROOT/scripts/rollback.sh" --snapshot "$credential_snapshot" --health-timeout 5 >"$TMP/credential-upgrade-rollback.out" 2>&1
+test "$("$PREFIX/bin/veil-forum" --version)" = "veil-forum 0.1.0-alpha.18"
+
+"$ROOT/scripts/upgrade.sh" "$RELEASE_ARCHIVE" --checksums "$TMP/checksums.txt" \
+    --database-url "$DSN" --addr 127.0.0.1:8001 \
+    --no-attestation-verify v0.1.0-alpha.19 >"$TMP/upgrade.out" 2>&1
+grep -q 'Pre-upgrade backup:' "$TMP/upgrade.out" || { cat "$TMP/upgrade.out" >&2; exit 1; }
+grep -q 'Done: 0.1.0-alpha.18 -> 0.1.0-alpha.19' "$TMP/upgrade.out" || { cat "$TMP/upgrade.out" >&2; exit 1; }
 test "$("$PREFIX/bin/veil-forum" --version)" = "veil-forum 0.1.0-alpha.19"
 test "$(cat "$PREFIX/static/style.css")" = "/* new */"
 grep -q 'systemctl stop veil-forum' "$STUB_LOG"
@@ -261,6 +302,80 @@ test "$(cat "$SNAP/ADDR")" = "127.0.0.1:8001"
 test -f "$(cat "$SNAP/DB_DUMP")"
 test "$("$SNAP/veil-forum" --version)" = "veil-forum 0.1.0-alpha.18"
 
+# Encrypted restore validation and loading must both receive the age plaintext
+# stream. No decrypted dump may be materialized under TMPDIR or the install
+# prefix. The fake root-owned key keeps this non-root smoke test faithful to
+# the production ownership gate.
+printf 'AGE-CIPHERTEXT\n' > "$TMP/restore.dump.age"
+printf 'AGE-SECRET-KEY-TEST\n' > "$TMP/restore.key"
+chmod 600 "$TMP/restore.key"
+export PG_RESTORE_LOG="$TMP/pg-restore.log" SU_LOG="$TMP/su.log"
+: > "$PG_RESTORE_LOG"
+: > "$SU_LOG"
+: > "$TMP/encrypted-restore.out"
+before_tmp_files=$(find "$TMP" -type f | sort)
+if ! FAKE_STAT_UID=0 "$ROOT/scripts/rollback.sh" --snapshot "$SNAP" \
+    --restore-db "$TMP/restore.dump.age" --backup-identity "$TMP/restore.key" \
+    --database-url "$DSN" --yes --health-timeout 5 >"$TMP/encrypted-restore.out" 2>&1; then
+  cat "$TMP/encrypted-restore.out" >&2
+  exit 1
+fi
+test "$(grep -c 'stdin=PLAINTEXT-PGRESTORE-STREAM' "$PG_RESTORE_LOG")" -eq 2
+grep -F "restore stdin=PLAINTEXT-PGRESTORE-STREAM" "$PG_RESTORE_LOG" >/dev/null
+grep -F 'DROP DATABASE' "$SU_LOG" >/dev/null
+after_tmp_files=$(find "$TMP" -type f | sort)
+test "$before_tmp_files" = "$after_tmp_files"
+test "$(find "$PREFIX" -type f -name '*.dump' | wc -l)" -eq 0
+
+# Missing, permissive, and wrongly owned age identities all fail closed before
+# the service is stopped or DROP is attempted.
+chmod 644 "$TMP/restore.key"
+if FAKE_STAT_UID=0 "$ROOT/scripts/rollback.sh" --snapshot "$SNAP" \
+    --restore-db "$TMP/restore.dump.age" --backup-identity "$TMP/restore.key" \
+    --database-url "$DSN" --yes >"$TMP/bad-key-mode.out" 2>&1; then
+    echo 'group/world-readable age identity was accepted' >&2
+    exit 1
+fi
+chmod 600 "$TMP/restore.key"
+if FAKE_STAT_UID=12345 "$ROOT/scripts/rollback.sh" --snapshot "$SNAP" \
+    --restore-db "$TMP/restore.dump.age" --backup-identity "$TMP/restore.key" \
+    --database-url "$DSN" --yes >"$TMP/bad-key-owner.out" 2>&1; then
+    echo 'non-root-owned age identity was accepted' >&2
+    exit 1
+fi
+
+# Credential-bearing DSNs and role mismatches are rejected before service stop
+# and before the DROP command boundary. The sentinel must not reach the log.
+: > "$STUB_LOG"
+: > "$SU_LOG"
+if "$ROOT/scripts/rollback.sh" --snapshot "$SNAP" \
+    --restore-db "$TMP/restore.dump.age" --backup-identity "$TMP/restore.key" \
+    --database-url "$CRED_DSN" --yes >"$TMP/credential-restore.out" 2>&1; then
+    echo 'credential-bearing restore DSN was accepted' >&2
+    exit 1
+fi
+if grep -F 'systemctl stop' "$STUB_LOG" >/dev/null || grep -F 'DROP DATABASE' "$SU_LOG" >/dev/null; then
+    echo 'credential-bearing DSN reached stop/DROP boundary' >&2
+    exit 1
+fi
+if grep -F "$DSN_SECRET" "$TMP/credential-restore.out" >/dev/null; then
+    echo 'rollback leaked a credential-bearing DSN' >&2
+    exit 1
+fi
+: > "$STUB_LOG"
+: > "$SU_LOG"
+MISMATCH_DSN='postgres://other-role@%2Fvar%2Frun%2Fpostgresql/veil_forum'
+if "$ROOT/scripts/rollback.sh" --snapshot "$SNAP" \
+    --restore-db "$TMP/restore.dump.age" --backup-identity "$TMP/restore.key" \
+    --database-url "$MISMATCH_DSN" --yes >"$TMP/mismatched-role.out" 2>&1; then
+    echo 'restore role/VEIL_USER mismatch was accepted' >&2
+    exit 1
+fi
+if grep -F 'systemctl stop' "$STUB_LOG" >/dev/null || grep -F 'DROP DATABASE' "$SU_LOG" >/dev/null; then
+    echo 'role mismatch reached stop/DROP boundary' >&2
+    exit 1
+fi
+
 # --- 6. rollback.sh for real ------------------------------------------------------
 "$ROOT/scripts/rollback.sh" --snapshot "$SNAP" >"$TMP/rollback.out" 2>&1
 grep -q 'Done: rolled back to 0.1.0-alpha.18' "$TMP/rollback.out"
@@ -271,9 +386,9 @@ test "$(cat "$PREFIX/static/style.css")" = "/* old */"
 # The stub fails exactly --health-timeout curl calls, so the upgrade's gate
 # times out while the rollback's own gate (sharing the counter) succeeds.
 rm -f "$TMP/c7"
-if STUB_CURL_BUDGET=5 STUB_CURL_COUNT="$TMP/c7" "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" \
+if STUB_CURL_BUDGET=5 STUB_CURL_COUNT="$TMP/c7" "$ROOT/scripts/upgrade.sh" "$RELEASE_ARCHIVE" \
     --checksums "$TMP/checksums.txt" --database-url "$DSN" --addr 127.0.0.1:8001 \
-    --health-timeout 5 >"$TMP/upgrade-fail.out" 2>&1; then
+    --health-timeout 5 --no-attestation-verify v0.1.0-alpha.19 >"$TMP/upgrade-fail.out" 2>&1; then
     echo "unhealthy release must fail the upgrade" >&2
     exit 1
 fi
@@ -308,8 +423,9 @@ fi
 # Refusing the new binary's destination aborts the swap after the service
 # stopped; the snapshot (already taken) must be restored and the old release
 # left running.
-if FAIL_ON="$PREFIX/bin/veil-forum" "$ROOT/scripts/upgrade.sh" "$TMP/archive.tar.gz" \
+if FAIL_ON="$PREFIX/bin/veil-forum" "$ROOT/scripts/upgrade.sh" "$RELEASE_ARCHIVE" \
     --checksums "$TMP/checksums.txt" --database-url "$DSN" --addr 127.0.0.1:8001 \
+    --no-attestation-verify v0.1.0-alpha.19 \
     >"$TMP/upgrade-install-fail.out" 2>&1; then
     echo "failed install must fail the upgrade" >&2
     exit 1

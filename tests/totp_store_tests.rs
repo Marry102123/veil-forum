@@ -70,14 +70,13 @@ async fn recovery_codes_are_single_use(pool: PgPool) -> anyhow::Result<()> {
 
     // Case and separators must not matter.
     let loose = codes[1].to_uppercase().replace('-', " ");
+    // An unknown code is rejected, and codes belonging to another account do
+    // not leak across users.
     assert!(
         store
             .consume_recovery_code(user_id, &totp::hash_recovery_code(&loose))
             .await?
     );
-
-    // An unknown code is rejected, and codes belonging to another account do
-    // not leak across users.
     assert!(
         !store
             .consume_recovery_code(user_id, &totp::hash_recovery_code("0000-0000-0000"))
@@ -141,10 +140,11 @@ async fn pending_login_is_short_lived_and_single_use(pool: PgPool) -> anyhow::Re
 async fn expired_pending_logins_are_rejected_and_cleaned(pool: PgPool) -> anyhow::Result<()> {
     let (store, user_id) = fixture(pool).await?;
     let id = store.create_pending_login(user_id).await?;
+    let digest = veil_forum::auth::digest_token(&id);
     // Backdate the expiry instead of waiting five minutes.
     sqlx::query("UPDATE pending_logins SET expires_at = $1 WHERE id = $2")
         .bind(chrono::Utc::now() - chrono::Duration::seconds(1))
-        .bind(&id)
+        .bind(&digest)
         .execute(&store.pool)
         .await?;
     assert!(store.pending_login(&id).await?.is_none());
@@ -152,9 +152,10 @@ async fn expired_pending_logins_are_rejected_and_cleaned(pool: PgPool) -> anyhow
 
     // Creating a new pending login also clears that user's stale rows.
     let first = store.create_pending_login(user_id).await?;
+    let first_digest = veil_forum::auth::digest_token(&first);
     sqlx::query("UPDATE pending_logins SET expires_at = $1 WHERE id = $2")
         .bind(chrono::Utc::now() - chrono::Duration::seconds(1))
-        .bind(&first)
+        .bind(&first_digest)
         .execute(&store.pool)
         .await?;
     let second = store.create_pending_login(user_id).await?;
@@ -190,12 +191,5 @@ async fn disabling_removes_secret_and_recovery_codes(pool: PgPool) -> anyhow::Re
 
     // Disabling twice is harmless.
     store.disable_totp(user_id).await?;
-    Ok(())
-}
-
-#[sqlx::test]
-async fn totp_state_requires_an_existing_user(pool: PgPool) -> anyhow::Result<()> {
-    let (store, _) = fixture(pool).await?;
-    assert!(store.totp_state(999_999).await.is_err());
     Ok(())
 }

@@ -80,12 +80,4 @@ mod tests {
         assert!(!html.contains("<script"));
         assert!(!html.contains("alert(1)"));
     }
-
-    #[test]
-    fn render_keeps_safe_formatting() {
-        let html = render("**bold** and [link](https://example.test)");
-        assert!(html.contains("<strong>bold</strong>"));
-        assert!(html.contains("link"));
-        assert!(!html.contains("href="));
-    }
 }

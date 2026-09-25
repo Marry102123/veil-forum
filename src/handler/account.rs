@@ -53,11 +53,21 @@ pub async fn policy_applies(store: &crate::store::Store, user: &crate::store::Us
     }
     match policy(store).await.as_str() {
         "all" => true,
-        "staff" => store
-            .list_user_roles(user.id)
-            .await
-            .map(|roles| !roles.is_empty())
-            .unwrap_or(false),
+        "staff" => {
+            user.is_admin
+                || store
+                    .user_has_role(user.id, crate::store::Role::Admin)
+                    .await
+                    .unwrap_or(false)
+                || store
+                    .user_has_role(user.id, crate::store::Role::Owner)
+                    .await
+                    .unwrap_or(false)
+                || store
+                    .user_has_role(user.id, crate::store::Role::Moderator)
+                    .await
+                    .unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -118,9 +128,9 @@ fn notice_text(locale: &str, code: &str, error: bool) -> Option<String> {
             "Этот код уже использован. Дождитесь следующего.",
         ),
         ("weak_password", true) => ui(
-            "Choose a password between 6 and 72 characters.",
-            "密码长度需在 6 到 72 个字符之间。",
-            "Пароль должен быть от 6 до 72 символов.",
+            "Choose a strong password between 15 and 128 characters.",
+            "请选择 15 到 128 个字符的强密码。",
+            "Выберите надёжный пароль длиной от 15 до 128 символов.",
         ),
         ("no_change", true) => ui(
             "The new password must differ from the old one.",
@@ -168,7 +178,7 @@ pub(super) async fn complete_login(
         Err(_) => {
             return apply_sec(
                 (StatusCode::INTERNAL_SERVER_ERROR, "session creation failed").into_response(),
-            )
+            );
         }
     };
     let mut resp = Redirect::to("/").into_response();
@@ -208,11 +218,7 @@ async fn confirm_password(
         return false;
     };
     let hash = db_user.password_hash.clone();
-    let _permit = state.password_gate.clone().acquire_owned().await.ok();
-    let valid = tokio::task::spawn_blocking(move || crate::auth::verify_password(&hash, &password))
-        .await
-        .unwrap_or(false);
-    drop(_permit);
+    let valid = crate::auth::verify_password_blocking(hash, password).await;
     valid
 }
 
@@ -221,7 +227,7 @@ async fn confirm_password(
 /// Called when the second factor is switched on or off: sessions created before
 /// that change must not survive it.
 async fn revoke_other_sessions(state: &AppState, user: &crate::store::User, headers: &HeaderMap) {
-    let current = session_id(headers);
+    let current = session_id(headers).map(|raw| crate::auth::digest_token(&raw));
     for session in state
         .store
         .list_sessions_by_user(user.id)
@@ -229,7 +235,7 @@ async fn revoke_other_sessions(state: &AppState, user: &crate::store::User, head
         .unwrap_or_default()
     {
         if current.as_deref() != Some(session.id.as_str()) {
-            let _ = state.store.delete_session(&session.id).await;
+            let _ = state.store.delete_session_digest(&session.id).await;
         }
     }
 }
@@ -254,7 +260,7 @@ async fn render_account(
         .list_sessions_by_user(user.id)
         .await
         .unwrap_or_default();
-    let current_sid = session_id(headers);
+    let current_sid = session_id(headers).map(|raw| crate::auth::digest_token(&raw));
     let roles = state
         .store
         .list_user_roles(user.id)
@@ -661,7 +667,7 @@ pub async fn account_password(
     let old = form.get("old_password").cloned().unwrap_or_default();
     let new = form.get("new_password").cloned().unwrap_or_default();
     let repeat = form.get("repeat_password").cloned().unwrap_or_default();
-    if new.len() < 6 || new.len() > 72 {
+    if !crate::auth::validate_password(&new, &[&user.username]) {
         return apply_sec(Redirect::to("/account?err=weak_password").into_response());
     }
     if new != repeat {
@@ -674,11 +680,7 @@ pub async fn account_password(
         return apply_sec((StatusCode::INTERNAL_SERVER_ERROR, "user not found").into_response());
     };
     let hash = db_user.password_hash.clone();
-    let _permit = s.password_gate.clone().acquire_owned().await.ok();
-    let valid = tokio::task::spawn_blocking(move || crate::auth::verify_password(&hash, &old))
-        .await
-        .unwrap_or(false);
-    drop(_permit);
+    let valid = crate::auth::verify_password_blocking(hash, old).await;
     if !valid {
         let _ = s
             .store
@@ -692,27 +694,21 @@ pub async fn account_password(
             .await;
         return apply_sec(Redirect::to("/account?err=bad_password").into_response());
     }
-    let new_hash = match crate::auth::hash_password(&new) {
+    let new_hash = match crate::auth::hash_password_blocking(new).await {
         Ok(hash) => hash,
         Err(_) => {
-            return apply_sec((StatusCode::INTERNAL_SERVER_ERROR, "hash failed").into_response())
+            return apply_sec((StatusCode::INTERNAL_SERVER_ERROR, "hash failed").into_response());
         }
     };
-    if s.store.update_password(user.id, &new_hash).await.is_err() {
-        return apply_sec((StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response());
-    }
-    // A password change ends every other session.
-    let current_sid = session_id(&headers);
-    for session in s
+    let sid = if let Ok(sid) = s
         .store
-        .list_sessions_by_user(user.id)
+        .update_password_and_rotate_sessions(user.id, &new_hash)
         .await
-        .unwrap_or_default()
     {
-        if current_sid.as_deref() != Some(session.id.as_str()) {
-            let _ = s.store.delete_session(&session.id).await;
-        }
-    }
+        sid
+    } else {
+        return apply_sec((StatusCode::INTERNAL_SERVER_ERROR, "update failed").into_response());
+    };
     let _ = s
         .store
         .audit(
@@ -723,7 +719,14 @@ pub async fn account_password(
             true,
         )
         .await;
-    apply_sec(Redirect::to("/account?ok=password_changed").into_response())
+    let mut response = Redirect::to("/account?ok=password_changed").into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        session_cookie(&sid, 12 * 3600, s.secure_session_cookie)
+            .parse()
+            .unwrap(),
+    );
+    apply_sec(response)
 }
 
 pub async fn account_totp_setup(
@@ -795,7 +798,7 @@ pub async fn account_totp_confirm(
         Err(_) => {
             return apply_sec(
                 (StatusCode::INTERNAL_SERVER_ERROR, "state unavailable").into_response(),
-            )
+            );
         }
     };
     let Some(pending) = state.pending_secret.as_deref() else {
@@ -813,7 +816,7 @@ pub async fn account_totp_confirm(
     let step = match outcome {
         Ok(crate::totp::CodeOutcome::Accepted { step }) => step,
         Ok(crate::totp::CodeOutcome::Replayed) => {
-            return apply_sec(Redirect::to("/account?err=replayed_code").into_response())
+            return apply_sec(Redirect::to("/account?err=replayed_code").into_response());
         }
         Ok(crate::totp::CodeOutcome::Invalid) | Err(_) => {
             let _ = s
@@ -882,7 +885,7 @@ pub async fn account_totp_disable(
         Err(_) => {
             return apply_sec(
                 (StatusCode::INTERNAL_SERVER_ERROR, "state unavailable").into_response(),
-            )
+            );
         }
     };
     let verified = match state.secret.as_deref() {
@@ -1069,7 +1072,7 @@ pub async fn login_totp_post(
                     ),
                 )
                     .into_response(),
-            )
+            );
         }
     };
     let Some(user) = s

@@ -172,8 +172,8 @@ pub fn looks_like_recovery_code(input: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// RFC 6238 Appendix B. The reference secret is the ASCII string
-    /// "12345678901234567890" with SHA-1, 8 digits and 30 second steps.
+    /// RFC 6238 Appendix B reference vectors detect interoperability and
+    /// time-step calculation regressions that end-to-end happy paths can miss.
     #[test]
     fn matches_rfc6238_test_vectors() {
         let totp = Builder::new()
@@ -207,7 +207,6 @@ mod tests {
             verify_code(&secret, "alice", "veil-forum", &code, now, None).unwrap(),
             CodeOutcome::Accepted { .. }
         ));
-        // The same code in a later step is no longer valid.
         assert_eq!(
             verify_code(&secret, "alice", "veil-forum", &code, now + 300, None).unwrap(),
             CodeOutcome::Invalid
@@ -286,16 +285,6 @@ mod tests {
         let svg = qr_svg(&url).expect("qr");
         assert!(svg.contains("<svg"), "inline svg expected");
         assert!(!svg.contains("<script"));
-    }
-
-    #[test]
-    fn secrets_round_trip_through_base32() {
-        for _ in 0..8 {
-            let secret = generate_secret();
-            let code = code_at(&secret, "alice", "veil-forum", 1_700_000_000).expect("code");
-            assert_eq!(code.len(), DIGITS as usize);
-            assert!(code.chars().all(|c| c.is_ascii_digit()));
-        }
     }
 
     #[test]

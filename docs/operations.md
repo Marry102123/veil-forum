@@ -22,7 +22,7 @@ Useful options (`scripts/install.sh --help` lists all of them):
 | Option | Meaning |
 |---|---|
 | `--dry-run` | Print every step without changing anything |
-| `--admin-password-file FILE` | 12-128 character first admin password (`VEIL_ADMIN_PASSWORD` also works); only needed when the database is empty |
+| `--admin-password-file FILE` | 15-128 character, sufficiently strong first admin password (`VEIL_ADMIN_PASSWORD` also works); only needed when the database is empty |
 | `--prefix DIR` | Install prefix (default `/usr/local`) |
 | `--user/--db-user/--db-name/--db-socket` | Service user, database role, name, socket directory |
 | `--port PORT` / `--addr HOST:PORT` | Listener (default `127.0.0.1:8001`; non-loopback needs `--allow-nonloopback`) |
@@ -66,9 +66,10 @@ curl --fail http://127.0.0.1:8001/healthz
 ```
 
 For the first start only, supply the administrator password through the
-service manager environment (`VEIL_ADMIN_PASSWORD`, 12-128 characters), then
-remove it and restart. The database role and the service user must share a
-name, because the default socket connection relies on peer authentication.
+service manager environment (`VEIL_ADMIN_PASSWORD`, 15-128 characters and
+sufficiently strong), then remove it and restart. The database role and the
+service user must share a name, because the default socket connection relies
+on peer authentication.
 
 Recommended hardening in `postgresql.conf`:
 
@@ -85,23 +86,40 @@ runtime.
 
 ## Backup and restore
 
-While the service is running:
+Prepare a recipient file before using a privileged backup. Keep the file mode
+600 or stricter:
 
 ```bash
-sudo scripts/db-maintenance.sh check
-sudo scripts/db-maintenance.sh backup postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum \
-                                    /srv/veil-forum-backups
+sudo install -d -m 700 /etc/veil-forum
+sudo install -m 600 age-recipient.txt /etc/veil-forum/backup-recipients
+```
+
+While the service is running, pass either that file or one recipient explicitly
+to the privileged command. Do not rely on `sudo` inheriting an exported value
+from the ordinary shell:
+
+```bash
+sudo scripts/db-maintenance.sh check postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum
+sudo env VEIL_BACKUP_RECIPIENT_FILE=/etc/veil-forum/backup-recipients \
+  scripts/db-maintenance.sh backup postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum \
+  /srv/veil-forum-backups
 ```
 
 Both arguments default to the local socket connection string and
 `/srv/veil-forum-backups`; `DATABASE_URL` is honoured when the first argument
 is omitted. `check` verifies connectivity and that the schema is present,
 then runs `pg_amcheck` when installed. `backup` writes a custom-format
-archive with `pg_dump --format=custom`, verifies it with `pg_restore
---list`, renames it into place atomically, keeps the 30 most recent archives,
-and sets mode 600 in a 0700 directory. It requires `pg_dump` and
-`pg_restore`. The older `scripts/backup.sh` remains available for
-compatibility and takes the same arguments.
+archive with `pg_dump --format=custom`, verifies the transient dump with
+`pg_restore --list`, encrypts it with age, and atomically publishes
+`forum-<timestamp>.dump.age`. It keeps the 30 most recent encrypted archives
+and sets mode 600 in a 0700 directory. The canonical new backup is therefore an
+age-encrypted custom-format archive, not a `.dump` file. `pg_restore` cannot
+open the `.dump.age` ciphertext directly.
+Set `VEIL_BACKUP_RECIPIENT` to an age public recipient, or
+`VEIL_BACKUP_RECIPIENT_FILE` to a mode 600-or-stricter file containing one
+recipient per line. Missing `age` or a missing recipient fails before any
+plaintext dump is created. The older `scripts/backup.sh` remains available
+for compatibility and takes the same arguments.
 
 Retention is `VEIL_BACKUP_RETAIN` (default 30). A value of `0`, an empty
 value, or anything that is not a number is refused with a warning and falls
@@ -114,12 +132,26 @@ table. The default Unix-socket string carries no password; for a TCP
 connection prefer `PGPASSWORD` or a mode 600 `~/.pgpass` over an inline
 password in the DSN, and run maintenance as a user nobody else shares.
 
-Restore into an empty database to verify a backup:
+Restore an encrypted backup through `rollback.sh`, not by passing it directly
+to `pg_restore`. The restore path accepts only a passwordless Unix-socket peer
+DSN, and its database role must equal `VEIL_USER` (the default is
+`veil-forum`):
 
 ```bash
-sudo -u postgres createdb -O veil-forum veil_forum_restore
-pg_restore --dbname veil_forum_restore --no-owner --exit-on-error forum-<stamp>.dump
+sudo scripts/rollback.sh --snapshot /var/lib/veil-forum/rollback/OLD-VERSION-STAMP \
+  --restore-db /srv/veil-forum-backups/forum-STAMP.dump.age \
+  --database-url postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum \
+  --user veil-forum \
+  --backup-identity /root/.config/veil-forum/backup.key
 ```
+
+`--backup-identity` is a root-owned mode 600 identity file path, never identity
+material on the command line. The script validates the archive by piping
+`age --decrypt` directly into `pg_restore --list`, then streams the decryption a
+second time into `pg_restore`. No decrypted `.dump` is created on disk. A
+wrong identity or invalid plaintext fails before the service is stopped. The
+command still drops and recreates the selected database after confirmation, so
+use a trusted pre-upgrade backup, not the latest backup after the failure.
 
 Backups contain sessions, password hashes, and deleted content, so treat them
 as sensitive data. Encrypt them before moving them off-host. Never include
@@ -132,10 +164,16 @@ From a verified release archive:
 
 ```bash
 sha256sum -c veil-forum-*-checksums.txt
-sudo scripts/upgrade.sh veil-forum-*.tar.gz --checksums veil-forum-*-checksums.txt
+sudo env VEIL_BACKUP_RECIPIENT_FILE=/etc/veil-forum/backup-recipients \
+  scripts/upgrade.sh /srv/releases/veil-forum-vVERSION-x86_64-unknown-linux-musl.tar.gz \
+  --checksums /srv/releases/veil-forum-vVERSION-checksums.txt \
+  --signatures /srv/releases/signatures
 ```
 
-`upgrade.sh` verifies the checksum, **backs up the database first**,
+Name exactly one release archive. The signature directory must contain the
+`.sig` and `.pem` pairs for both that archive and the checksum file.
+`upgrade.sh` verifies the archive and checksum Sigstore identity, **backs up
+the database first with age encryption**,
 snapshots the running binary and `static/` to a versioned directory under
 `/var/lib/veil-forum/rollback/`, stops the service, installs the new files,
 starts it, and waits for `/healthz`. If the health check fails it **restores
@@ -179,11 +217,17 @@ read the newer schema. Restore the pre-upgrade backup into a fresh database
 first:
 
 ```bash
-sudo scripts/rollback.sh --restore-db /srv/veil-forum-backups/forum-<stamp>.dump
+sudo scripts/rollback.sh --restore-db /srv/veil-forum-backups/forum-<stamp>.dump.age \
+  --database-url postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum \
+  --user veil-forum \
+  --backup-identity /root/.config/veil-forum/backup.key
 ```
 
 `--restore-db` drops the configured database and recreates it from the dump,
 so it asks for confirmation (pass `--yes` only from automation you trust).
+It accepts only a passwordless peer socket DSN whose role matches `VEIL_USER`.
+Encrypted input is streamed into `pg_restore` for both validation and loading,
+so the restore does not write a plaintext `.dump` file.
 The snapshot records which backup was taken before the upgrade (`DB_DUMP`
 file next to `VERSION` in the snapshot directory).
 
@@ -195,9 +239,12 @@ database before starting the older binary, and point it at that database.
 
 ## Service management
 
-The unit declares `Requires=postgresql.service`, so the database starts
-first. The application retries the initial connection, which covers the
-remaining startup window. It limits restart bursts to five failures in five
+The systemd unit declares `Requires=postgresql.service` and orders the service
+after both `network.target` and `postgresql.service`. The OpenRC unit declares
+the corresponding `use`/`after` dependencies. The application makes ten bounded
+connection attempts with a five-second per-attempt timeout and a short backoff,
+so a database that is still starting is tolerated without masking a persistent
+failure. The systemd unit limits restart bursts to five failures in five
 minutes, preventing a persistent failure from spinning indefinitely. After
 correcting the cause, inspect the journal and run
 `sudo systemctl reset-failed veil-forum` before starting it again.
@@ -301,9 +348,10 @@ malformed legacy row rolled back rather than leaving a half-filled database.
 - **Startup fails:** the error identifies the PostgreSQL target,
   administrator initialization, or listener address. Check that the database
   is running, that the role can log in over the socket, that the first-run
-  `VEIL_ADMIN_PASSWORD` is 12-128 characters, and that the configured
-  loopback port is not already in use. Connection errors never include the
-  password; the target is printed with the password replaced by `***`.
+  `VEIL_ADMIN_PASSWORD` is 15-128 characters and sufficiently strong, and
+  that the configured loopback port is not already in use. Connection errors
+  never include the password; the target is printed with the password replaced
+  by `***`.
 - **`/healthz` never answers:** the process is up but the database is not.
   Inspect `journalctl -u veil-forum` and run
   `scripts/db-maintenance.sh check` with the same connection string the unit
@@ -317,3 +365,15 @@ malformed legacy row rolled back rather than leaving a half-filled database.
 - **Which release is running:** `veil-forum --version`, or the version shown
   in the administration workspace. Rollback snapshots live in
   `/var/lib/veil-forum/rollback/` with a `VERSION` file each.
+
+## CI prerequisites for encrypted backups
+
+CI 必须显式安装 age（Debian/Ubuntu 通常为 `apt-get install age`）。若发行版
+仓库没有包，可下载固定版本 release，并校验发布方 SHA-256 后把 `age` 和
+`age-keygen` 放入 CI `PATH`。不要缓存、提交或写入日志中的 identity 私钥。
+
+数据库服务角色必须是 `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+NOREPLICATION NOBYPASSRLS`。安装器创建这些属性，并在重装时复核。发现既有
+高权限角色时安装器明确失败，不会修改密码或自动降权。管理员审查
+`pg_roles` 后应显式执行 `ALTER ROLE veil_forum LOGIN NOSUPERUSER NOCREATEDB
+NOCREATEROLE NOREPLICATION NOBYPASSRLS`，确认对象所有权需求后再重跑。

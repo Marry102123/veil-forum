@@ -27,13 +27,20 @@ pub async fn maintenance_gate(
         return next.run(request).await;
     }
     let is_admin = match session_id(request.headers()) {
-        Some(sid) => store
-            .get_user_by_session(&sid)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.is_admin)
-            .unwrap_or(false),
+        Some(sid) => match store.get_user_by_session(&sid).await.ok().flatten() {
+            Some(user) => {
+                user.is_admin
+                    || store
+                        .user_has_role(user.id, crate::store::Role::Admin)
+                        .await
+                        .unwrap_or(false)
+                    || store
+                        .user_has_role(user.id, crate::store::Role::Owner)
+                        .await
+                        .unwrap_or(false)
+            }
+            None => false,
+        },
         None => false,
     };
     if is_admin {
@@ -119,10 +126,8 @@ pub async fn theme_query_cookie(
     next.run(request).await
 }
 
-/// Policy gate: when `totp_required` is `staff` or `all`, a signed-in member
-/// without an active second factor may only reach the account page, sign out,
-/// and static assets. Enrolling stays reachable, so nobody is locked out of
-/// fixing their own account.
+/// Policy gate: when TOTP is required, unactivated non-staff sessions are
+/// confined to account/TOTP recovery, logout, static assets, and health.
 pub async fn totp_gate(
     State(store): State<crate::store::Store>,
     request: axum::extract::Request,
@@ -169,6 +174,15 @@ pub async fn totp_gate(
         .unwrap_or(false)
     {
         return next.run(request).await;
+    }
+    if path.starts_with("/admin") || path.starts_with("/governance") {
+        return apply_sec(
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                "TOTP enrollment required",
+            )
+                .into_response(),
+        );
     }
 
     let locale = store

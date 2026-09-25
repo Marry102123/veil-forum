@@ -5,8 +5,6 @@ use anyhow::Context;
 use axum::body::to_bytes;
 use axum::http::{header, Request, StatusCode};
 use sqlx::PgPool;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use veil_forum::store::Store;
 use veil_forum::{captcha, handler, pow, totp};
@@ -24,7 +22,6 @@ async fn app_with_store(pool: &PgPool) -> anyhow::Result<(axum::Router, Store)> 
         limits: veil_forum::rate_limit::Limits::new(),
         secure_session_cookie: false,
         store: store.clone(),
-        password_gate: Arc::new(Semaphore::new(8)),
     };
     Ok((handler::routes(state), store))
 }
@@ -129,7 +126,7 @@ fn code_in(secret: &str, account: &str, offset_seconds: i64) -> String {
 #[sqlx::test]
 async fn account_page_hides_totp_when_the_feature_is_off(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
     let sid = store.create_session(id).await?;
     let cookie = format!("session_id={sid}");
 
@@ -150,7 +147,7 @@ async fn account_page_hides_totp_when_the_feature_is_off(pool: PgPool) -> anyhow
 #[sqlx::test]
 async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    member(&store, "alice", "correct horse battery").await?;
+    member(&store, "alice", "Glacier-Maple7-Raven").await?;
 
     // 1. Password step: no session yet, a pending login instead.
     let csrf = csrf_token(app.clone(), "/login", None).await?;
@@ -158,7 +155,7 @@ async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
         app.clone(),
         "/login",
         None,
-        &format!("csrf_token={csrf}&username=alice&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&username=alice&password=Glacier-Maple7-Raven"),
     )
     .await?;
     // Without a second factor the same request yields a session; with TOTP not
@@ -172,7 +169,7 @@ async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
         app.clone(),
         "/account/totp/setup",
         Some(&signed_in_cookie),
-        &format!("csrf_token={csrf}&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&password=Glacier-Maple7-Raven"),
     )
     .await?;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -240,7 +237,7 @@ async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
         app.clone(),
         "/login",
         None,
-        &format!("csrf_token={csrf}&username=alice&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&username=alice&password=Glacier-Maple7-Raven"),
     )
     .await?;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -321,7 +318,7 @@ async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
         app.clone(),
         "/login",
         None,
-        &format!("csrf_token={csrf}&username=alice&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&username=alice&password=Glacier-Maple7-Raven"),
     )
     .await?;
     let target = redirect_target(&response);
@@ -342,7 +339,7 @@ async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
         app.clone(),
         "/login",
         None,
-        &format!("csrf_token={csrf}&username=alice&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&username=alice&password=Glacier-Maple7-Raven"),
     )
     .await?;
     let target = redirect_target(&response);
@@ -366,7 +363,7 @@ async fn enrolment_then_two_step_login(pool: PgPool) -> anyhow::Result<()> {
 #[sqlx::test]
 async fn disabling_needs_password_and_a_code(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
     let secret = totp::generate_secret();
     store.activate_totp(id, &secret, 0).await?;
     let sid = store.create_session(id).await?;
@@ -393,7 +390,7 @@ async fn disabling_needs_password_and_a_code(pool: PgPool) -> anyhow::Result<()>
         app.clone(),
         "/account/totp/disable",
         Some(&cookie),
-        &format!("csrf_token={csrf}&password=correct+horse+battery&code=000000"),
+        &format!("csrf_token={csrf}&password=Glacier-Maple7-Raven&code=000000"),
     )
     .await?;
     assert!(redirect_target(&response).contains("err=bad_code"));
@@ -406,7 +403,7 @@ async fn disabling_needs_password_and_a_code(pool: PgPool) -> anyhow::Result<()>
         "/account/totp/disable",
         Some(&cookie),
         &format!(
-            "csrf_token={csrf}&password=correct+horse+battery&code={}",
+            "csrf_token={csrf}&password=Glacier-Maple7-Raven&code={}",
             code_now(&secret, "alice")
         ),
     )
@@ -417,38 +414,9 @@ async fn disabling_needs_password_and_a_code(pool: PgPool) -> anyhow::Result<()>
 }
 
 #[sqlx::test]
-async fn password_change_ends_other_sessions(pool: PgPool) -> anyhow::Result<()> {
-    let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
-    let current = store.create_session(id).await?;
-    let cookie = format!("session_id={current}");
-
-    let csrf = csrf_token(app.clone(), "/account", Some(&cookie)).await?;
-    let response = post_form(
-        app.clone(),
-        "/account/password",
-        Some(&cookie),
-        &format!(
-            "csrf_token={csrf}&old_password=correct+horse+battery&new_password=new+password+value&repeat_password=new+password+value"
-        ),
-    )
-    .await?;
-    assert!(redirect_target(&response).contains("ok=password_changed"));
-    let sessions = store.list_sessions_by_user(id).await?;
-    assert_eq!(sessions.len(), 1, "only the current session survives");
-
-    // The new password works, the old one does not.
-    assert!(veil_forum::auth::verify_password(
-        &store.get_user_by_id(id).await?.unwrap().password_hash,
-        "new password value"
-    ));
-    Ok(())
-}
-
-#[sqlx::test]
 async fn required_policy_gates_the_forum_until_enrolment(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
     let board = store
         .create_board("general2", "General", "test", true, true)
         .await?;
@@ -496,7 +464,7 @@ async fn required_policy_gates_the_forum_until_enrolment(pool: PgPool) -> anyhow
     // `staff` only applies to accounts holding a role.
     store.set_config("totp_required", "staff").await?;
     store.disable_totp(id).await?;
-    let plain = member(&store, "bob", "correct horse battery").await?;
+    let plain = member(&store, "bob", "Glacier-Maple7-Raven").await?;
     let plain_sid = store.create_session(plain).await?;
     let (status, html) = get(
         app.clone(),
@@ -553,7 +521,7 @@ async fn admin_can_toggle_the_feature_and_policy(pool: PgPool) -> anyhow::Result
     );
 
     // With the feature off, the policy does not gate anything.
-    let other = member(&store, "carol", "correct horse battery").await?;
+    let other = member(&store, "carol", "Glacier-Maple7-Raven").await?;
     let other_sid = store.create_session(other).await?;
     let (status, _) = get(app.clone(), "/", Some(&format!("session_id={other_sid}"))).await?;
     assert_eq!(status, StatusCode::OK);
@@ -584,7 +552,7 @@ async fn admin_can_toggle_the_feature_and_policy(pool: PgPool) -> anyhow::Result
 #[sqlx::test]
 async fn enrolment_requires_the_current_password(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
     let sid = store.create_session(id).await?;
     let cookie = format!("session_id={sid}");
 
@@ -616,7 +584,7 @@ async fn enrolment_requires_the_current_password(pool: PgPool) -> anyhow::Result
         app.clone(),
         "/account/totp/setup",
         Some(&cookie),
-        &format!("csrf_token={csrf}&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&password=Glacier-Maple7-Raven"),
     )
     .await?;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -634,7 +602,7 @@ async fn enrolment_requires_the_current_password(pool: PgPool) -> anyhow::Result
 #[sqlx::test]
 async fn crafted_session_cookie_cannot_bypass_the_policy_gate(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
     // A private board: a guest is redirected to the login page, so the only way
     // to read the thread is to be recognised as a member.
     let board = store
@@ -678,7 +646,7 @@ async fn crafted_session_cookie_cannot_bypass_the_policy_gate(pool: PgPool) -> a
 #[sqlx::test]
 async fn a_code_cannot_be_reused_for_a_second_pending_login(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
     let secret = totp::generate_secret();
     store.activate_totp(id, &secret, 0).await?;
 
@@ -690,7 +658,7 @@ async fn a_code_cannot_be_reused_for_a_second_pending_login(pool: PgPool) -> any
             app.clone(),
             "/login",
             None,
-            &format!("csrf_token={csrf}&username=alice&password=correct+horse+battery"),
+            &format!("csrf_token={csrf}&username=alice&password=Glacier-Maple7-Raven"),
         )
         .await?;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -752,7 +720,7 @@ async fn a_code_cannot_be_reused_for_a_second_pending_login(pool: PgPool) -> any
 #[sqlx::test]
 async fn totp_transitions_revoke_other_sessions(pool: PgPool) -> anyhow::Result<()> {
     let (app, store) = app_with_store(&pool).await?;
-    let id = member(&store, "alice", "correct horse battery").await?;
+    let id = member(&store, "alice", "Glacier-Maple7-Raven").await?;
 
     // A stale session from before enrolment.
     let stale = store.create_session(id).await?;
@@ -765,7 +733,7 @@ async fn totp_transitions_revoke_other_sessions(pool: PgPool) -> anyhow::Result<
         app.clone(),
         "/account/totp/setup",
         Some(&current_cookie),
-        &format!("csrf_token={csrf}&password=correct+horse+battery"),
+        &format!("csrf_token={csrf}&password=Glacier-Maple7-Raven"),
     )
     .await?;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);

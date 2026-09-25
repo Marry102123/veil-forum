@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.1.0-alpha.20
+
+**Security release.** This release hardens sessions, credentials, backups, and
+the release pipeline. Existing password hashes stay valid, but a database that
+has already run `0.1.0-alpha.19` will apply two new migrations on first start.
+
+### Sessions and identity
+
+- Session cookies are now stored only as a digest
+  (`migrations/0003_session_security.sql`). A leaked database row therefore no
+  longer yields a usable session token, and the absolute and idle expiry bounds
+  are enforced on every authenticated request.
+- Session cookies are issued with `Secure`, `HttpOnly`, and `SameSite=Strict`
+  whenever secure transport is enabled, and are rejected over an insecure
+  origin.
+- `threads.author_id` is now nullable and anonymous threads store `NULL`
+  (`migrations/0004_anonymous_identity.sql`). The migration also clears the
+  author on previously created anonymous threads, matched by their first post,
+  so an anonymous board cannot attribute a thread to whoever happened to start
+  it. Named threads and replies keep their author.
+
+### Credentials and input handling
+
+- Password policy is now uniform across registration, self-service change, and
+  administrator change: 15-128 characters with a `zxcvbn` strength of at
+  least 3. All three paths emit the same localized hint.
+- Password hashing moved to Argon2id with parameters calibrated for the
+  deployment, and the bundled `argon2` WebAssembly asset was removed now that
+  the server is the only password verifier.
+- Markdown rendering strips remote images and other markup that let a stored
+  post track readers or execute script.
+- Proof-of-work inputs are length- and range-validated before any hashing, and
+  rate-limit and captcha state are bounded so a single caller cannot exhaust
+  memory.
+
+### Operations, backup, and release
+
+- `install.sh`, `upgrade.sh`, and `rollback.sh` redact the PostgreSQL connection
+  string in all output. A snapshot persists only a passwordless peer-socket
+  DSN, never a credential-bearing one.
+- Rollback restores an encrypted dump as a stream
+  (`age --decrypt | pg_restore`) and never writes a decrypted archive to disk.
+  It refuses a credential-bearing DSN, requires the restore role to equal the
+  service role, and requires the age identity to be root-owned and mode 600.
+  A failed service start during rollback is no longer ignored.
+- `db-maintenance.sh` builds each backup in a private `mktemp -d` workspace and
+  publishes it with an atomic `ln`, so a concurrent run can never observe or
+  overwrite a partial archive. `check` no longer requires an age recipient.
+- The non-root bypass needs both `VEIL_ALLOW_NONROOT=1` and
+  `VEIL_TEST_HARNESS=1`; a single variable no longer disables the root checks.
+- CI builds and signs a **draft** release, runs `tests/release_packages_e2e.sh`
+  against the draft assets, and only then publishes it. A failed validation
+  leaves the release as a draft instead of exposing unverified assets.
+  `verify` runs with the least privileges it needs and clippy covers all
+  features.
+- `release_packages_e2e.sh` derives the expected migration count from the
+  migrations shipped inside each archive instead of the current working tree,
+  requires `cosign` only on the signed-release path, and can execute
+  non-native archives under QEMU user-mode emulation
+  (`VEIL_QEMU_BIN_DIR` plus `VEIL_QEMU_SYSROOT_DIR`). It probes each
+  emulator/sysroot pair, reports `passed` only when no archive was skipped,
+  asserts the service process tree is really gone after SIGTERM, and records
+  `passed_with_partial_runs` or `passed_with_runtime_skips` otherwise.
+- `tests/deploy-scripts.sh` no longer blocks on an inherited stdin, which had
+  made the deployment suite hang indefinitely.
+
+### Tests
+
+- Add real end-to-end suites with credential-free JSON reports:
+  authentication, configuration effects, forum lifecycle, governance, search
+  privacy, and the backup/upgrade/rollback flow. Each report records a schema,
+  UTC timestamps, an input summary, the checks it expected and completed, a
+  reproduction command, and `credentials_included=false`, and is written even
+  on panic.
+- The authentication E2E now exercises weak-password rejection at registration,
+  self-service change, and administrator change, and asserts the secure cookie
+  attributes on the real response.
+
 ## 0.1.0-alpha.19
 
 **Breaking for operators:** the PostgreSQL connection string must now carry a

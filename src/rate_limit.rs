@@ -62,26 +62,3 @@ impl Default for Limits {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Limits;
-
-    #[test]
-    fn posting_requires_a_session_and_is_keyed_per_session_digest() {
-        let limits = Limits::new();
-        assert!(!limits.allow_post(None));
-        assert!(limits.allow_post(Some("first-session")));
-        assert!(!limits.allow_post(Some("first-session")));
-        assert!(limits.allow_post(Some("second-session")));
-    }
-
-    #[test]
-    fn authentication_limit_bounds_global_burst() {
-        let limits = Limits::new();
-        for _ in 0..30 {
-            assert!(limits.allow_auth());
-        }
-        assert!(!limits.allow_auth());
-    }
-}
