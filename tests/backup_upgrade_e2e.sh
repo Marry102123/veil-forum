@@ -180,7 +180,7 @@ as_postgres() {
   sudo -n -u postgres "$@"
 }
 
-for cmd in cargo curl psql pg_dump pg_restore age tar sha256sum openssl sudo seq su jq; do
+for cmd in cargo curl psql pg_dump pg_restore age tar sha256sum openssl sudo seq su jq python3; do
   command -v "$cmd" >/dev/null 2>&1 || fail "missing command: $cmd"
 done
 CREDENTIAL_DSN="postgres://$DB_USER:$CREDENTIAL_SENTINEL@%2Fvar%2Frun%2Fpostgresql/$DB_NAME"
@@ -273,31 +273,81 @@ tar -czf "$RELEASE_ARCHIVE" -C "$STAGE" veil-forum-e2e
 # It controls the process started from the installed binary, so upgrade and
 # rollback exercise their real stop/start/health gate instead of a mocked path.
 mkdir -p "$TMP/bin"
-cat > "$TMP/bin/systemctl" <<EOF
+cat > "$TMP/bin/systemctl" <<'EOF'
 #!/bin/sh
-printf '%s %s\n' "\$1" "\${2:-}" >> "$SYSTEMCTL_LOG"
-case "\$1" in
+# The shim body is fully quoted: nothing here is expanded when this file is
+# generated, so no command substitution or backtick in a comment can run at
+# generation time. The __TOKEN__ placeholders below are replaced afterwards
+# with literal values, because `sudo -n env` does not forward the harness
+# environment to this script.
+set -eu
+SYSTEMCTL_LOG='__SYSTEMCTL_LOG__'
+DB_USER='__DB_USER__'
+PREFIX='__PREFIX__'
+PORT='__PORT__'
+DB_URL='__DB_URL__'
+TMP='__TMP__'
+printf '%s %s\n' "${1:-}" "${2:-}" >> "$SYSTEMCTL_LOG"
+case "${1:-}" in
   stop)
     if [ -f "$TMP/service.pid" ]; then
-      pid=\$(cat "$TMP/service.pid")
-      kill -TERM "\$pid" 2>/dev/null || true
+      pid=$(cat "$TMP/service.pid")
+      kill -TERM "$pid" 2>/dev/null || true
       i=0
-      while kill -0 "\$pid" 2>/dev/null && [ "\$i" -lt 50 ]; do sleep 0.1; i=\$((i + 1)); done
-      kill -0 "\$pid" 2>/dev/null && kill -KILL "\$pid" 2>/dev/null || true
+      while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
       rm -f "$TMP/service.pid"
     fi
     ;;
   start)
-    su -s /bin/sh -c 'VEIL_ALLOW_NONROOT=1 "\$1" --addr "127.0.0.1:\$2" --database-url "\$3" >>"\$4" 2>&1 & echo \$! > "\$5"' \
-      "$DB_USER" veil-e2e-service "$PREFIX/bin/veil-forum" "$PORT" "$DB_URL" "$TMP/service.log" "$TMP/service.pid"
+    # Switching to the *same* user still goes through PAM and interactively
+    # prompts for a password on Debian/Ubuntu, which hangs a non-interactive
+    # CI runner. Skip the identity switch when it is unnecessary.
+    if [ "$(id -un)" = "$DB_USER" ]; then
+      VEIL_ALLOW_NONROOT=1 "$PREFIX/bin/veil-forum" --addr "127.0.0.1:$PORT" \
+        --database-url "$DB_URL" >>"$TMP/service.log" 2>&1 &
+      echo $! > "$TMP/service.pid"
+    else
+      su -s /bin/sh -c 'VEIL_ALLOW_NONROOT=1 "$1" --addr "127.0.0.1:$2" --database-url "$3" >>"$4" 2>&1 & echo $! > "$5"' \
+        "$DB_USER" veil-e2e-service "$PREFIX/bin/veil-forum" "$PORT" "$DB_URL" "$TMP/service.log" "$TMP/service.pid"
+    fi
     ;;
   daemon-reload) : ;;
   *) exit 0 ;;
 esac
 EOF
+# Inject the literal harness values now that the quoted heredoc is written.
+# Python is used instead of sed so values containing the delimiter cannot
+# corrupt the shim, and so a missing placeholder is a hard error.
+python3 - "$TMP/bin/systemctl" "$SYSTEMCTL_LOG" "$DB_USER" "$PREFIX" "$PORT" "$DB_URL" "$TMP" <<'PY'
+import pathlib
+import sys
+
+path, systemctl_log, db_user, prefix, port, db_url, tmp = sys.argv[1:]
+path = pathlib.Path(path)
+text = path.read_text(encoding="utf-8")
+values = {
+    "__SYSTEMCTL_LOG__": systemctl_log,
+    "__DB_USER__": db_user,
+    "__PREFIX__": prefix,
+    "__PORT__": port,
+    "__DB_URL__": db_url,
+    "__TMP__": tmp,
+}
+for token, value in values.items():
+    if token not in text:
+        raise SystemExit(f"systemctl shim is missing {token}")
+    # Single-quote for POSIX sh, escaping any embedded single quote.
+    literal = "'" + value.replace("'", "'\\''") + "'"
+    text = text.replace(token, literal)
+path.write_text(text, encoding="utf-8")
+PY
 chmod 0755 "$TMP/bin/systemctl"
 
 export PATH="$TMP/bin:$PATH"
+# The systemctl shim is a fully quoted heredoc, so it reads these from the
+# environment instead of from generation-time expansion.
+export SYSTEMCTL_LOG DB_USER DB_URL PORT PREFIX TMP
 export VEIL_ALLOW_NONROOT=1
 export VEIL_TEST_HARNESS=1
 export VEIL_SERVICE_MANAGER=systemd
