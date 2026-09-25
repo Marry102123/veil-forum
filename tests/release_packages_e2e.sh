@@ -202,19 +202,26 @@ fi
 gh auth status -h github.com >/dev/null 2>&1 || fail 'GitHub CLI authentication failed'
 
 STEP="download_release_assets"
-# The release under test is a DRAFT at this point, and `gh release download`
-# resolves releases through the REST by-tag endpoint, which returns 404 for a
-# draft. Resolve the release id through the REST list endpoint and fetch each
-# asset by its numeric asset id, which works for drafts and for published
-# releases alike.
-#
-# A retried tag can leave more than one draft for the same tag, so select the
-# most recently created one and then require it to carry the expected assets.
-# Picking an arbitrary match would validate a stale draft.
-release_id=$(gh api "repos/$REPO/releases" --paginate \
-  --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.created_at) \(.id)\"" \
-  | sort | tail -n 1 | cut -d' ' -f2)
-[ -n "$release_id" ] || fail "no GitHub release found for tag $TAG"
+# The release under test is a DRAFT at this point. Two facts shape this code:
+#   1. `gh release download` resolves through the REST by-tag endpoint, which
+#      returns 404 for a draft, so assets are fetched by numeric asset id.
+#   2. A read-only workflow token cannot enumerate drafts at all, and a
+#      retried tag leaves several drafts sharing one tag name. CI therefore
+#      hands over RELEASE_ID from the job that created the draft. Outside CI a
+#      user-level token is available, so fall back to the newest matching draft.
+release_id="${RELEASE_ID:-}"
+if [ -n "$release_id" ]; then
+  case "$release_id" in
+    ''|*[!0-9]*) fail "RELEASE_ID must be a numeric release id: $release_id" ;;
+  esac
+  [ -n "$(gh api "repos/$REPO/releases/$release_id" --jq '.id' 2>/dev/null)" ] \
+    || fail "release id $release_id is not visible to this token"
+else
+  release_id=$(gh api "repos/$REPO/releases" --paginate \
+    --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.created_at) \(.id)\"" \
+    | sort | tail -n 1 | cut -d' ' -f2)
+  [ -n "$release_id" ] || fail "no GitHub release found for tag $TAG (set RELEASE_ID when running with a read-only token)"
+fi
 released_tag=$(gh api "repos/$REPO/releases/$release_id" --jq '.tag_name')
 [ "$released_tag" = "$TAG" ] || fail "GitHub release tag mismatch: requested $TAG, received $released_tag"
 is_draft=$(gh api "repos/$REPO/releases/$release_id" --jq '.draft')

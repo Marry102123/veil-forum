@@ -134,6 +134,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: release-build
     runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.stage_release.outputs.release_id }}
     permissions:
       contents: write
       id-token: write
@@ -160,6 +162,7 @@ jobs:
               "$blob"
           done
       - name: Stage draft GitHub Release assets
+        id: stage_release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -170,6 +173,16 @@ jobs:
             --generate-notes \
             veil-forum-*.tar.gz veil-forum-*.tar.gz.sig veil-forum-*.tar.gz.pem \
             veil-forum-*-checksums.txt veil-forum-*-checksums.txt.sig veil-forum-*-checksums.txt.pem
+          # Hand the exact draft id to the validation job. A retried tag leaves
+          # several drafts with the same tag name, and the validation job's
+          # read-only token cannot enumerate drafts at all, so it must not
+          # search for the release it is meant to verify.
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | \"\(.created_at) \(.id)\"" \
+            | sort | tail -n 1 | cut -d' ' -f2)
+          test -n "$release_id"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "staged draft release $release_id for $GITHUB_REF_NAME"
 
   release-package-e2e:
     if: startsWith(github.ref, 'refs/tags/')
@@ -180,6 +193,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ github.ref_name }}
+      # The exact draft created by stage-release. A read-only workflow token
+      # cannot enumerate drafts, so the id must be handed over explicitly.
+      RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install release E2E prerequisites
