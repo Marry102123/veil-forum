@@ -12,6 +12,7 @@
 .credentials/
 *.log
 agents.md
+AGENTS.md
 .DS_Store
 .idea/
 .vscode/
