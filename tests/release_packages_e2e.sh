@@ -203,22 +203,51 @@ gh auth status -h github.com >/dev/null 2>&1 || fail 'GitHub CLI authentication 
 
 STEP="download_release_assets"
 # The release under test is a DRAFT at this point, and `gh release download`
-# only resolves published releases (the REST by-tag endpoint returns 404 for a
-# draft). Resolve the release id through the REST list endpoint and fetch each
-# asset by its numeric asset id, which works for drafts. The published-release
-# path is unchanged because the same endpoint serves both.
+# resolves releases through the REST by-tag endpoint, which returns 404 for a
+# draft. Resolve the release id through the REST list endpoint and fetch each
+# asset by its numeric asset id, which works for drafts and for published
+# releases alike.
+#
+# A retried tag can leave more than one draft for the same tag, so select the
+# most recently created one and then require it to carry the expected assets.
+# Picking an arbitrary match would validate a stale draft.
 release_id=$(gh api "repos/$REPO/releases" --paginate \
-  --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n 1)
+  --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.created_at) \(.id)\"" \
+  | sort | tail -n 1 | cut -d' ' -f2)
 [ -n "$release_id" ] || fail "no GitHub release found for tag $TAG"
 released_tag=$(gh api "repos/$REPO/releases/$release_id" --jq '.tag_name')
 [ "$released_tag" = "$TAG" ] || fail "GitHub release tag mismatch: requested $TAG, received $released_tag"
 is_draft=$(gh api "repos/$REPO/releases/$release_id" --jq '.draft')
-printf 'release_id=%s draft=%s\n' "$release_id" "$is_draft"
+created_at=$(gh api "repos/$REPO/releases/$release_id" --jq '.created_at')
+printf 'release_id=%s draft=%s created=%s\n' "$release_id" "$is_draft" "$created_at"
 gh api "repos/$REPO/releases/$release_id/assets" --paginate --jq '.[] | "\(.id)\t\(.name)"' > "$TMP/assets.tsv"
 [ -s "$TMP/assets.tsv" ] || fail 'release contains no assets'
 cut -f2 < "$TMP/assets.tsv" > "$TMP/assets.txt"
 CHECKSUM_ASSET="veil-forum-$TAG-checksums.txt"
 grep -F -x "$CHECKSUM_ASSET" "$TMP/assets.txt" >/dev/null || fail "missing checksum asset: $CHECKSUM_ASSET"
+# Every archive must be accompanied by its signature bundle and certificate,
+# and the checksums file must list every archive. A partially uploaded draft
+# must fail here rather than be reported as a valid release.
+missing=0
+while IFS= read -r archive; do
+  name=${archive##*/}
+  for suffix in '' .sig .pem; do
+    grep -F -x "$name$suffix" "$TMP/assets.txt" >/dev/null || {
+      echo "release is missing $name$suffix" >&2
+      missing=$((missing + 1))
+    }
+  done
+done <<EOF
+$(grep -E '^veil-forum-.*\.tar\.gz$' "$TMP/assets.txt" || true)
+EOF
+for suffix in '' .sig .pem; do
+  grep -F -x "$CHECKSUM_ASSET$suffix" "$TMP/assets.txt" >/dev/null || {
+    echo "release is missing $CHECKSUM_ASSET$suffix" >&2
+    missing=$((missing + 1))
+  }
+done
+[ "$missing" -eq 0 ] || fail "release assets are incomplete: $missing expected file(s) absent"
+record assets_complete passed 'every archive and the checksum file has a signature bundle and certificate'
 record checksums_asset_present passed 'required checksum asset was published'
 
 while IFS="$(printf '\t')" read -r asset_id asset; do
