@@ -202,21 +202,36 @@ fi
 gh auth status -h github.com >/dev/null 2>&1 || fail 'GitHub CLI authentication failed'
 
 STEP="download_release_assets"
-released_tag=$(gh release view "$TAG" --repo "$REPO" --json tagName --jq '.tagName')
+# The release under test is a DRAFT at this point, and `gh release download`
+# only resolves published releases (the REST by-tag endpoint returns 404 for a
+# draft). Resolve the release id through the REST list endpoint and fetch each
+# asset by its numeric asset id, which works for drafts. The published-release
+# path is unchanged because the same endpoint serves both.
+release_id=$(gh api "repos/$REPO/releases" --paginate \
+  --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n 1)
+[ -n "$release_id" ] || fail "no GitHub release found for tag $TAG"
+released_tag=$(gh api "repos/$REPO/releases/$release_id" --jq '.tag_name')
 [ "$released_tag" = "$TAG" ] || fail "GitHub release tag mismatch: requested $TAG, received $released_tag"
-gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' > "$TMP/assets.txt"
-[ -s "$TMP/assets.txt" ] || fail 'release contains no assets'
+is_draft=$(gh api "repos/$REPO/releases/$release_id" --jq '.draft')
+printf 'release_id=%s draft=%s\n' "$release_id" "$is_draft"
+gh api "repos/$REPO/releases/$release_id/assets" --paginate --jq '.[] | "\(.id)\t\(.name)"' > "$TMP/assets.tsv"
+[ -s "$TMP/assets.tsv" ] || fail 'release contains no assets'
+cut -f2 < "$TMP/assets.tsv" > "$TMP/assets.txt"
 CHECKSUM_ASSET="veil-forum-$TAG-checksums.txt"
 grep -F -x "$CHECKSUM_ASSET" "$TMP/assets.txt" >/dev/null || fail "missing checksum asset: $CHECKSUM_ASSET"
 record checksums_asset_present passed 'required checksum asset was published'
 
-while IFS= read -r asset; do
+while IFS="$(printf '\t')" read -r asset_id asset; do
   case "$asset" in
     ''|*[!A-Za-z0-9._-]*) fail "unsafe release asset name: $asset" ;;
   esac
   printf 'Downloading %s\n' "$asset"
-  gh release download "$TAG" --repo "$REPO" --pattern "$asset" --dir "$DOWNLOAD"
-done < "$TMP/assets.txt"
+  # Redirect to a temporary name first so a failed transfer never leaves a
+  # partial file that a later checksum pass could read.
+  gh api -H 'Accept: application/octet-stream' \
+    "repos/$REPO/releases/assets/$asset_id" > "$DOWNLOAD/.partial"
+  mv "$DOWNLOAD/.partial" "$DOWNLOAD/$asset"
+done < "$TMP/assets.tsv"
 record assets_download passed 'all published release assets downloaded'
 
 for asset in "$DOWNLOAD"/*; do
