@@ -15,24 +15,32 @@ last two, and CI builds the archives from the tag.
    `cargo fmt --all -- --check`,
    `DATABASE_URL=postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test cargo test --all-targets`,
    `cargo clippy --all-targets --all-features`, `tests/scripts.sh`, `tests/deploy-scripts.sh`,
-   and `sh tests/backup_upgrade_e2e.sh` (requires PostgreSQL tools and passwordless
+   `tests/startup-smoke.sh` (same `DATABASE_URL`; it starts the release binary,
+   checks `/healthz`, the redacted banner, SIGTERM, and refusal of a non-loopback
+   listener, and writes `target/startup-smoke-report.json`),
+   `cargo audit --ignore RUSTSEC-2023-0071`, `cargo deny check`, and
+   `sh tests/backup_upgrade_e2e.sh` (requires PostgreSQL tools and passwordless
    `sudo`). The `#[sqlx::test]` suites require `DATABASE_URL`; the backup E2E
    invokes sudo with explicit non-interactive environment arguments and does
    not depend on ordinary shell variables being inherited.
 4. Sanity-check the new scripts' help: `scripts/install.sh --help`,
    `scripts/upgrade.sh --help`, `scripts/rollback.sh --help`.
+5. Optionally capture a latency baseline against a running instance with
+   `BASE_URL=<url> REPEATS=25 tests/performance-baseline.sh`. It writes
+   `target/performance-baseline-report.json` and records no credentials, so it
+   is safe to attach to a release note.
 
 ## Tag and publish
 
-5. Commit, then tag: `git tag v<VERSION>` (annotated tags are fine too).
-6. Push the branch and the tag. CI runs `verify` first, then
+6. Commit, then tag: `git tag v<VERSION>` (annotated tags are fine too).
+7. Push the branch and the tag. CI runs `verify` first, then
    `release-build` cross-compiles every target, and `stage-release` signs and
    uploads all payloads to a **draft** release. `stage-release` has only
    `contents:write` and `id-token:write`. It uses keyless Sigstore/cosign, not
    a repository-held key, and produces a `.sig` bundle and `.pem` Fulcio
    certificate for every archive and for the checksums file. `release-build`
    is read-only and cannot publish or change actions.
-7. The tag-only `release-package-e2e` job downloads and exercises those draft
+8. The tag-only `release-package-e2e` job downloads and exercises those draft
    assets with `RELEASE_TAG=v<VERSION> RELEASE_REPO=OWNER/REPO
    sh tests/release_packages_e2e.sh` and `GH_TOKEN` set. It covers
    authentication/tag/asset lookup, checksum and archive safety, target/ELF
@@ -51,19 +59,19 @@ last two, and CI builds the archives from the tag.
    `target/release-packages-e2e-report.json` and
    `target/release-packages-e2e-logs/`. This job is absent from ordinary branch
    and pull-request CI, so those runs never depend on release assets.
-8. Only after that E2E passes does `finalize-release` publish the draft with
+9. Only after that E2E passes does `finalize-release` publish the draft with
    `contents:write` only. A failed validation leaves the release as a draft
    rather than exposing unsigned or unverified assets.
 
 ## Smoke-test the upgrade path
 
-9. After the draft becomes public, download one archive (at least
+10. After the draft becomes public, download one archive (at least
    `x86_64-unknown-linux-musl`) and its `.sig` and `.pem` files. Repeat the
    verification locally:
    `cosign verify-blob --certificate-identity-regexp '^https://github.com/Marry102123/veil-forum/\.github/workflows/ci\.yml@refs/tags/v<VERSION>$' --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate <archive>.pem --bundle <archive>.sig <archive>`.
    Also run `sha256sum -c veil-forum-*-checksums.txt` and confirm the archive
    contains `veil-forum`, `deploy/veil-forum.service`, and `static/style.css`.
-10. On a scratch host or VM with the previous release installed, put the
+11. On a scratch host or VM with the previous release installed, put the
    downloaded `.sig` and `.pem` files for the selected archive and checksum
    file in one directory. Configure a mode 600 age recipient file, then name
    exactly one archive and run:
@@ -72,9 +80,9 @@ last two, and CI builds the archives from the tag.
    Actions workflow identity, exact repository/tag, and OIDC issuer before
    the archive is unpacked. `--no-checksum-verify` remains available, but it
    never disables signatures. `cosign` is required.
-11. Confirm `/healthz` says `ok`, the banner shows the new version, and a
+12. Confirm `/healthz` says `ok`, the banner shows the new version, and a
    rollback snapshot exists under `/var/lib/veil-forum/rollback/`.
-12. Optionally exercise `sudo scripts/rollback.sh` and re-upgrade, so both
+13. Optionally exercise `sudo scripts/rollback.sh` and re-upgrade, so both
     directions are proven before operators follow.
 
 ## Backup, upgrade, and rollback E2E evidence

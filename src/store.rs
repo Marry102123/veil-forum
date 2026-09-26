@@ -1684,8 +1684,12 @@ impl Store {
         user_id: i64,
         since: DateTime<Utc>,
     ) -> anyhow::Result<i64> {
+        // `SUM(bigint)` returns NUMERIC in PostgreSQL, which sqlx cannot decode
+        // into an i64, so the previous query failed on every call and the
+        // caller silently read the error as "no failed attempts". Cast in SQL
+        // instead of decoding NUMERIC so the per-account limit actually works.
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(attempts), 0) FROM pending_logins \
+            "SELECT COALESCE(SUM(attempts), 0)::bigint FROM pending_logins \
              WHERE user_id=$1 AND created_at > $2",
         )
         .bind(user_id)

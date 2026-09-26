@@ -11,6 +11,39 @@
 - 每次 E2E 验证结束时，生成一个可验证、可重复的产物，例如带版本、时间、输入摘要、结果和日志位置的报告或归档。产物不得包含密码、Token、私钥或其他凭证，并应能由同一条命令重新生成和校验。
 - 测试命令、依赖服务、清理步骤和产物校验方式必须写入项目文档或 CI，避免只能由原作者复现。
 
+### 本地验证环境
+
+- 本地 PostgreSQL 通过 Unix socket 位于 `/var/run/postgresql`；本机 OS 用户
+  对应的数据库角色需要 `CREATEDB`，`sqlx::test` 才能为每个用例创建隔离数据库。
+- 验证用的临时数据库在用完后用
+  `sudo -n -u postgres psql -c 'DROP DATABASE IF EXISTS <name>'` 清理。
+- E2E 报告与基线产物一律写入 `target/`，不进入版本库。
+
+### 构建产物位置
+
+- 本机 Rust 构建产物**不落在仓库的 `target/`**，而是写到外部 USB 硬盘
+  `/mnt/newsmy/rust-build/target`（466G NTFS，标签 Newsmy，源自 `sys-usb:sda2`）。
+  根分区只有 28G，构建留在上面会撑爆。
+- 生效机制是 **`~/.cargo/config.toml` 的 `build.target-dir`**，这是权威来源。
+  它由 cargo 在任何进程里读取，**不依赖 shell 环境**，因此 cron、systemd、
+  非登录 shell（`bash -c`）同样生效。不要只靠 `CARGO_TARGET_DIR`：它只在
+  登录/交互 shell 里存在，其他执行方式会静默退回仓库内的 `target/`。
+  `~/.bashrc` 与 `~/.profile` 里的 `CARGO_TARGET_DIR` 仅作为可见性便利保留。
+- `~/bin/mount-newsmy.sh` 负责重新附加块设备并挂载；Qubes 在 VM 重启后会丢弃
+  设备附加，shell 启动时经 `~/.config/rust-newsmy.sh` 自动恢复挂载并导出环境变量。
+  重新附加走 `qac`（AppVM 内没有 `qvm-device`），失败时脚本会打印 dom0 侧的
+  `qvm-device block attach` 恢复命令。挂载点存在但未挂载时，先跑该脚本再编译。
+- 校验当前构建去向（**不要只看环境变量**）：
+  `cargo metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"'`
+  应为 `/mnt/newsmy/rust-build/target`。
+- 某个项目若自带 `.cargo/config.toml` 且含 `build.target-dir`，它**优先于**
+  `~/.cargo/config.toml`，需单独改。
+- 不要把仓库里的 `target/` 目录 `mv` 到该挂载点：NTFS 是 fuse（ntfs-3g），
+  跨文件系统 `mv` 会退化成逐文件复制，几 GB 的构建树要几分钟且中途失败会留下
+  半份副本。要腾地方就删掉重建。
+
+
+
 ## 工作流
 
 - 修改测试后运行格式检查、静态检查和与变更相关的 E2E 验证，并检查最终差异中是否残留低价值单元测试。

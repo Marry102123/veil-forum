@@ -34,6 +34,13 @@ pub struct PendingQuery {
 }
 
 /// Is the TOTP feature offered by this deployment?
+///
+/// The `!= Some("0")` comparison is deliberate in the fail-closed direction: an
+/// unreadable key reads as "offered", not "off". The login path uses this to
+/// decide whether a password step may complete without a second factor, so
+/// treating a storage error as "off" would let a database outage silently turn
+/// a two-factor login into a password-only one. `middleware::totp_policy_gate`
+/// answers 503 for the same key, so the two agree during an outage.
 pub async fn feature_enabled(store: &crate::store::Store) -> bool {
     store.get_config_opt(TOTP_FEATURE_KEY).await.as_deref() != Some("0")
 }
@@ -44,32 +51,6 @@ pub async fn policy(store: &crate::store::Store) -> String {
         .get_config_opt(TOTP_POLICY_KEY)
         .await
         .unwrap_or_else(|| "none".to_string())
-}
-
-/// Does the policy require this account to have a second factor?
-pub async fn policy_applies(store: &crate::store::Store, user: &crate::store::User) -> bool {
-    if !feature_enabled(store).await {
-        return false;
-    }
-    match policy(store).await.as_str() {
-        "all" => true,
-        "staff" => {
-            user.is_admin
-                || store
-                    .user_has_role(user.id, crate::store::Role::Admin)
-                    .await
-                    .unwrap_or(false)
-                || store
-                    .user_has_role(user.id, crate::store::Role::Owner)
-                    .await
-                    .unwrap_or(false)
-                || store
-                    .user_has_role(user.id, crate::store::Role::Moderator)
-                    .await
-                    .unwrap_or(false)
-        }
-        _ => false,
-    }
 }
 
 /// Version of the policy as a stable identifier for the settings form.
@@ -795,9 +776,14 @@ pub async fn account_totp_confirm(
     let code = form.get("code").cloned().unwrap_or_default();
     let state = match s.store.totp_state(user.id).await {
         Ok(state) => state,
-        Err(_) => {
+        Err(_error) => {
+            tracing::error!(
+                operation = "totp_disable",
+                error_chain_kind = "database_error",
+                "second-factor state unavailable"
+            );
             return apply_sec(
-                (StatusCode::INTERNAL_SERVER_ERROR, "state unavailable").into_response(),
+                (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),
             );
         }
     };
@@ -882,9 +868,14 @@ pub async fn account_totp_disable(
     // Fail closed: a storage error must not look like "no factor configured".
     let state = match s.store.totp_state(user.id).await {
         Ok(state) => state,
-        Err(_) => {
+        Err(_error) => {
+            tracing::error!(
+                operation = "totp_recovery_codes",
+                error_chain_kind = "database_error",
+                "second-factor state unavailable"
+            );
             return apply_sec(
-                (StatusCode::INTERNAL_SERVER_ERROR, "state unavailable").into_response(),
+                (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),
             );
         }
     };
@@ -964,14 +955,21 @@ pub async fn account_recovery_regenerate(
     if !confirm_password(&s, &user, &form).await {
         return apply_sec(Redirect::to("/account?err=bad_password").into_response());
     }
-    if !s
-        .store
-        .totp_state(user.id)
-        .await
-        .unwrap_or_default()
-        .is_active()
-    {
-        return apply_sec(Redirect::to("/account?err=feature_off").into_response());
+    match s.store.totp_state(user.id).await {
+        Ok(state) if state.is_active() => {}
+        Ok(_) => {
+            return apply_sec(Redirect::to("/account?err=feature_off").into_response());
+        }
+        Err(_error) => {
+            tracing::error!(
+                operation = "account_recovery_regenerate",
+                error_chain_kind = "database_error",
+                "second-factor state unavailable"
+            );
+            return apply_sec(
+                (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),
+            );
+        }
     }
     let codes = crate::totp::generate_recovery_codes();
     let hashes: Vec<String> = codes
@@ -1087,12 +1085,26 @@ pub async fn login_totp_post(
     // password holder can open a fresh attempt (and five new guesses) as often
     // as the global authentication limiter allows.
     let since = chrono::Utc::now() - chrono::Duration::minutes(TOTP_ATTEMPT_WINDOW_MINUTES);
-    if s.store
-        .recent_failed_totp_attempts(user.id, since)
-        .await
-        .unwrap_or(0)
-        >= TOTP_ACCOUNT_ATTEMPT_LIMIT
-    {
+    // Fail closed: a counter read that fails must not silently reopen the
+    // per-account second-factor guessing budget.
+    let recent_failures = match s.store.recent_failed_totp_attempts(user.id, since).await {
+        Ok(count) => count,
+        Err(_error) => {
+            tracing::error!(
+                operation = "login_totp_post",
+                error_chain_kind = "database_error",
+                "second-factor attempt counter unavailable"
+            );
+            return apply_sec(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "second-factor attempt counter unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
+    if recent_failures >= TOTP_ACCOUNT_ATTEMPT_LIMIT {
         let _ = s
             .store
             .audit(
@@ -1115,7 +1127,23 @@ pub async fn login_totp_post(
                 .into_response(),
         );
     }
-    let state = s.store.totp_state(user.id).await.unwrap_or_default();
+    let state = match s.store.totp_state(user.id).await {
+        Ok(state) => state,
+        Err(_error) => {
+            tracing::error!(
+                operation = "login_totp_post",
+                error_chain_kind = "database_error",
+                "second-factor state unavailable"
+            );
+            return apply_sec(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "second-factor state unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
     let Some(secret) = state.secret.as_deref().filter(|_| state.is_active()) else {
         // The factor disappeared mid-login; treat it as a failed attempt.
         let _ = s.store.fail_pending_login(&pending_id).await;
@@ -1207,7 +1235,26 @@ pub async fn login_totp_post(
                 .into_response(),
         ),
         _ => {
-            let attempts = s.store.fail_pending_login(&pending_id).await.unwrap_or(0);
+            // A genuine storage failure must not reset the per-attempt budget
+            // to zero, but a rejected code is not a storage failure: the
+            // counter still has to be spent and the form has to be redisplayed.
+            let attempts = match s.store.fail_pending_login(&pending_id).await {
+                Ok(attempts) => attempts,
+                Err(_error) => {
+                    tracing::error!(
+                        operation = "login_totp_post",
+                        error_chain_kind = "database_error",
+                        "second-factor attempt counter unavailable"
+                    );
+                    return apply_sec(
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "second-factor attempt counter unavailable",
+                        )
+                            .into_response(),
+                    );
+                }
+            };
             let _ = s
                 .store
                 .audit(

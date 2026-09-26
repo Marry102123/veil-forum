@@ -124,7 +124,13 @@ STATE="$TMP/state"
 BACKUPS="$TMP/backups"
 ROLLBACK="$STATE/rollback"
 LOGDIR="$TMP/logs"
-BIN_SRC="$ROOT/target/debug/veil-forum"
+# Resolve the build directory through cargo rather than assuming "$ROOT/target".
+# A `build.target-dir` in a cargo config moves the binary elsewhere, and a
+# hard-coded path then reports a false failure.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n 1)
+[ -n "$TARGET_DIR" ] || TARGET_DIR="$ROOT/target"
+BIN_SRC="$TARGET_DIR/debug/veil-forum"
 
 cleanup() {
   status=$?

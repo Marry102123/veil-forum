@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.1.0-alpha.21
+
+**Reliability and verification release.** No password-hash change and no
+configuration key change: an existing database keeps working and existing
+accounts keep their credentials. The only schema change is a new index added by
+`migrations/0005_post_cooldown_index.sql`, so an already-migrated database keeps
+its data and gains one index on first start. Operators should read the new
+"HTTP 503" section in `docs/operations.md`: the forum now refuses requests while
+the database is unavailable instead of continuing as if a feature were off.
+
+### Fail-closed policy and session handling
+
+- The TOTP policy gate, the maintenance gate, and the account recovery and
+  second-step login paths now distinguish "the database answered" from "the
+  database failed". A failed policy, feature, role, session, or second-factor
+  state read answers `503` instead of silently continuing as if the setting
+  were off, as if the account held no role, or as if the request were a guest.
+- Storage failures now answer `503` consistently across the whole application.
+  The login flow and the second-factor management paths previously answered
+  `500` for the same class of failure, which left an operator unable to tell a
+  dependency outage from a bug in the service.
+- Role management fails closed as well: a storage error while checking whether
+  the target holds the owner role, or while checking a grant target's second
+  factor, answers `503` instead of reading the error as "not an owner" or "no
+  second factor".
+- The second-factor guess budget fails closed: a failed attempt-counter read or
+  write answers `503` instead of resetting the per-account or per-pending-login
+  counter to zero.
+- Reporting is fail-closed end to end. The feature flag, the report target
+  lookup, and the report write each answer `503` on a storage error. The write
+  previously redirected to the thread as if the report had been filed, so a
+  failed insert silently dropped a moderation report while telling the reporter
+  it was received. A missing target still answers `404`, so a reporter can tell
+  "gone" from "try again later".
+- The maintenance check inside the login flow now uses a strict read that
+  matches the middleware gate. A failing read used to be treated as
+  "maintenance is off", so the login form could admit members while the gate
+  was already refusing the same key.
+- `docs/operations.md` documents the `503` behavior, the
+  `error_chain_kind = "database_error"` log field, and the recovery steps, and
+  corrects the database role in its `ALTER ROLE` example to `veil-forum`.
+- Gate logging records a stable error class only, so database error text never
+  reaches the JSON log stream, and the gate reads the policy once per request
+  instead of twice.
+
+### Fixed: the sidebar recent-threads list cost one query per row
+
+The sidebar fetched author and board details for the five most recent threads
+with one query per row, five extra round-trips on every page render. The list is
+now a single JOIN query, and it also excludes soft-deleted threads, which the old
+per-row query could surface.
+
+### Fixed: the per-account second-factor guess limit never applied
+
+`recent_failed_totp_attempts` selected `COALESCE(SUM(attempts), 0)`, which
+PostgreSQL returns as `NUMERIC`, so decoding it into `i64` failed on every call.
+The caller read that error as "no failed attempts", so the per-account guess
+limit added in `0.1.0-alpha.18` never took effect. The query now casts to
+`bigint` in SQL, the counter read fails closed with `503` instead of `0`, and
+the two-step login and code-reuse end-to-end tests cover the path again.
+
+### Fixed: the sidebar reply count was always zero
+
+The same decode mismatch also affected the sidebar statistics panel, which
+selected `COALESCE(SUM(reply_count), 0)` and discarded the failed decode with
+`if let Ok(row)`, so the visible "Replies" figure stayed at 0 on every page
+render. The query now casts to `bigint` in SQL.
+
+### Fixed: the per-account posting cooldown scanned the whole posts table
+
+The cooldown read the most recent non-anonymous post for the author, and
+`posts` had no index to serve it, so every submission paid a parallel sequential
+scan. The new partial index in `migrations/0005_post_cooldown_index.sql` makes
+it an index-only scan and keeps anonymous posts out of the index, since the
+cooldown must not consider them.
+
+### Fixed: the startup smoke test assumed the build lived in ./target
+
+`tests/startup-smoke.sh` looked for the release binary at
+`$ROOT/target/release/veil-forum`, and `tests/backup_upgrade_e2e.sh` looked for
+the debug binary at `$ROOT/target/debug/veil-forum`. Any deployment that sets a
+cargo `build.target-dir` — a normal way to keep build artifacts off a small root
+filesystem — builds the binary elsewhere, so both suites reported a false
+failure. They now resolve the directory through `cargo metadata`, and the smoke
+test fails with a clear message if the binary is still absent after a build.
+
+### Verification
+
+- `tests/totp_http_tests.rs` asserts `503` for twelve distinct storage-failure
+  paths over the real router and a real PostgreSQL, and writes
+  `target/totp-http-e2e-report.json`. Each check confirms the fault landed on
+  the statement it intends: a single unreadable configuration key is produced
+  with a row-level-security policy whose predicate raises, because a policy that
+  merely filters the row would read as "key absent" rather than "the database
+  failed". A broken write is confirmed by storing a report first and revoking
+  only `INSERT`. The artifact self-checks that its verdict follows its checks
+  and contains no credentials.
+- `tests/startup-smoke.sh` writes `target/startup-smoke-report.json` on success
+  and failure, adds a non-loopback listener refusal check, and CI uploads the
+  report.
+- `tests/performance-baseline.sh` measures `/healthz`, `/`, `/login`, and
+  `/search` against a running instance and writes
+  `target/performance-baseline-report.json` without request bodies, cookies, or
+  credentials.
+- CI pins `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2, verifies the locked
+  dependency graph, and uploads both audit reports. Earlier pins fail on
+  advisory-database entries that use CVSS 4.0.
+- The migration set is covered by an idempotency test, so re-running the
+  migrator adds no rows and creates no duplicate index.
+
+### Removed
+
+- `tests/governance_store_tests.rs` and two store-level config tests were
+  removed. Their subject matter is already asserted over real HTTP by
+  `tests/governance_e2e.rs` and `tests/config_effects_e2e.rs`. The migration
+  idempotency test and the check that a storage failure stays distinguishable
+  from a missing key are kept, because neither is observable from the HTTP
+  suites.
+
 ## 0.1.0-alpha.20
 
 **Security release.** This release hardens sessions, credentials, backups, and

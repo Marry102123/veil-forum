@@ -8,8 +8,20 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-if [ ! -x "$ROOT/target/release/veil-forum" ]; then
+# Resolve the build directory through cargo rather than assuming
+# "$ROOT/target". A `build.target-dir` in a cargo config (a common setup for
+# keeping build artifacts off a small root filesystem) moves the binary
+# elsewhere, and a hard-coded path then reports a false failure.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n 1)
+[ -n "$TARGET_DIR" ] || TARGET_DIR="$ROOT/target"
+BINARY="$TARGET_DIR/release/veil-forum"
+if [ ! -x "$BINARY" ]; then
   cargo build --release --manifest-path "$ROOT/Cargo.toml"
+fi
+if [ ! -x "$BINARY" ]; then
+  echo "error: release binary not found at $BINARY after cargo build --release" >&2
+  exit 1
 fi
 
 DATABASE_URL="${DATABASE_URL:-postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test}"
@@ -34,10 +46,20 @@ command -v psql >/dev/null 2>&1 || { echo 'error: psql is required' >&2; exit 1;
 # connection URI as a literal database name rather than a connection string.
 
 TMP=$(mktemp -d)
+REPORT="$ROOT/target/startup-smoke-report.json"
+mkdir -p "$ROOT/target"
+write_report() {
+  result=passed
+  [ "${1:-0}" -eq 0 ] || result=failed
+  printf '{"schema_version":1,"test":"startup_health_sigterm_and_database_failure","result":"%s","reproduce_command":"DATABASE_URL=<test-postgres-url> tests/startup-smoke.sh","credentials_included":false}\n' "$result" > "$REPORT.tmp"
+  mv "$REPORT.tmp" "$REPORT"
+}
 PORT=$((19000 + ($$ % 1000)))
 LOG="$TMP/server.log"
 PIDFILE="$TMP/server.pid"
 cleanup() {
+  status=$?
+  write_report "$status"
   if [ -f "$PIDFILE" ]; then kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   psql "$ADMIN_URL" -c "DROP DATABASE IF EXISTS $SMOKE_DB" >/dev/null 2>&1 || true
   rm -rf "$TMP"
@@ -46,7 +68,7 @@ trap cleanup EXIT HUP INT TERM
 
 psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE $SMOKE_DB"
 
-VEIL_ADMIN_PASSWORD='Harbor-Cedar9-Phoenix' "$ROOT/target/release/veil-forum" \
+VEIL_ADMIN_PASSWORD='Harbor-Cedar9-Phoenix' "$BINARY" \
   --addr "127.0.0.1:$PORT" --database-url "$SMOKE_URL" >"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 pid=$(cat "$PIDFILE")
@@ -68,6 +90,14 @@ done
 test "$ready" -eq 1
 test "$(cat "$TMP/healthz")" = ok
 
+# Listener policy must fail before any database connection or secret handling.
+if VEIL_ALLOW_NONLOOPBACK= "$BINARY" \
+    --addr 0.0.0.0:0 --database-url "$SMOKE_URL" >"$TMP/nonloopback.log" 2>&1; then
+  echo 'non-loopback listener was unexpectedly accepted' >&2
+  exit 1
+fi
+grep -q 'refusing non-loopback listener' "$TMP/nonloopback.log"
+
 # The startup banner must show the redacted database target, never a password.
 grep -q 'veil-forum database: postgres' "$LOG"
 
@@ -87,7 +117,7 @@ for dsn in \
   "postgres://u:p@ss${SECRET}@127.0.0.1:5599/db" \
   "host=127.0.0.1 port=5599 password=${SECRET} user=u dbname=x" \
   "postgres:///db?host=127.0.0.1&port=5599&password=${SECRET}"; do
-  if "$ROOT/target/release/veil-forum" --addr 127.0.0.1:0 --database-url "$dsn" \
+  if "$BINARY" --addr 127.0.0.1:0 --database-url "$dsn" \
       > "$TMP/redact.log" 2>&1; then
     echo "unexpected success for the unreachable database" >&2
     exit 1

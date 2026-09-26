@@ -507,9 +507,12 @@ async fn sidebar_data(
     // the maintained reply_count. Counting posts instead scaled with every post
     // in the database (covering-index scan plus a correlated subquery per row)
     // on every page render; this is O(threads).
-    if let Ok(row) = sqlx::query_as::<_, (i64,)>("SELECT COALESCE(SUM(reply_count),0) FROM threads")
-        .fetch_one(pool)
-        .await
+    // `SUM(bigint)` returns NUMERIC, which cannot be decoded into an i64, so
+    // this used to fail on every render and leave the reply count at zero.
+    if let Ok(row) =
+        sqlx::query_as::<_, (i64,)>("SELECT COALESCE(SUM(reply_count),0)::bigint FROM threads")
+            .fetch_one(pool)
+            .await
     {
         stats_posts = row.0;
     }
@@ -519,29 +522,47 @@ async fn sidebar_data(
     {
         stats_users = row.0;
     }
-    // recent 5 threads
-    let recent = {
-        let mut v = Vec::new();
-        if let Ok(rows) = sqlx::query("SELECT id, board_id, title, author_id, is_pinned, is_locked, reply_count, last_reply_at, created_at FROM threads ORDER BY last_reply_at DESC LIMIT 5").fetch_all(pool).await {
-            for r in rows {
-                use sqlx::Row;
-                let last: chrono::DateTime<chrono::Utc> = r.get("last_reply_at");
-                let created: chrono::DateTime<chrono::Utc> = r.get("created_at");
-                // fetch author_name and slug crudely
-                let tid: i64 = r.get("id");
-                let th = store.get_thread(tid).await.ok().flatten();
-                if let Some(t) = th { v.push(t); } else {
-                    v.push(crate::store::Thread{
-                        id: r.get("id"), board_id: r.get("board_id"), title: r.get("title"),
-                        author_id: r.get::<Option<i64>, _>("author_id"), is_pinned: r.get("is_pinned"), is_locked: r.get("is_locked"),
-                        reply_count: r.get("reply_count"), last_reply_at: last, created_at: created,
-                        author_name: "".to_string(), board_slug: "".to_string(),
-                    });
-                }
-            }
-        }
-        v
-    };
+    // Recent 5 threads. This used to run the bare `SELECT ... LIMIT 5` above and
+    // then call `get_thread` once per row, discarding the rows it had already
+    // fetched and paying five extra round-trips on every page render. The JOIN
+    // below reproduces `get_thread`'s author anonymisation and board slug in one
+    // statement, so a page render no longer scales with the sidebar width.
+    let recent = sqlx::query(
+        "SELECT th.id, th.board_id, th.title, th.author_id, th.is_pinned, th.is_locked, \
+                th.reply_count, th.last_reply_at, th.created_at, \
+                CASE WHEN th.author_id IS NULL OR EXISTS ( \
+                        SELECT 1 FROM posts op WHERE op.thread_id=th.id \
+                        AND op.id=(SELECT MIN(op2.id) FROM posts op2 WHERE op2.thread_id=th.id) \
+                        AND op.is_anonymous) THEN 'Anonymous' \
+                     ELSE COALESCE(u.username,'deleted') END as author_name, \
+                COALESCE(b.slug,'') as board_slug \
+         FROM threads th \
+         LEFT JOIN users u ON u.id=th.author_id \
+         LEFT JOIN boards b ON b.id=th.board_id \
+         WHERE th.deleted_at IS NULL \
+         ORDER BY th.last_reply_at DESC LIMIT 5",
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        use sqlx::Row;
+        rows.into_iter()
+            .map(|r| crate::store::Thread {
+                id: r.get("id"),
+                board_id: r.get("board_id"),
+                title: r.get("title"),
+                author_id: r.get("author_id"),
+                is_pinned: r.get("is_pinned"),
+                is_locked: r.get("is_locked"),
+                reply_count: r.get("reply_count"),
+                last_reply_at: r.get("last_reply_at"),
+                created_at: r.get("created_at"),
+                author_name: r.get("author_name"),
+                board_slug: r.get("board_slug"),
+            })
+            .collect()
+    })
+    .unwrap_or_default();
     let announcement = store
         .get_config("announcement")
         .await
@@ -1415,13 +1436,27 @@ async fn thread(
     context.insert("can_reply", &user.is_some());
     context.insert("is_admin", &is_admin);
     context.insert("can_moderate", &can_moderate);
-    let reports_enabled = s
-        .store
-        .get_config("reports_enabled")
-        .await
-        .unwrap_or(None)
-        .map(|v| v == "1")
-        .unwrap_or(true);
+    // Fail closed: a storage error must not read as "reporting is on" and offer
+    // a moderation action the forum cannot accept. The submit endpoint applies
+    // the same rule and answers 503 rather than a bare 403, so an operator can
+    // tell a dependency failure from a deliberately disabled feature.
+    let reports_enabled = match s.store.get_config("reports_enabled").await {
+        Ok(value) => value.as_deref() == Some("1"),
+        Err(_error) => {
+            tracing::error!(
+                operation = "thread_view",
+                error_chain_kind = "database_error",
+                "reporting feature state unavailable"
+            );
+            return apply_sec(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "reporting feature state unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
     context.insert("can_report", &(user.is_some() && reports_enabled));
     context.insert(
         "allow_anonymous",
@@ -2110,7 +2145,7 @@ async fn login_post(
                 Ok(hash) => hash.to_string(),
                 Err(_) => {
                     return apply_sec(
-                        (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable")
+                        (StatusCode::SERVICE_UNAVAILABLE, "login state unavailable")
                             .into_response(),
                     );
                 }
@@ -2118,9 +2153,14 @@ async fn login_post(
             let _ = crate::auth::verify_password_blocking(dummy, password).await;
             return apply_sec((StatusCode::FORBIDDEN, "invalid credentials").into_response());
         }
-        Err(_) => {
+        Err(_error) => {
+            tracing::error!(
+                operation = "login_post",
+                error_chain_kind = "database_error",
+                "account lookup unavailable"
+            );
             return apply_sec(
-                (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable").into_response(),
+                (StatusCode::SERVICE_UNAVAILABLE, "login state unavailable").into_response(),
             );
         }
     };
@@ -2132,13 +2172,27 @@ async fn login_post(
     if u.is_banned {
         return apply_sec((StatusCode::FORBIDDEN, "invalid credentials").into_response());
     }
-    if s.store
-        .get_config_opt("maintenance_enabled")
-        .await
-        .as_deref()
-        == Some("1")
-        && !u.is_admin
-    {
+    // Fail closed. A storage error must not read as "maintenance is off": the
+    // login form would admit ordinary members while the maintenance gate in
+    // middleware.rs is already answering 503 for the same key.
+    let maintenance_enabled = match s.store.get_config("maintenance_enabled").await {
+        Ok(value) => value.as_deref() == Some("1"),
+        Err(_error) => {
+            tracing::error!(
+                operation = "login_post",
+                error_chain_kind = "database_error",
+                "maintenance state unavailable"
+            );
+            return apply_sec(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "maintenance state unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
+    if maintenance_enabled && !u.is_admin {
         return apply_sec(
             (
                 StatusCode::FORBIDDEN,
@@ -2154,18 +2208,28 @@ async fn login_post(
         // into a password-only login.
         let state = match s.store.totp_state(u.id).await {
             Ok(state) => state,
-            Err(_) => {
+            Err(_error) => {
+                tracing::error!(
+                    operation = "login_post",
+                    error_chain_kind = "database_error",
+                    "second-factor state unavailable"
+                );
                 return apply_sec(
-                    (StatusCode::INTERNAL_SERVER_ERROR, "login state unavailable").into_response(),
+                    (StatusCode::SERVICE_UNAVAILABLE, "login state unavailable").into_response(),
                 );
             }
         };
         if state.is_active() {
             let pending_id = match s.store.create_pending_login(u.id).await {
                 Ok(id) => id,
-                Err(_) => {
+                Err(_error) => {
+                    tracing::error!(
+                        operation = "login_post",
+                        error_chain_kind = "database_error",
+                        "second-factor window could not be opened"
+                    );
                     return apply_sec(
-                        (StatusCode::INTERNAL_SERVER_ERROR, "login state failed").into_response(),
+                        (StatusCode::SERVICE_UNAVAILABLE, "login state failed").into_response(),
                     );
                 }
             };
@@ -2786,20 +2850,57 @@ async fn submit_report(
         Some(u) => u,
         None => return apply_sec(Redirect::to("/login").into_response()),
     };
-    let reports_enabled = state
-        .store
-        .get_config("reports_enabled")
-        .await
-        .unwrap_or(None)
-        .map(|v| v == "1")
-        .unwrap_or(true);
+    // Fail closed. Reading the error as "reporting is enabled" would let a
+    // database outage look like a working moderation queue, and answering 403
+    // would tell the reporter the feature is off when it is actually unknown.
+    let reports_enabled = match state.store.get_config("reports_enabled").await {
+        Ok(value) => value.as_deref() == Some("1"),
+        Err(_error) => {
+            tracing::error!(
+                operation = "submit_report",
+                error_chain_kind = "database_error",
+                "reporting feature state unavailable"
+            );
+            return apply_sec(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "reporting feature state unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
     if !reports_enabled {
         return apply_sec((StatusCode::FORBIDDEN, "reporting disabled").into_response());
     }
+    // A failed lookup is not the same answer as a missing target: reporting a
+    // deleted thread must answer 404, while a storage error must answer 503 so
+    // a reporter can tell "gone" from "try again later".
     let target_exists = match target_type {
-        "thread" => state.store.get_thread(id).await.ok().flatten().is_some(),
-        "post" => state.store.get_post(id).await.ok().flatten().is_some(),
-        _ => false,
+        "thread" => state
+            .store
+            .get_thread(id)
+            .await
+            .map(|found| found.is_some()),
+        "post" => state.store.get_post(id).await.map(|found| found.is_some()),
+        _ => Ok(false),
+    };
+    let target_exists = match target_exists {
+        Ok(exists) => exists,
+        Err(_error) => {
+            tracing::error!(
+                operation = "submit_report",
+                error_chain_kind = "database_error",
+                "report target lookup unavailable"
+            );
+            return apply_sec(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "report target lookup unavailable",
+                )
+                    .into_response(),
+            );
+        }
     };
     if !target_exists {
         return apply_sec((StatusCode::NOT_FOUND, "report target not found").into_response());
@@ -2808,11 +2909,13 @@ async fn submit_report(
     if reason.is_empty() || reason.chars().count() > 500 {
         return apply_sec((StatusCode::BAD_REQUEST, "report reason required").into_response());
     }
-    let ok = state
+    let stored = state
         .store
         .create_report(Some(user.id), target_type, id, reason)
-        .await
-        .is_ok();
+        .await;
+    let ok = stored.is_ok();
+    // Audit the outcome before returning, so a rejected write is still recorded
+    // even though the request now fails instead of redirecting.
     audit_admin(
         &state,
         &headers,
@@ -2822,6 +2925,22 @@ async fn submit_report(
         ok,
     )
     .await;
+    if let Err(_error) = stored {
+        // Redirecting as if the report had been filed would silently drop a
+        // moderation report while telling the reporter it was received.
+        tracing::error!(
+            operation = "submit_report",
+            error_chain_kind = "database_error",
+            "report could not be stored"
+        );
+        return apply_sec(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "report could not be stored",
+            )
+                .into_response(),
+        );
+    }
     apply_sec(Redirect::to(&redirect_to).into_response())
 }
 async fn report_thread(
@@ -2916,12 +3035,22 @@ async fn change_role(
         Some(u) => u,
         None => return apply_sec((StatusCode::FORBIDDEN, "forbidden").into_response()),
     };
-    if id == actor.id
-        || s.store
-            .user_has_role(id, crate::store::Role::Owner)
-            .await
-            .unwrap_or(false)
-    {
+    // Fail closed: a storage error must not read as "the target is not an
+    // owner", or a role change could slip past the owner protection.
+    let target_is_owner = match s.store.user_has_role(id, crate::store::Role::Owner).await {
+        Ok(is_owner) => is_owner,
+        Err(_error) => {
+            tracing::error!(
+                operation = "change_role",
+                error_chain_kind = "database_error",
+                "role state unavailable"
+            );
+            return apply_sec(
+                (StatusCode::SERVICE_UNAVAILABLE, "role state unavailable").into_response(),
+            );
+        }
+    };
+    if id == actor.id || target_is_owner {
         return apply_sec((StatusCode::FORBIDDEN, "owner role protected").into_response());
     }
     let role = match form.get("role").map(String::as_str) {
@@ -2930,12 +3059,23 @@ async fn change_role(
         _ => return apply_sec((StatusCode::BAD_REQUEST, "invalid role").into_response()),
     };
     if form.get("operation").map(String::as_str) == Some("grant")
-        && !s
-            .store
-            .totp_state(id)
-            .await
-            .map(|state| state.is_active())
-            .unwrap_or(false)
+        && match s.store.totp_state(id).await {
+            Ok(state) => !state.is_active(),
+            Err(_error) => {
+                tracing::error!(
+                    operation = "change_role",
+                    error_chain_kind = "database_error",
+                    "second-factor state unavailable"
+                );
+                return apply_sec(
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "second-factor state unavailable",
+                    )
+                        .into_response(),
+                );
+            }
+        }
     {
         return apply_sec(
             (

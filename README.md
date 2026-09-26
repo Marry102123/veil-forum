@@ -182,9 +182,31 @@ cargo clippy --all-targets --all-features
 tests/scripts.sh
 tests/deploy-scripts.sh
 sh tests/backup_upgrade_e2e.sh
+DATABASE_URL=postgres://user@%2Fvar%2Frun%2Fpostgresql/veil_forum_test \
+  tests/startup-smoke.sh
 cargo build --release
+cargo install cargo-audit --version 0.22.2 --locked
 cargo audit --ignore RUSTSEC-2023-0071
+cargo install cargo-deny --version 0.20.2 --locked
+cargo deny check
 ```
+
+`tests/performance-baseline.sh` is separate from the gate because it measures a
+running instance rather than a test harness:
+
+```bash
+BASE_URL=http://127.0.0.1:8001 REPEATS=25 tests/performance-baseline.sh
+```
+
+`cargo audit` and `cargo deny` must both be at least 0.22.2 and 0.20.2. Older
+releases cannot parse advisory-database entries that carry a CVSS 4.0 score and
+fail before scanning anything.
+
+The audit tools are pinned so a green run is reproducible. `cargo audit` scans
+the whole lockfile, which is why it still needs `--ignore RUSTSEC-2023-0071` for
+the unused `sqlx-mysql` entry; `cargo deny check` inspects the enabled feature
+graph instead and needs no exception. CI uploads both reports as
+`target/cargo-audit.txt` and `target/cargo-deny.txt` even when a check fails.
 
 `cargo test --all-targets` automatically compiles and runs Rust integration
 targets under `tests/`, including the `*_e2e.rs` suites. The `#[sqlx::test]`
@@ -193,7 +215,18 @@ current user can create disposable test databases. This command does not run
 shell E2E scripts. Each Rust E2E writes a credential-free JSON report under
 `target/` on success, error, and panic paths. CI uploads the authentication,
 configuration, forum lifecycle, governance, and search reports together with the
-backup/upgrade report and the sanitized application JSON log.
+backup/upgrade report, the startup smoke report, the sanitized application JSON
+log, and both supply-chain audit logs.
+
+`tests/startup-smoke.sh` starts the release binary against a scratch database
+and writes `target/startup-smoke-report.json` on both the success and the
+failure path. It checks the health endpoint, the redacted startup banner, the
+baseline migration, the first-run administrator, SIGTERM shutdown, refusal of a
+non-loopback listener, and that a database password never reaches the log in any
+connection-string form sqlx accepts. `tests/performance-baseline.sh` writes
+`target/performance-baseline-report.json` with per-path mean, minimum, and
+maximum latency. Neither report contains a password, cookie, request body, or
+connection string, and neither is committed: `/target` is ignored.
 
 The backup/upgrade E2E uses a real PostgreSQL server, a temporary age identity,
 and passwordless `sudo -n -u postgres`; it does not rely on sudo inheriting

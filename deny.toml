@@ -24,6 +24,10 @@ version = 2
 confidence-threshold = 0.8
 # Unicode-DFS-2016 is the permissive licence of the Unicode data tables that
 # comrak pulls in through finl_unicode.
+# MPL-2.0 is required by cssparser and dtoa-short, which ammonia pulls into the
+# normal build graph, so it must stay. cargo-deny 0.20.2 also lists it as an
+# unmatched allowance in the same run; deleting it makes `cargo deny check`
+# fail with `failed to satisfy license requirements`.
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016", "Zlib", "CC0-1.0", "AGPL-3.0-only", "MPL-2.0"]
 
 [bans]

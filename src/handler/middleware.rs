@@ -23,7 +23,27 @@ pub async fn maintenance_gate(
         || path.starts_with("/account")
         || path.starts_with("/admin")
         || path.starts_with("/governance");
-    if exempt || store.get_config_opt("maintenance_enabled").await.as_deref() != Some("1") {
+    if exempt {
+        return next.run(request).await;
+    }
+    let maintenance_enabled = match store.get_config("maintenance_enabled").await {
+        Ok(value) => value.as_deref() == Some("1"),
+        Err(_error) => {
+            tracing::error!(
+                operation = "maintenance_gate",
+                error_chain_kind = "database_error",
+                "maintenance state unavailable"
+            );
+            return apply_sec(
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "maintenance state unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
+    if !maintenance_enabled {
         return next.run(request).await;
     }
     let is_admin = match session_id(request.headers()) {
@@ -147,33 +167,126 @@ pub async fn totp_gate(
     if exempt {
         return next.run(request).await;
     }
-    let policy = store
-        .get_config_opt("totp_required")
-        .await
-        .unwrap_or_default();
-    if policy != "staff" && policy != "all" {
+    let policy = match store.get_config("totp_required").await {
+        Ok(policy) => policy,
+        Err(_error) => {
+            tracing::error!(
+                operation = "totp_policy_gate",
+                error_chain_kind = "database_error",
+                "TOTP policy unavailable"
+            );
+            return apply_sec(
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "second-factor policy unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
+    if !matches!(policy.as_deref(), Some("staff") | Some("all")) {
         return next.run(request).await;
     }
     // The session cookie must be read exactly the way the handlers read it,
     // otherwise a request can look signed out to this gate and signed in to the
     // handler it guards.
-    let Some(user) = (match session_id(request.headers()) {
-        Some(sid) => store.get_user_by_session(&sid).await.ok().flatten(),
-        None => None,
-    }) else {
-        // Guests are handled by the individual handlers.
-        return next.run(request).await;
+    let user = match session_id(request.headers()) {
+        Some(sid) => match store.get_user_by_session(&sid).await {
+            Ok(Some(user)) => user,
+            Ok(None) => {
+                // Guests are handled by the individual handlers.
+                return next.run(request).await;
+            }
+            Err(_error) => {
+                tracing::error!(
+                    operation = "totp_policy_gate",
+                    error_chain_kind = "database_error",
+                    "session state unavailable"
+                );
+                return apply_sec(
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "session state unavailable",
+                    )
+                        .into_response(),
+                );
+            }
+        },
+        None => return next.run(request).await,
     };
-    if !crate::handler::account::policy_applies(&store, &user).await {
+    let feature_enabled = match store.get_config("totp_enabled").await {
+        Ok(value) => value.as_deref() != Some("0"),
+        Err(_error) => {
+            tracing::error!(
+                operation = "totp_policy_gate",
+                error_chain_kind = "database_error",
+                "TOTP feature state unavailable"
+            );
+            return apply_sec(
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "second-factor policy unavailable",
+                )
+                    .into_response(),
+            );
+        }
+    };
+    if !feature_enabled {
         return next.run(request).await;
     }
-    if store
-        .totp_state(user.id)
-        .await
-        .map(|state| state.is_active())
-        .unwrap_or(false)
-    {
+    let staff_member = if user.is_admin || policy.as_deref() == Some("all") {
+        true
+    } else {
+        let mut found = false;
+        for role in [
+            crate::store::Role::Admin,
+            crate::store::Role::Owner,
+            crate::store::Role::Moderator,
+        ] {
+            match store.user_has_role(user.id, role).await {
+                Ok(true) => {
+                    found = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(_error) => {
+                    tracing::error!(
+                        operation = "totp_policy_gate",
+                        error_chain_kind = "database_error",
+                        "TOTP role state unavailable"
+                    );
+                    return apply_sec(
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "second-factor policy unavailable",
+                        )
+                            .into_response(),
+                    );
+                }
+            }
+        }
+        found
+    };
+    if !staff_member {
         return next.run(request).await;
+    }
+    match store.totp_state(user.id).await {
+        Ok(state) if state.is_active() => return next.run(request).await,
+        Ok(_) => {}
+        Err(_error) => {
+            tracing::error!(
+                operation = "totp_policy_gate",
+                error_chain_kind = "database_error",
+                "TOTP policy state unavailable"
+            );
+            return apply_sec(
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "second-factor state unavailable",
+                )
+                    .into_response(),
+            );
+        }
     }
     if path.starts_with("/admin") || path.starts_with("/governance") {
         return apply_sec(

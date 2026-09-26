@@ -366,6 +366,76 @@ malformed legacy row rolled back rather than leaving a half-filled database.
   in the administration workspace. Rollback snapshots live in
   `/var/lib/veil-forum/rollback/` with a `VERSION` file each.
 
+### HTTP 503: the database did not answer
+
+A `503` from the forum means a database read or write failed. It does not mean a
+feature was switched off, that a user holds no role, or that a request was
+treated as a guest. Those situations are answers the database *gave*; a `503`
+means the database gave nothing. The affected paths include the TOTP and
+maintenance gates, the login flow, report submission, role management, and
+account recovery and second-factor management.
+
+This is deliberate fail-closed behavior. When the forum cannot confirm a policy,
+a role, or a second-factor state, it refuses the request instead of serving
+degraded or unauthenticated content. Do not work around a `503` by loosening the
+gate.
+
+Every such response logs a stable error class and nothing else:
+
+```text
+operation = "maintenance_gate" error_chain_kind = "database_error"
+```
+
+The log deliberately carries no SQL text, no statement parameters, and no
+credentials; `error_chain_kind` is a fixed label that separates a storage failure
+from other error classes, and `database_error` is currently its only value on this
+path. Filter on the operation name together with it:
+
+```bash
+sudo journalctl -u veil-forum | grep error_chain_kind
+```
+
+Recovery:
+
+```bash
+# 1. Is PostgreSQL running and is the schema present?
+sudo scripts/db-maintenance.sh check
+
+# 2. Same check against the exact connection string the unit uses.
+sudo scripts/db-maintenance.sh check postgres://veil-forum@%2Fvar%2Frun%2Fpostgresql/veil_forum
+
+# 3. If the service stopped, clear the failed unit state and start it.
+sudo systemctl reset-failed veil-forum
+sudo systemctl restart veil-forum
+```
+
+`check` verifies connectivity and that the public schema has tables, then runs
+`pg_amcheck` when it is installed. If `check` succeeds but requests still answer
+`503`, the pool is timing out or has been closed rather than the database being
+unreachable, so the `503` carries the same `error_chain_kind = "database_error"`
+label and the journal timestamp is what separates the two cases. `/healthz` and
+the exempt maintenance paths stay reachable while the forum itself is refusing
+requests, so the service is not down in that state.
+
+### Latency baseline
+
+`tests/performance-baseline.sh` measures the public HTTP entry points of a
+*running* instance. It takes no credentials and makes no authenticated request:
+
+```bash
+BASE_URL=http://127.0.0.1:8001 REPEATS=25 tests/performance-baseline.sh
+```
+
+`BASE_URL` defaults to `http://127.0.0.1:8001` and `REPEATS` to `10`. The script
+measures `/healthz`, `/`, `/login`, and `/search?q=veil`, then writes
+`target/performance-baseline-report.json` with `schema_version`, the `base_url`,
+the repeat count, an overall `result` of `passed` or `failed`, and per-path
+`samples`, `mean_seconds`, `min_seconds`, and `max_seconds`. It exits non-zero if
+any path could not be measured. The report records no request bodies, cookies,
+headers, or credentials, and the report file is written under `target/`, which is
+ignored by git. Run it against a disposable deployment, since the login probe is
+a deliberate failure used only to time a public form.
+
 ## CI prerequisites for encrypted backups
 
 CI 必须显式安装 age（Debian/Ubuntu 通常为 `apt-get install age`）。若发行版
@@ -375,5 +445,5 @@ CI 必须显式安装 age（Debian/Ubuntu 通常为 `apt-get install age`）。�
 数据库服务角色必须是 `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
 NOREPLICATION NOBYPASSRLS`。安装器创建这些属性，并在重装时复核。发现既有
 高权限角色时安装器明确失败，不会修改密码或自动降权。管理员审查
-`pg_roles` 后应显式执行 `ALTER ROLE veil_forum LOGIN NOSUPERUSER NOCREATEDB
+`pg_roles` 后应显式执行 `ALTER ROLE veil-forum LOGIN NOSUPERUSER NOCREATEDB
 NOCREATEROLE NOREPLICATION NOBYPASSRLS`，确认对象所有权需求后再重跑。
