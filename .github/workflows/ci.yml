@@ -62,6 +62,21 @@ jobs:
             target/backup-upgrade-e2e-report.json
             target/startup-smoke-report.json
             target/totp-http-e2e-report.json
+      - name: Cache the pinned audit tools
+        # `cargo install` compiles cargo-audit and cargo-deny from source, which
+        # is most of this job's runtime. rust-cache cannot help with that: its
+        # key follows Cargo.lock, and every dependency PR changes that file. The
+        # two tools are pinned by version, so they are cached under a key that
+        # changes only when a pin below changes, and the install steps then
+        # report them as already installed instead of rebuilding them.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: audit-tools-${{ runner.os }}-cargo-audit-0.22.2-cargo-deny-0.20.2
       - name: Install pinned cargo-audit
         # Pinned for reproducibility, but not older than this: rustsec advisory
         # entries using CVSS 4.0 fail to parse in cargo-audit <= 0.21.2, and the
