@@ -211,10 +211,14 @@ graph instead and needs no exception. CI uploads both reports as
 `cargo test --all-targets` automatically compiles and runs Rust integration
 targets under `tests/`, including the `*_e2e.rs` suites. The `#[sqlx::test]`
 suites require `DATABASE_URL` to point at a PostgreSQL database for which the
-current user can create disposable test databases. This command does not run
-shell E2E scripts. Each Rust E2E writes a credential-free JSON report under
-`target/` on success, error, and panic paths. CI uploads the authentication,
-configuration, forum lifecycle, governance, and search reports together with the
+current user can create disposable test databases. That role must not be a
+superuser: the fail-closed suite revokes a privilege from the role its own pool
+authenticates as, and a superuser bypasses privilege checks, so the check fails
+closed (with a message naming the role) rather than passing without proving
+anything. This command does not run shell E2E scripts. Each Rust E2E writes a
+credential-free JSON report under `target/` on success, error, and panic paths.
+CI uploads the authentication, configuration, forum lifecycle, governance, and
+search reports together with the
 backup/upgrade report, the startup smoke report, the sanitized application JSON
 log, and both supply-chain audit logs.
 

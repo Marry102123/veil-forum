@@ -9,8 +9,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/veil_forum_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
@@ -23,9 +21,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql postgresql-client binutils age
           sudo systemctl start postgresql
-          sudo -u postgres psql -v ON_ERROR_STOP=1 \
-            -c "ALTER ROLE postgres PASSWORD 'postgres'" \
-            -c "CREATE DATABASE veil_forum_test"
+      - name: Create the least-privilege test role and database
+        # The fault-injection suites prove fail-closed behaviour by revoking a
+        # privilege from the role the pool authenticates as, and a superuser
+        # bypasses privilege checks, so the suite must run as a non-superuser:
+        # LOGIN plus CREATEDB for the disposable databases it creates, and
+        # nothing else. Over the Unix socket, peer authentication maps the
+        # runner's OS user to that role, so the URL carries no password and no
+        # password literal is needed here.
+        run: |
+          sudo -u postgres createuser --createdb --no-superuser "$USER"
+          sudo -u postgres createdb -O "$USER" veil_forum_test
+          echo "DATABASE_URL=postgres://$USER@%2Fvar%2Frun%2Fpostgresql/veil_forum_test" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - name: Verify locked dependency graph
         run: cargo metadata --locked --no-deps --format-version 1
