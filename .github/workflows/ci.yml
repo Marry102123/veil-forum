@@ -48,7 +48,7 @@ jobs:
         run: tests/startup-smoke.sh
       - name: Run real backup, upgrade, and rollback E2E
         run: sh tests/backup_upgrade_e2e.sh
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: rust-e2e-reports
@@ -80,7 +80,7 @@ jobs:
           set -o pipefail
           cargo deny --version
           cargo deny check | tee target/cargo-deny.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: supply-chain-audit
@@ -156,7 +156,7 @@ jobs:
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/veil-forum"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/deploy/veil-forum.service"
           tar -tzf "$archive" | grep -Fx "veil-forum-${GITHUB_REF_NAME}/static/style.css"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: veil-forum-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
@@ -241,7 +241,7 @@ jobs:
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       - name: Verify published GitHub Release packages
         run: tests/release_packages_e2e.sh
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: release-packages-e2e-report
