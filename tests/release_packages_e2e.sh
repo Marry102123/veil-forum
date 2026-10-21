@@ -232,13 +232,15 @@ gh api "repos/$REPO/releases/$release_id/assets" --paginate --jq '.[] | "\(.id)\
 cut -f2 < "$TMP/assets.tsv" > "$TMP/assets.txt"
 CHECKSUM_ASSET="veil-forum-$TAG-checksums.txt"
 grep -F -x "$CHECKSUM_ASSET" "$TMP/assets.txt" >/dev/null || fail "missing checksum asset: $CHECKSUM_ASSET"
-# Every archive must be accompanied by its signature bundle and certificate,
-# and the checksums file must list every archive. A partially uploaded draft
-# must fail here rather than be reported as a valid release.
+# Every archive must be accompanied by its Sigstore signature bundle, and the
+# checksums file must list every archive. A partially uploaded draft must fail
+# here rather than be reported as a valid release. The bundle is
+# self-contained: cosign 3.x carries the Fulcio certificate inside it, so there
+# is no separate .pem asset to require.
 missing=0
 while IFS= read -r archive; do
   name=${archive##*/}
-  for suffix in '' .sig .pem; do
+  for suffix in '' .sig; do
     grep -F -x "$name$suffix" "$TMP/assets.txt" >/dev/null || {
       echo "release is missing $name$suffix" >&2
       missing=$((missing + 1))
@@ -247,14 +249,14 @@ while IFS= read -r archive; do
 done <<EOF
 $(grep -E '^veil-forum-.*\.tar\.gz$' "$TMP/assets.txt" || true)
 EOF
-for suffix in '' .sig .pem; do
+for suffix in '' .sig; do
   grep -F -x "$CHECKSUM_ASSET$suffix" "$TMP/assets.txt" >/dev/null || {
     echo "release is missing $CHECKSUM_ASSET$suffix" >&2
     missing=$((missing + 1))
   }
 done
 [ "$missing" -eq 0 ] || fail "release assets are incomplete: $missing expected file(s) absent"
-record assets_complete passed 'every archive and the checksum file has a signature bundle and certificate'
+record assets_complete passed 'every archive and the checksum file has a signature bundle'
 record checksums_asset_present passed 'required checksum asset was published'
 
 while IFS="$(printf '\t')" read -r asset_id asset; do
@@ -302,10 +304,10 @@ else
   for payload in "$CHECKSUM_PATH" "$DOWNLOAD"/veil-forum-*.tar.gz; do
     name=${payload##*/}
     bundle="$DOWNLOAD/$name.sig"
-    certificate="$DOWNLOAD/$name.pem"
     [ -s "$bundle" ] || fail "missing Sigstore bundle: $name.sig"
-    [ -s "$certificate" ] || fail "missing Sigstore certificate: $name.pem"
-    cosign verify-blob --bundle "$bundle" --certificate "$certificate" \
+    # The bundle carries the signing certificate, so verification takes only
+    # the bundle and the pinned identity and issuer.
+    cosign verify-blob --bundle "$bundle" \
       --certificate-identity-regexp "$IDENTITY" \
       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
       "$payload" > "$LOG_ROOT/cosign-$name.log" 2>&1 || fail "Sigstore verification failed: $name"
@@ -319,16 +321,14 @@ if [ "$TAG" != "$LEGACY_UNSIGNED_TAG" ]; then
 mkdir -p "$negative"
 cp "$CHECKSUM_PATH" "$negative/$(basename "$CHECKSUM_PATH")"
 cp "$CHECKSUM_PATH.sig" "$negative/$(basename "$CHECKSUM_PATH").sig"
-cp "$CHECKSUM_PATH.pem" "$negative/$(basename "$CHECKSUM_PATH").pem"
 printf '\n# tampered\n' >> "$negative/$(basename "$CHECKSUM_PATH")"
 if cosign verify-blob --bundle "$negative/$(basename "$CHECKSUM_PATH").sig" \
-  --certificate "$negative/$(basename "$CHECKSUM_PATH").pem" \
   --certificate-identity-regexp "$IDENTITY" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   "$negative/$(basename "$CHECKSUM_PATH")" >/dev/null 2>&1; then
   fail 'tampered payload unexpectedly passed Sigstore verification'
 fi
-if cosign verify-blob --bundle "$CHECKSUM_PATH.sig" --certificate "$CHECKSUM_PATH.pem" \
+if cosign verify-blob --bundle "$CHECKSUM_PATH.sig" \
   --certificate-identity-regexp '^https://github.com/Attacker/veil-forum/' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   "$CHECKSUM_PATH" >/dev/null 2>&1; then

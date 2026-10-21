@@ -198,13 +198,16 @@ jobs:
           sha256sum -c veil-forum-${GITHUB_REF_NAME}-checksums.txt
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign every release payload with keyless Sigstore identity
+        # cosign 3.x writes a self-contained Sigstore bundle: the Fulcio
+        # certificate travels inside the .sig bundle, so `--output-certificate`
+        # is ignored in the new bundle format (and removed in cosign v4) and no
+        # separate .pem is produced. Verification needs only `--bundle`.
         run: |
           set -eu
           for blob in veil-forum-*.tar.gz veil-forum-*-checksums.txt; do
             test -s "$blob"
             cosign sign-blob --yes \
               --bundle "$blob.sig" \
-              --output-certificate "$blob.pem" \
               "$blob"
           done
       - name: Stage draft GitHub Release assets
@@ -217,8 +220,8 @@ jobs:
             --draft \
             --title "veil-forum $GITHUB_REF_NAME" \
             --generate-notes \
-            veil-forum-*.tar.gz veil-forum-*.tar.gz.sig veil-forum-*.tar.gz.pem \
-            veil-forum-*-checksums.txt veil-forum-*-checksums.txt.sig veil-forum-*-checksums.txt.pem
+            veil-forum-*.tar.gz veil-forum-*.tar.gz.sig \
+            veil-forum-*-checksums.txt veil-forum-*-checksums.txt.sig
           # Hand the exact draft id to the validation job. A retried tag leaves
           # several drafts with the same tag name, and the validation job's
           # read-only token cannot enumerate drafts at all, so it must not

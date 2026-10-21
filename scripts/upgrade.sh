@@ -8,8 +8,8 @@
 # Options:
 #   --checksums FILE        sha256 checksum file listing the archive (required
 #                           unless --no-checksum-verify is given)
-#   --signatures DIR        directory containing <asset>.sig and <asset>.pem
-#                           bundles (required unless --no-attestation-verify)
+#   --signatures DIR        directory containing <asset>.sig Sigstore bundles
+#                           (required unless --no-attestation-verify)
 #   --no-attestation-verify LEGACY_TAG
 #                           EMERGENCY ONLY: skip Sigstore identity verification
 #                           for this exact historical unsigned tag
@@ -148,10 +148,11 @@ verify_signature() {
     _asset=$1
     _name=${_asset##*/}
     _bundle="$SIGNATURES/$_name.sig"
-    _certificate="$SIGNATURES/$_name.pem"
     [ -s "$_bundle" ] || veil_die "missing signature bundle for $_name: $_bundle"
-    [ -s "$_certificate" ] || veil_die "missing signing certificate for $_name: $_certificate"
-    cosign verify-blob --bundle "$_bundle" --certificate "$_certificate" \
+    # The Sigstore bundle is self-contained: the Fulcio certificate that
+    # `--certificate-identity-regexp` pins travels inside it, so verification
+    # needs no separate .pem file.
+    cosign verify-blob --bundle "$_bundle" \
         --certificate-identity-regexp "^https://github.com/Marry102123/veil-forum/\\.github/workflows/ci\\.yml@refs/tags/$RELEASE_TAG$" \
         --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
         "$_asset" || veil_die "Sigstore verification failed for $_name"

@@ -214,7 +214,6 @@ cd "$UPGRADE"
 sha256sum veil-forum-v0.1.0-alpha.19-x86_64-unknown-linux-musl.tar.gz > checksums.txt
 for asset in veil-forum-v0.1.0-alpha.19-x86_64-unknown-linux-musl.tar.gz checksums.txt; do
   printf 'bundle\n' > "signatures/$asset.sig"
-  printf 'certificate\n' > "signatures/$asset.pem"
 done
 
 if VEIL_BIN="$UPGRADE/veil-forum-v0.1.0-alpha.19/veil-forum" \
@@ -253,5 +252,11 @@ fi
 test "$(grep -c 'verify-blob' "$UPGRADE/cosign.log")" -ge 1
 grep -F 'Marry102123/veil-forum/' "$UPGRADE/cosign.log" >/dev/null
 grep -F 'https://token.actions.githubusercontent.com' "$UPGRADE/cosign.log" >/dev/null
+# The bundle carries the certificate, so a separate --certificate argument is
+# both unnecessary and deprecated in cosign 3.x. `--certificate-identity-regexp`
+# and `--certificate-oidc-issuer` must still be present.
+if grep -E -- '--certificate([[:space:]]|$)' "$UPGRADE/cosign.log" >/dev/null; then
+  echo 'upgrade passed a deprecated separate --certificate to cosign' >&2; exit 1
+fi
 
 echo 'script smoke tests passed'

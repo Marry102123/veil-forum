@@ -32,11 +32,7 @@ dependency work below.
 - `tokio` 1.53.1 -> 1.53.3
 - `serde_json` 1.0.151 -> 1.0.154
 - `sha2` 0.11.0 -> 0.11.1
-- `sigstore/cosign-installer` 3.9.2 -> 4.1.2, which installs cosign 3.0.6. The
-  `--bundle` and `--output-certificate` flags the release pipeline signs with
-  are still provided by cosign 3.x and are only removed in cosign 4, so the
-  signed-release format and `scripts/upgrade.sh` verification are unchanged.
-  Moving the pipeline to the bundle-only format is separate work.
+- `sigstore/cosign-installer` 3.9.2 -> 4.1.2, which installs cosign 3.0.6.
 
 ### Verification
 
@@ -48,6 +44,26 @@ dependency work below.
 - `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 are installed from a cached tool
   directory instead of being compiled from source on every run.
 - `dtolnay/rust-toolchain` moves to the current `stable` commit.
+
+### Fixed: the release pipeline produced no signing certificate file
+
+cosign 3.x writes the self-contained Sigstore bundle format by default, and in
+that format `--output-certificate` is ignored because the Fulcio certificate
+and Rekor receipt already travel inside the `.sig` bundle. The first tag built
+against cosign 3.0.6 therefore staged nine archives and nine bundles and zero
+`.pem` files, and `stage-release` failed on the missing asset before any
+release was created.
+
+- The pipeline signs with `--bundle` alone and publishes the `.sig` bundles
+  without `.pem` files.
+- `tests/release_packages_e2e.sh` verifies with `--bundle` only, still pins the
+  workflow identity, repository, tag, and OIDC issuer, and keeps both negative
+  controls (tampered payload, wrong repository).
+- `scripts/upgrade.sh --signatures DIR` now needs only `<asset>.sig`, and
+  `tests/scripts.sh` fails if a separate `--certificate` argument ever comes
+  back.
+- This is also the format cosign v4 keeps: the deprecated certificate flags are
+  removed there, so the pipeline no longer depends on them.
 
 ## 0.1.0-alpha.21
 

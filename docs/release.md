@@ -37,9 +37,10 @@ last two, and CI builds the archives from the tag.
    `release-build` cross-compiles every target, and `stage-release` signs and
    uploads all payloads to a **draft** release. `stage-release` has only
    `contents:write` and `id-token:write`. It uses keyless Sigstore/cosign, not
-   a repository-held key, and produces a `.sig` bundle and `.pem` Fulcio
-   certificate for every archive and for the checksums file. `release-build`
-   is read-only and cannot publish or change actions.
+   a repository-held key, and produces one self-contained `.sig` Sigstore
+   bundle for every archive and for the checksums file. The bundle carries the
+   Fulcio certificate and the Rekor receipt, so there is no separate `.pem`
+   asset. `release-build` is read-only and cannot publish or change actions.
 8. The tag-only `release-package-e2e` job downloads and exercises those draft
    assets with `RELEASE_TAG=v<VERSION> RELEASE_REPO=OWNER/REPO
    sh tests/release_packages_e2e.sh` and `GH_TOKEN` set. It covers
@@ -66,14 +67,14 @@ last two, and CI builds the archives from the tag.
 ## Smoke-test the upgrade path
 
 10. After the draft becomes public, download one archive (at least
-   `x86_64-unknown-linux-musl`) and its `.sig` and `.pem` files. Repeat the
+   `x86_64-unknown-linux-musl`) and its `.sig` bundle. Repeat the
    verification locally:
-   `cosign verify-blob --certificate-identity-regexp '^https://github.com/Marry102123/veil-forum/\.github/workflows/ci\.yml@refs/tags/v<VERSION>$' --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate <archive>.pem --bundle <archive>.sig <archive>`.
+   `cosign verify-blob --certificate-identity-regexp '^https://github.com/Marry102123/veil-forum/\.github/workflows/ci\.yml@refs/tags/v<VERSION>$' --certificate-oidc-issuer https://token.actions.githubusercontent.com --bundle <archive>.sig <archive>`.
    Also run `sha256sum -c veil-forum-*-checksums.txt` and confirm the archive
    contains `veil-forum`, `deploy/veil-forum.service`, and `static/style.css`.
 11. On a scratch host or VM with the previous release installed, put the
-   downloaded `.sig` and `.pem` files for the selected archive and checksum
-   file in one directory. Configure a mode 600 age recipient file, then name
+   downloaded `.sig` bundles for the selected archive and checksum file in one
+   directory. Configure a mode 600 age recipient file, then name
    exactly one archive and run:
    `sudo env VEIL_BACKUP_RECIPIENT_FILE=/etc/veil-forum/backup-recipients scripts/upgrade.sh <single-archive> --checksums <checksums-file> --signatures <signature-directory>`.
    Both the archive and checksums file are verified with the pinned GitHub

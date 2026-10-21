@@ -171,7 +171,8 @@ sudo env VEIL_BACKUP_RECIPIENT_FILE=/etc/veil-forum/backup-recipients \
 ```
 
 Name exactly one release archive. The signature directory must contain the
-`.sig` and `.pem` pairs for both that archive and the checksum file.
+`.sig` Sigstore bundle for both that archive and the checksum file; each bundle
+carries its own signing certificate, so no separate `.pem` is needed.
 `upgrade.sh` verifies the archive and checksum Sigstore identity, **backs up
 the database first with age encryption**,
 snapshots the running binary and `static/` to a versioned directory under
