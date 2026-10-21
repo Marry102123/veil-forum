@@ -41,7 +41,15 @@ mkdir -p "${STAGE}/docs" "${STAGE}/deploy" "${STAGE}/static" "${STAGE}/locales" 
 
 cargo build --release
 
-cp "target/release/${BIN_NAME}" "${STAGE}/${BIN_NAME}"
+# Resolve the build directory through cargo rather than assuming "target". A
+# `build.target-dir` in a cargo config (a common way to keep multi-gigabyte
+# artifacts off a small root filesystem) or CARGO_TARGET_DIR moves the binary
+# elsewhere, and a hard-coded path then fails after the build already succeeded.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps --manifest-path Cargo.toml 2>/dev/null \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n 1)"
+[ -n "${TARGET_DIR}" ] || TARGET_DIR="target"
+
+cp "${TARGET_DIR}/release/${BIN_NAME}" "${STAGE}/${BIN_NAME}"
 cp README.md LICENSE CHANGELOG.md "${STAGE}/"
 cp docs/*.md "${STAGE}/docs/"
 cp deploy/*.service "${STAGE}/deploy/"
@@ -54,7 +62,7 @@ tar -czf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
 (
     cd "${DIR_NAME}"
     find . -type f -print | sort | xargs sha256sum
-) > "${CHECKSUMS}"
+) > "${BIN_NAME}-v${VERSION}-checksums.txt"
 cd ..
 
 echo "Archive:   ${ARCHIVE}"
