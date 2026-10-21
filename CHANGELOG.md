@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.1.0-alpha.22
+
+**Dependency security release.** No schema change, no configuration key change,
+and no password-hash change: an existing database keeps working and existing
+accounts keep their credentials. `v0.1.0-alpha.21` was tagged on 2026-09-26 but
+its tag pipeline failed in `verify`, so no release was ever published for it;
+this release publishes everything documented under `0.1.0-alpha.21` plus the
+dependency work below.
+
+### Security: the HTML sanitiser let `URL(...)` through
+
+- `ammonia` 4.2.3 and older matched the CSS `url()` function case-sensitively
+  (RUSTSEC-2026-0373), so a `URL(...)` written in user-supplied HTML was not
+  recognised as a link and could survive sanitisation. Every thread body, reply,
+  and profile field passes through this sanitiser. `Cargo.toml` now floors the
+  dependency at `4.2.4` instead of the floating `4` range that pulled the
+  vulnerable patch release back in, and the lockfile resolves 4.2.4.
+- The same advisory had turned the gate red: with 4.2.3 locked, the pinned
+  `cargo audit` step failed, so `verify` had been failing on `master` and on
+  every pull request since 2026-10-16. The open dependabot pull requests were
+  red because of a vulnerability none of them introduced.
+- `yoke-derive` 0.8.3 was yanked upstream; the lockfile now resolves 0.8.4.
+
+### Dependency updates
+
+- `ammonia` 4.2.0 -> 4.2.4
+- `comrak` 0.55.0 -> 0.56.0, with its default features still off so the unused
+  CLI and syntax-highlighting stack stays out of the build
+- `rust-i18n` 4.2.2 -> 4.2.4
+- `tokio` 1.53.1 -> 1.53.3
+- `serde_json` 1.0.151 -> 1.0.154
+- `sha2` 0.11.0 -> 0.11.1
+- `sigstore/cosign-installer` 3.9.2 -> 4.1.2, which installs cosign 3.0.6. The
+  `--bundle` and `--output-certificate` flags the release pipeline signs with
+  are still provided by cosign 3.x and are only removed in cosign 4, so the
+  signed-release format and `scripts/upgrade.sh` verification are unchanged.
+  Moving the pipeline to the bundle-only format is separate work.
+
+### Verification
+
+- `verify` now creates the test role as `LOGIN` plus `CREATEDB` and nothing
+  else. The fault-injection suites revoke a privilege from that role to prove
+  the application fails closed, and a superuser bypasses the privilege check, so
+  the suite refuses to report a pass against one. This is what failed the
+  `v0.1.0-alpha.21` tag run.
+- `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 are installed from a cached tool
+  directory instead of being compiled from source on every run.
+- `dtolnay/rust-toolchain` moves to the current `stable` commit.
+
 ## 0.1.0-alpha.21
 
 **Reliability and verification release.** No password-hash change and no
