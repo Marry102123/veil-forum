@@ -12,7 +12,7 @@ readme = "README.md"
 axum = { version = "0.8", features = ["macros", "form"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
-comrak = { version = "0.56", default-features = false }
+comrak = { version = "0.59", default-features = false }
 # 4.2.4 is the first release that fixes RUSTSEC-2026-0373, so the floor is
 # pinned there instead of the floating 4.x range that let 4.2.3 back in.
 ammonia = "4.2.4"
